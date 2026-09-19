@@ -1,5 +1,6 @@
 /**
- * 真机验证：开关即时生效、回落、半坏仍可用（ticket `16` 的第 1、6、7、8 项）。
+ * 真机验证：开关即时生效、回落、半坏仍可用（ticket `16` 的第 1、6、7、8 项），
+ * 外加抓取接管（`10`）与调度策略（`18`）。
  *
  * 单测打的是桩件，而这里打的是**真实宿主服务**：真实的 `WebRuntime`（pin 到本插件）、
  * 真实的 `SettingsProvider`（宿主的基类，不是替身）、真实的 Tavily API 与真实网络。它能
@@ -12,7 +13,9 @@
  * 4. **patch 的接管真正落到 seam 上**（第 1 项的服务侧一半）：`searchProvider: tavily`
  *    解析到本插件，而不是靠 id 相同碰巧对上；
  * 5. **抓取接管同样落到 seam 上**（第 10 项）：`fetchProvider: tavily` 解析到本插件的抓取
- *    提供方、请求真的抵达 `/extract`，且两个开关互不影响。
+ *    提供方、请求真的抵达 `/extract`，且两个开关互不影响；
+ * 6. **调度策略改动即时生效**（第 18 项）：`schedulingPolicy` 切成 `manual` 之后，下一次
+ *    搜索立刻改用顺序最前的那把密钥，而不是余额最高的那把。
  *
  * 它需要一把真实密钥，因此不属于 `npm test`：
  *
@@ -431,6 +434,64 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
 
     // 测试完把这把无效密钥删掉，免得它影响后面的断言。
     await call(PANEL_ROUTE_PATHS.keys, { action: 'remove', id: invalid.id });
+
+    // ── 第 18 项：调度策略改动经真实 settings 即时影响下一次搜索（SCHED-7） ──
+    //
+    // 池里只有一把真密钥，而「选了哪一把」在单密钥池上无话可说。这里经**面板接口**再加一把
+    // 假密钥并把它排到第一位——走面板而不是直接改文件，是因为插件的内存密钥池只在首次使用时
+    // 读一次盘（`ensureLoaded` 的记忆化），文件改了它也不会重读，那样测的就不是插件的行为。
+    //
+    // 假密钥的明文带一个可辨认的前缀，于是「这次用的是哪一把」可以直接从 Authorization 头读出
+    // 来；真密钥的明文不打印，也不能打印。
+    const FAKE_KEY = 'tvly-dev-manual-first-000000000000000000000000';
+    const beforeAdd = (await call(PANEL_ROUTE_PATHS.keys, { action: 'reorder', ids: [] })).keys.map((entry) => entry.id);
+    const withFake = await call(PANEL_ROUTE_PATHS.keys, { action: 'add', key: FAKE_KEY });
+    // 用**新增的那个 id** 指认假密钥，而不是从脱敏串上猜：真密钥与假密钥的脱敏形式都以
+    // `tvly-dev-` 开头（`maskKey` 保留前 9 个字符），按前缀挑会挑中真密钥——第一版就是这么
+    // 错的，症状是「重排了，选的还是真密钥」。
+    const [fakeId] = withFake.keys.map((entry) => entry.id).filter((id) => !beforeAdd.includes(id));
+    assert.notEqual(fakeId, undefined, '假密钥应当被面板接受');
+    await call(PANEL_ROUTE_PATHS.keys, {
+      action: 'reorder',
+      ids: [fakeId, ...withFake.keys.filter((entry) => entry.id !== fakeId).map((entry) => entry.id)],
+    });
+
+    // 真密钥的余额刚刚由「刷新余额」写入缓存，因此它是「余额已知」的那把；假密钥从未刷新过，
+    // 余额未知——`balance` 策略下垫底，`manual` 下排在最前。
+    const keyUsed = async () => {
+      const seen = [];
+      const original = globalThis.fetch;
+      globalThis.fetch = (input, init) => {
+        seen.push(init?.headers?.authorization);
+        return original(input, init);
+      };
+      try {
+        await trySearch(ctx, 'DeepSeek Harness scheduling');
+      } finally {
+        globalThis.fetch = original;
+      }
+      return seen[0];
+    };
+
+    assert.equal(
+      String(await keyUsed()).includes('manual-first'),
+      false,
+      'balance：余额已知的真密钥先被选中（假密钥余额未知，垫底）',
+    );
+
+    await settings.update(SETTINGS_NAMESPACE, { schedulingPolicy: 'manual' });
+    assert.equal(settings.get(SETTINGS_NAMESPACE).schedulingPolicy, 'manual', '写入必须落到真实 settings 上');
+
+    assert.equal(
+      String(await keyUsed()).includes('manual-first'),
+      true,
+      'manual：必须改用排在最前的那把，即使它余额未知、即使另一把余额充足',
+    );
+    check('第 18 项：schedulingPolicy 改动经真实 settings 即时改变下一次搜索选中的密钥');
+
+    // 收尾：把假密钥删掉、策略改回默认，免得影响后面的检查。
+    await call(PANEL_ROUTE_PATHS.keys, { action: 'remove', id: fakeId });
+    await settings.update(SETTINGS_NAMESPACE, { schedulingPolicy: 'balance' });
   } finally {
     globalThis.fetch = realFetch;
   }

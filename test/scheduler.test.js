@@ -32,7 +32,13 @@ async function harness(keys, options = {}) {
     ids[entry.label] = record.id;
   }
   const health = new KeyHealth({ pool, now: options.now });
-  const scheduler = new Scheduler({ pool, health, now: options.now, sleep: options.sleep });
+  const scheduler = new Scheduler({
+    pool,
+    health,
+    now: options.now,
+    sleep: options.sleep,
+    ...options.policy === undefined ? {} : { policy: options.policy },
+  });
   return { pool, health, scheduler, ids };
 }
 
@@ -373,5 +379,73 @@ describe('SCHED-9：全部冷却时的有界等待', () => {
     const outcome = await scheduler.select();
     assert.equal(outcome.blocked, 'cooling');
     assert.equal(slept, false);
+  });
+});
+
+describe('SCHED-7：手动顺序策略', () => {
+  test('每次都选池内最靠前的那把，即使它刚被用过、即使别的余额更高', async () => {
+    // 这条用例与 `balance` 的那条（「同余额档内轮转打散」）正面对立，因此它同时钉住了两件
+    // 事：`manual` 不参考余额，也不轮转。
+    const { pool, scheduler, ids } = await harness(
+      [{ label: 'first' }, { label: 'second' }],
+      { policy: 'manual' },
+    );
+    await setUsage(pool, ids.first, { limit: 200, usage: 190 });
+    await setUsage(pool, ids.second, { limit: 200, usage: 0 });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const selected = await scheduler.select();
+      assert.equal(selected.key.id, ids.first, `第 ${String(attempt + 1)} 次仍应选 A`);
+    }
+  });
+
+  test('第一把被排除时轮到第二把——依次尝试的含义', async () => {
+    const { pool, scheduler, health, ids } = await harness(
+      [{ label: 'first' }, { label: 'second' }],
+      { policy: 'manual' },
+    );
+
+    // 「已在本请求里试过」是最常见的那种排除：一次请求里 A 失败就会调用 select({exclude})。
+    const selected = await scheduler.select({ exclude: new Set([ids.first]) });
+    assert.equal(selected.key.id, ids.second);
+
+    // 冷却同样是硬排除，策略不改变这一点。
+    health.recordFailure(ids.first, { failure: { status: 500 }, message: 'boom' });
+    const afterCooldown = await scheduler.select();
+    assert.equal(afterCooldown.key.id, ids.second);
+  });
+
+  test('硬排除照旧：额度耗尽与永久失效的密钥在手动顺序下也不被选中', async () => {
+    // 「不参考余额」说的是**排序**，不是「无视状态硬打」。第一把一旦额度耗尽就进不了候选，
+    // 手动顺序必须落到第二把——否则第一把一坏，整个池子就废了。
+    const { pool, scheduler, health, ids } = await harness(
+      [{ label: 'first' }, { label: 'second' }],
+      { policy: 'manual' },
+    );
+    health.recordFailure(ids.first, { failure: { status: 432 }, message: 'no credits' });
+    assert.equal((await scheduler.select()).key.id, ids.second);
+
+    health.recordFailure(ids.second, {
+      failure: { status: 401, detail: 'invalid api key' },
+      message: 'invalid api key',
+    });
+    const blocked = await scheduler.select().catch((error) => error);
+    assert.equal(blocked?.blocked ?? 'all-unusable', 'all-unusable');
+  });
+
+  test('策略可以是一个函数，于是改动即时生效', async () => {
+    // 插件就是这样用它的（`index.js` 传的是 `() => readPluginSettings(...).schedulingPolicy`）：
+    // 策略在**每次决策**时现读，因此面板上换策略无需重新注册提供方。这条断言盯的是「现读」
+    // 而不是「构造时读一次」——后者在本用例里会让第二次选择仍然是 A。
+    const { pool, health, ids } = await harness([{ label: 'first' }, { label: 'second' }]);
+    await setUsage(pool, ids.first, { limit: 200, usage: 190 });
+    await setUsage(pool, ids.second, { limit: 200, usage: 0 });
+
+    let current = 'manual';
+    const scheduler = new Scheduler({ pool, health, policy: () => current });
+
+    assert.equal((await scheduler.select()).key.id, ids.first, 'manual：每次都从 A 开始');
+    current = 'balance';
+    assert.equal((await scheduler.select()).key.id, ids.second, '切回 balance：轮到余额更高的 B');
   });
 });

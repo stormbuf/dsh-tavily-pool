@@ -1034,3 +1034,79 @@ describe('10：回落契约——关掉开关后逐字段复现官方抓取器',
     assert.equal(officialFetchProvider(), provider);
   });
 });
+
+
+describe('18：调度策略经入口真实生效（SCHED-7）', () => {
+  /**
+   * 直接往临时 harness home 的密钥池里写一份余额缓存。
+   *
+   * 写文件而不是经 `/usage` 打桩，是因为本组用例要检验的是**排序**，余额从哪来与它无关；
+   * 而走真实刷新路径会让每条用例多出一层与本需求无关的往返。
+   */
+  async function seedBalance(keyPoolPath, index, key) {
+    const document = JSON.parse(await readFile(keyPoolPath, 'utf8'));
+    document.usageCache[document.order[index]] = { key, fetchedAt: new Date().toISOString(), stale: false };
+    await writeFile(keyPoolPath, JSON.stringify(document), 'utf8');
+  }
+
+  /** 一次搜索用的是哪把密钥——从出站请求的 Authorization 头读出来。 */
+  async function keyUsedBy(host) {
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      (calls) => host.registered[0].search({ query: 'q' }).then(() => calls[0].authorization),
+    );
+    return result;
+  }
+
+  test('默认 balance：余额高的密钥先被选中', async () => {
+    const host = await hostWithKeys([{ label: 'low' }, { label: 'high' }]);
+    await seedBalance(host.keyPoolPath, 0, { limit: 200, usage: 190 });
+    await seedBalance(host.keyPoolPath, 1, { limit: 200, usage: 0 });
+
+    // 池里第二把（`-1-`）余额更高，因此默认策略下被选中。
+    assert.match(await keyUsedBy(host), /^Bearer tvly-dev-1-/u);
+  });
+
+  test('切到 manual 之后按池内顺序选，不参考余额', async () => {
+    const host = await hostWithKeys([{ label: 'low' }, { label: 'high' }]);
+    await seedBalance(host.keyPoolPath, 0, { limit: 200, usage: 190 });
+    await seedBalance(host.keyPoolPath, 1, { limit: 200, usage: 0 });
+
+    host.setSettings({ schedulingPolicy: 'manual' });
+
+    // 第一把余额更低，但 manual 只看顺序——这正是 `SCHED-7` 的「不参考余额」。
+    assert.match(await keyUsedBy(host), /^Bearer tvly-dev-0-/u);
+    // 而且**不轮转**：紧接着的第二次仍然选它。
+    assert.match(await keyUsedBy(host), /^Bearer tvly-dev-0-/u);
+  });
+
+  test('手动顺序下的硬排除照旧：第一把失败后轮到第二把', async () => {
+    const host = await hostWithKeys([{ label: 'first' }, { label: 'second' }]);
+    host.setSettings({ schedulingPolicy: 'manual' });
+
+    const { result } = await withStubbedFetch(
+      (call) => (call.authorization.includes('-0-')
+        ? { status: 500, body: { detail: { error: 'boom' } } }
+        : { status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      (calls) => host.registered[0].search({ query: 'q' }).then(() => calls.map((call) => call.authorization)),
+    );
+
+    assert.equal(result.length, 2, '第一把 500 之后必须换第二把，而不是原地重试');
+    assert.match(result[0], /^Bearer tvly-dev-0-/u);
+    assert.match(result[1], /^Bearer tvly-dev-1-/u);
+  });
+
+  test('策略改动即时生效，不需要重新注册提供方', async () => {
+    const host = await hostWithKeys([{ label: 'low' }, { label: 'high' }]);
+    await seedBalance(host.keyPoolPath, 0, { limit: 200, usage: 190 });
+    await seedBalance(host.keyPoolPath, 1, { limit: 200, usage: 0 });
+
+    assert.match(await keyUsedBy(host), /^Bearer tvly-dev-1-/u, 'balance：选余额高的');
+    host.setSettings({ schedulingPolicy: 'manual' });
+    assert.match(await keyUsedBy(host), /^Bearer tvly-dev-0-/u, 'manual：改选顺序最前的');
+    host.setSettings({ schedulingPolicy: 'balance' });
+    assert.match(await keyUsedBy(host), /^Bearer tvly-dev-1-/u, '切回去又按余额');
+
+    assert.equal(host.registered.length, 1, '全程只有一次注册');
+  });
+});

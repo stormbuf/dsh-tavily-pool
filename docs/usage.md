@@ -67,12 +67,27 @@ A fetched page comes back as **plain text, never as HTML**. Tavily already retur
 
 ## Scheduling
 
-The key pool schedules by **balance first**:
+The key pool schedules by **balance first** by default:
 
 - Keys with more remaining credits go first
 - Keys whose balance is "unlimited" go first of all
 - Keys whose balance is **unknown** go last (unknown is not zero)
 - Within the same balance tier, keys rotate
+
+### Scheduling policy
+
+`schedulingPolicy` switches between two ways of **ordering** the candidates:
+
+| Value | Behaviour |
+|---|---|
+| `balance` (default) | Remaining balance decides; keys in the same tier rotate |
+| `manual` | Keys are tried strictly in the order shown in the key pool, **ignoring balance** |
+
+"Manual order" means the list order becomes the scheduling order — so the up/down buttons stop being cosmetic. With `manual`, the first usable key in the list is chosen every time (it does not rotate), and when it fails the request moves to the next one.
+
+**This is ordering only.** Disabled, cooling, quota-exhausted, and permanently invalid keys are hard-excluded under *either* policy — manual order is not "ignore the state and keep hammering key one", because then a single broken key would take the whole pool down with it.
+
+Policy changes take effect **immediately**, like every other setting.
 
 When a key fails temporarily (rate limiting `429`, server error `5xx`) it is **cooled down**, and during the cooldown it **does not participate** in key selection (it will not be used even if every other key is unavailable). It recovers automatically when the cooldown ends.
 

@@ -169,7 +169,13 @@ export function apply(ctx, _config) {
   try {
     state.pool = new PoolStore({ dir: resolveStateDir(state.host), fileName: KEYS_FILE_NAME });
     state.health = new KeyHealth({ pool: state.pool });
-    state.scheduler = new Scheduler({ pool: state.pool, health: state.health });
+    // 策略以**函数**交给调度器：它每次决策都读一次当前设置，于是面板上换策略即时生效，
+    // 而插件不必为了携带新值去重新注册提供方（`SCHED-7`）。
+    state.scheduler = new Scheduler({
+      pool: state.pool,
+      health: state.health,
+      policy: () => readPluginSettings(state.host).schedulingPolicy,
+    });
     state.usageRefresher = new UsageRefresher({
       pool: state.pool,
       health: state.health,

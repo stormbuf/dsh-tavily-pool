@@ -222,6 +222,7 @@ function sampleState(overrides = {}) {
       includeAnswer: false,
       fetchDepth: 'basic',
       fetchFormat: 'markdown',
+      schedulingPolicy: 'balance',
     },
     keys: [],
     poolError: null,
@@ -273,6 +274,7 @@ function readyDraft() {
     includeAnswer: false,
     fetchDepth: 'basic',
     fetchFormat: 'markdown',
+    schedulingPolicy: 'balance',
   };
 }
 
@@ -633,11 +635,12 @@ describe('PANEL-5：卡片渲染出中英双语文案', () => {
     const selects = flatten(component({ t })).filter((element) => element.type === 'select');
     const values = selects.map((element) => element.props.value);
     // `maxResults` 是 `<input type="number">`，不在这一列里。
-    assert.deepEqual(values, ['basic', 'general', 'basic', 'markdown']);
+    assert.deepEqual(values, ['basic', 'general', 'balance', 'basic', 'markdown']);
 
     const options = selects.map((element) => element.children.map((child) => child.props.value));
-    assert.deepEqual(options[2], ['basic', 'advanced'], '抽取深度的词表要与 EXTRACT_DEPTH_VALUES 一致');
-    assert.deepEqual(options[3], ['markdown', 'text'], '返回格式的词表要与 EXTRACT_FORMAT_VALUES 一致');
+    assert.deepEqual(options[2], ['balance', 'manual'], '调度策略的词表要与 SCHEDULING_POLICY_VALUES 一致');
+    assert.deepEqual(options[3], ['basic', 'advanced'], '抽取深度的词表要与 EXTRACT_DEPTH_VALUES 一致');
+    assert.deepEqual(options[4], ['markdown', 'text'], '返回格式的词表要与 EXTRACT_FORMAT_VALUES 一致');
   });
 
   test('每把密钥的最近耗时也显示出来（USAGE-7）', async () => {
@@ -649,6 +652,26 @@ describe('PANEL-5：卡片渲染出中英双语文案', () => {
     });
 
     assert.equal(textsOf(component({ t })).some((text) => text.includes('最近耗时：812 ms')), true);
+  });
+
+  test('SCHED-7：选 manual 时说清列表顺序就是调度顺序，balance 下不说', async () => {
+    // 手动顺序策略下，密钥池列表的顺序**换了一个含义**。用户没有任何别的线索能知道这件事，
+    // 因此那句话必须在切到 manual 的那一刻出现；而它在 balance 下常显，会让用户以为上下移
+    // 也在影响调度。
+    const balance = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
+    assert.equal(
+      textsOf(balance.component({ t: balance.t })).some((text) => text.includes('这个列表的顺序就是调度顺序')),
+      false,
+      'balance 下不该声称排序在起作用',
+    );
+
+    const manual = await mountedCard({
+      hooks: { ui: readyUi(), draft: { ...readyDraft(), schedulingPolicy: 'manual' } },
+    });
+    assert.equal(
+      textsOf(manual.component({ t: manual.t })).some((text) => text.includes('这个列表的顺序就是调度顺序')),
+      true,
+    );
   });
 
   test('拿不到宿主 t 时按 navigator.language 选自带词表', async () => {

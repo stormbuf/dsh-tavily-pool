@@ -77,6 +77,7 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
         includeAnswer: false,
         fetchDepth: 'basic',
         fetchFormat: 'markdown',
+        schedulingPolicy: 'balance',
       },
       '默认值必须由宿主按 schema 解析出来，而不是靠我们自己填',
     );
@@ -146,6 +147,20 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
     );
   });
 
+  test('调度策略的非法取值被 schema 拒绝（SCHED-7）', async () => {
+    // 用户文档可以直接编辑，因此「退回默认值」那一半由读侧（`readSettings`）覆盖；这里管的
+    // 是写侧：面板不能把一个 schema 不允许的策略存下去。
+    const ctx = contextWithRealSettings();
+    registerSettings(ctx);
+
+    await assert.rejects(
+      () => ctx.settings.update(SETTINGS_NAMESPACE, { schedulingPolicy: 'random' }),
+      /expected|string/u,
+    );
+    await ctx.settings.update(SETTINGS_NAMESPACE, { schedulingPolicy: 'manual' });
+    assert.equal(readPluginSettings(ctx).schedulingPolicy, 'manual', '合法取值必须能存下去');
+  });
+
   test('settings 服务缺席时注册退化为 undefined，而不是抛错', () => {
     // 可选能力缺席不能让插件加载失败：搜索仍要可用，只是开关按默认值走。
     const ctx = { get: () => undefined };
@@ -162,6 +177,7 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
         includeAnswer: false,
         fetchDepth: 'basic',
         fetchFormat: 'markdown',
+        schedulingPolicy: 'balance',
       },
       '缺席时用默认值',
     );
@@ -209,6 +225,7 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
       includeAnswer: false,
       fetchDepth: 'basic',
       fetchFormat: 'markdown',
+      schedulingPolicy: 'balance',
     });
   });
 

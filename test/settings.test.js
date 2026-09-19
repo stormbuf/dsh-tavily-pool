@@ -31,6 +31,7 @@ describe('CFG-3：搜索参数可配置', () => {
       fetchEnabled: true,
       fetchDepth: 'basic',
       fetchFormat: 'markdown',
+      schedulingPolicy: 'balance',
       searchDepth: 'basic',
       maxResults: 10,
       topic: 'general',
@@ -51,6 +52,16 @@ describe('CFG-3：搜索参数可配置', () => {
     assert.equal(settings.maxResults, 3);
     assert.equal(settings.topic, 'news');
     assert.equal(settings.includeAnswer, true);
+  });
+
+  test('SCHED-7：调度策略在读取时重新校验，越界值退回默认', () => {
+    assert.equal(read({ schedulingPolicy: 'manual' }).schedulingPolicy, 'manual');
+    assert.equal(read({ schedulingPolicy: 'balance' }).schedulingPolicy, 'balance');
+    // settings.yaml 可以直接编辑，因此这里必须守住：一个不认识的策略会落进调度器
+    // `policy === 'manual'` 的判断之外，也就是静默退回余额优先——那不算坏，但用户会以为
+    // 自己选的策略生效了。
+    assert.equal(read({ schedulingPolicy: 'random' }).schedulingPolicy, 'balance');
+    assert.equal(read({ schedulingPolicy: 42 }).schedulingPolicy, 'balance');
   });
 
   test('投影成发给 Tavily 的那三项', () => {
