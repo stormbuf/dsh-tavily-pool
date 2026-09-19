@@ -464,6 +464,7 @@ async function fetchUrl(state, request, signal) {
       health: state.health,
       signal,
       deadlineMs,
+      operation: 'fetch',
       onAttempt: (attempt) => recordCall(state, 'extract', attempt),
       invoke: ({ key }) => extractTavily({
         apiKey: key,

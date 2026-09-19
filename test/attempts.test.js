@@ -270,6 +270,71 @@ describe('取消与记账', () => {
     assert.equal(health.statsOf(ids.a).cooldownUntil, undefined);
   });
 
+  test('中止的文案跟着 operation 走', async () => {
+    // 抓取也走这条编排（`operation: 'fetch'`）。文案里说 search 而实际做的是抓取，会把读日志
+    // 的人带偏——与 `lib/tavily.js` 的 `postJson` 同一个用意。
+    const { scheduler, health } = await harness([{ label: 'a' }]);
+    const invoke = async () => {
+      throw new TavilyError('aborted', { code: 'TAVILY_ABORTED' });
+    };
+    const controller = new AbortController();
+    controller.abort();
+
+    const search = await runWithFailover({ scheduler, health, invoke, signal: controller.signal }).catch((thrown) => thrown);
+    assert.match(search.message, /Tavily search aborted/u);
+
+    const fetch = await runWithFailover({
+      scheduler,
+      health,
+      invoke,
+      signal: controller.signal,
+      operation: 'fetch',
+    }).catch((thrown) => thrown);
+    assert.match(fetch.message, /Tavily fetch aborted/u);
+  });
+
+  test('onAttempt 在成功与失败两条路径上都被调用，且不参与决策', async () => {
+    // `14` 用它记调用历史。它必须是**观察者**：抛错不该影响这次调用的结果，否则一段记历史的
+    // 代码就能把搜索搞挂。
+    const { scheduler, health, ids } = await harness([{ label: 'a' }]);
+    const { invoke } = stubInvoke({ [ids.a]: { ok: true, credits: 2 } });
+    const seen = [];
+
+    const outcome = await runWithFailover({
+      scheduler,
+      health,
+      invoke,
+      onAttempt: (attempt) => {
+        seen.push(attempt);
+        throw new Error('记历史时炸了');
+      },
+    });
+
+    assert.equal(seen.length, 1, '观察者要在成功路径上被调用');
+    assert.equal(seen[0].keyId, ids.a);
+    assert.equal(seen[0].outcome, 'ok');
+    assert.equal(seen[0].credits, 2);
+    assert.equal(outcome.keyId, ids.a, '观察者抛错不该影响这次调用的结果');
+
+    // 失败路径同理。
+    const failing = await harness([{ label: 'b' }]);
+    const stub = stubInvoke({ [failing.ids.b]: { status: 500 } });
+    const failed = [];
+    await runWithFailover({
+      scheduler: failing.scheduler,
+      health: failing.health,
+      invoke: stub.invoke,
+      onAttempt: (attempt) => {
+        failed.push(attempt);
+        throw new Error('记历史时炸了');
+      },
+    }).catch(() => undefined);
+
+    assert.equal(failed.length, 1, '失败路径上也要被调用');
+    assert.equal(failed[0].outcome, 'failed');
+    assert.equal(failed[0].status, 500);
+  });
+
   test('成功会把调度时记下的调用数与积分一并留下', async () => {
     const { pool, health, scheduler, ids } = await harness([{ label: 'a' }]);
     const { invoke } = stubInvoke({ [ids.a]: { ok: true, credits: 2 } });
