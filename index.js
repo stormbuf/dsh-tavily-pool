@@ -278,6 +278,9 @@ async function search(state, request, signal) {
  * 关于 **DeepSeek** 凭据的错误，而真正要修的东西两回事——他刚被从 Tavily 那条路踢出来。
  * 把起点写进消息，用户才知道该看哪边。
  *
+ * **原因只拼一次。** 它被交给 `searchWithOfficialProvider`，由后者织进错误文案；这里不再
+ * 往前面补一遍，否则同一条消息会把「为什么离开 Tavily」说两遍。
+ *
  * **回落成功时也记一条日志，每个不同的原因只记一次。** 这一条不是可有可无的：本机通常
  * 配着 `DEEPSEEK_API_KEY`，于是密钥池为空的用户会**静默地**用上官方搜索——面板上两个开关
  * 都是开的、搜索也正常工作，没有任何迹象说明 Tavily 根本没被用上。同一个原因反复刷屏同样
@@ -303,17 +306,13 @@ async function fallbackToOfficial(state, request, signal, reason) {
     }
     return result;
   } catch (error) {
+    // 只换外壳，不改动 code 与文案：`searchWithOfficialProvider` 已经把原因与凭据状态都
+    // 织进了消息，这里再做一次改写只会让同一句话说两遍。
     if (error?.code === 'TAVILY_FALLBACK_CREDENTIAL_MISSING') {
-      throw new TavilyError(`${reason}. ${error.message}`, {
-        code: 'TAVILY_FALLBACK_CREDENTIAL_MISSING',
-        cause: error,
-      });
+      throw new TavilyError(error.message, { code: error.code, cause: error });
     }
     if (error?.code === 'TAVILY_FALLBACK_CREDENTIAL_INVALID') {
-      throw new TavilyError(`${reason}. ${error.message}`, {
-        code: 'TAVILY_FALLBACK_CREDENTIAL_INVALID',
-        cause: error,
-      });
+      throw new TavilyError(error.message, { code: error.code, cause: error });
     }
     if (error?.code === 'WEB_ABORTED') {
       throw new TavilyError('Tavily search aborted by the caller', { code: 'TAVILY_ABORTED', cause: error });

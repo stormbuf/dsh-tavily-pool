@@ -233,6 +233,51 @@ describe('回落的成功路径', () => {
   });
 });
 
+describe('回落文案必须说清**真正的**起点', () => {
+  test('原因来自调用方，不由本模块猜', async () => {
+    // 这条压的是一个已经被复现过的缺陷：原因曾在这里写死成「开关关了」，而 `index.js`
+    // 另外把真实原因拼在消息前面。于是密钥池文件损坏（开关明明是**开**的）时，用户读到
+    // 的是两句话互相矛盾，其中一句还指着一个不需要动的开关。
+    const error = await searchWithOfficialProvider({
+      ctx: fakeContext(),
+      request: { query: 'q' },
+      reason: 'the key pool could not be read: keys.json is not valid JSON',
+    }).catch((thrown) => thrown);
+
+    assert.equal(error.code, FALLBACK_CREDENTIAL_MISSING);
+    assert.match(error.message, /keys\.json is not valid JSON/u, '真实起点必须在文案里');
+    assert.doesNotMatch(error.message, /turned off/u, '开关根本没关，不得这么说');
+  });
+
+  test('没有给原因时也不编造一个', async () => {
+    const error = await searchWithOfficialProvider({
+      ctx: fakeContext(),
+      request: { query: 'q' },
+    }).catch((thrown) => thrown);
+
+    assert.equal(error.code, FALLBACK_CREDENTIAL_MISSING);
+    assert.doesNotMatch(error.message, /turned off/u, '不知道原因就不要说一个具体的原因');
+    assert.match(error.message, /fallback|fell back/u);
+  });
+
+  test('凭据失效那条也带上同一个起点', async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: 'auth' }), { status: 401 });
+    try {
+      const error = await searchWithOfficialProvider({
+        ctx: fakeContext({ settings: { apiKey: 'sk-x' } }),
+        request: { query: 'q' },
+        reason: 'no Tavily key is usable: the pool is empty',
+      }).catch((thrown) => thrown);
+
+      assert.equal(error.code, FALLBACK_CREDENTIAL_INVALID);
+      assert.match(error.message, /the pool is empty/u, '失效那条同样要说清为什么离开 Tavily');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
 describe('取消经回落路径向上传递', () => {
   test('调用方已中止时按取消报错，而不是报成凭据问题', async () => {
     const controller = new AbortController();

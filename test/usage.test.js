@@ -317,18 +317,22 @@ describe('SCHED-10：月起始探测窗口', () => {
     );
   });
 
-  test('48 小时窗口内的探测次数不超过 9 次', () => {
+  test('48 小时窗口内恰好探测 8 次', () => {
+    // 下界写死成 8 而不是「≤9」：`≤9` 拦不住一个退化成 9 次（甚至更多）的回归，而探测
+    // 花的是 `/usage` 的官方配额——那正是恢复所需要的那份。栅格是月起始后的
+    // 0/6/12/…/42 小时；第 48 小时那个点落在半开窗口之外。
     let lastProbeAt;
-    let probes = 0;
+    const probes = [];
     for (let elapsed = 0; elapsed <= QUOTA_PROBE_WINDOW_MS; elapsed += 60_000) {
       const nowMs = monthStart + elapsed;
       if (shouldProbeAfterMonthStart({ quotaExhaustedAt: markedAt, nowMs, lastProbeAt }).probe) {
-        probes += 1;
+        probes.push(elapsed / 3600_000);
         lastProbeAt = nowMs;
       }
     }
 
-    assert.ok(probes <= 9, `48 小时内最多 9 次探测（实际 ${String(probes)} 次），远低于官方 10 次 / 10 分钟`);
+    assert.deepEqual(probes, [0, 6, 12, 18, 24, 30, 36, 42], '探测时刻必须落在 6 小时栅格上');
+    assert.ok(probes.length < 10, '必须远低于官方「10 次 / 10 分钟」的配额');
   });
 
   test('48 小时之后停止自动探测', () => {
