@@ -33,7 +33,7 @@ See [`docs/usage.md`](./docs/usage.md) for configuration, scheduling behaviour, 
 
 DeepSeek Harness is in preview, so its architecture and plugin interfaces may change between releases. This plugin isolates all host-specific knowledge in one thin adapter layer (`lib/dsh/`) and probes host capabilities at load time, so that adapting to a breaking change stays cheap.
 
-**Tested against DSH `0.1.5-rc.2`.** On a newer release, the plugin may need re-adaptation; it will report a clear error naming the missing capability rather than failing silently.
+**Tested against DSH `0.1.5-rc.2`.** On a newer release, the plugin may need re-adaptation; it will report a clear error naming the missing capability rather than failing silently. The step-by-step checklist lives in [`docs/dsh-upgrade.md`](./docs/dsh-upgrade.md).
 
 ## License
 

@@ -1,0 +1,66 @@
+{
+  "name": "dsh-tavily-pool",
+  "version": "0.1.0",
+  "description": "Tavily-backed web search and page fetching for DeepSeek Harness: multi-key pool with balance-aware scheduling, automatic failover, cooldown, and usage stats.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "default": "./index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "docs/usage.md",
+    "docs/usage.zh-CN.md",
+    "docs/dsh-upgrade.md",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stormbuf/dsh-tavily-pool.git"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "tavily",
+    "web-search",
+    "web-fetch"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.2 <5",
+    "@deepseek-ai/dsh-settings": ">=0.1.5-rc.2 <0.1.6",
+    "@deepseek-ai/dsh-web": ">=0.1.5-rc.2 <0.1.6",
+    "@deepseek-ai/dsh-web-fetch-http": ">=0.1.5-rc.2 <0.1.6",
+    "@deepseek-ai/dsh-web-search-deepseek": ">=0.1.5-rc.2 <0.1.6",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-settings": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-web": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-web-fetch-http": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-web-search-deepseek": "0.1.5-rc.2",
+    "@deepseek-ai/schemastery": "3.18.2"
+  }
+}

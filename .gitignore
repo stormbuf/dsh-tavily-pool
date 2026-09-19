@@ -31,3 +31,10 @@ docs/adr/
 # ============================================================================
 node_modules/
 dist/
+
+# Local dev install of the host packages `npm test` needs; the published
+# plugin itself has zero runtime dependencies.
+package-lock.json
+
+# macOS metadata
+.DS_Store

@@ -1,0 +1,21 @@
+# dsh-tavily-pool bundle patch: mount the plugin and pin BOTH web providers to it.
+#
+# ⚠️ `config` on an id-targeted patch REPLACES the whole config object
+# (`cordis-plugin-include` does `target[key] = value`), it does not merge. Both
+# provider fields must therefore be written out together: omitting one leaves it
+# "unconfigured", which silently falls back to auto-selection instead of
+# erroring. This is the exact mistake `dsh-tavily@0.3.1` shipped.
+#
+# To roll back by hand, point both values back at the official providers:
+#   searchProvider: deepseek-official
+#   fetchProvider: http
+# See docs/usage.md ("Manual rollback").
+
+- insert:
+    - id: tavily-pool
+      name: dsh-tavily-pool
+
+- id: web
+  config:
+    searchProvider: tavily
+    fetchProvider: tavily
