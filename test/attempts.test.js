@@ -295,6 +295,79 @@ describe('取消与记账', () => {
 });
 
 describe('SCHED-9：等待预算的折算', () => {
+  test('冷却在本次预算内到期时，等它结束并成功', async () => {
+    const start = Date.parse('2026-09-19T00:00:00Z');
+    let now = start;
+    const { pool, health, ids } = await harness([{ label: 'cooling' }], {
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+    });
+    await health.recordFailure(ids.cooling, { failure: { status: 429, retryAfter: '30' }, nowMs: now });
+
+    const scheduler = new Scheduler({
+      pool,
+      health,
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+    });
+    let invoked = false;
+    const outcome = await runWithFailover({
+      scheduler,
+      health,
+      deadlineMs: start + 60_000,
+      now: () => now,
+      invoke: async () => {
+        invoked = true;
+        return { result: { sources: [], truncated: false }, credits: 1 };
+      },
+    });
+
+    assert.equal(outcome.keyId, ids.cooling, '冷却一结束它就该重新成为候选');
+    assert.equal(invoked, true, '等待必须换来一次真实的尝试');
+    assert.equal(now, start + 30_000, '等满了整整 30 秒');
+  });
+
+  test('冷却超出本次预算时立刻失败，且一次请求都不发', async () => {
+    const start = Date.parse('2026-09-19T00:00:00Z');
+    let now = start;
+    const { pool, health, ids } = await harness([{ label: 'cooling' }], {
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+    });
+    await health.recordFailure(ids.cooling, { failure: { status: 429, retryAfter: '300' }, nowMs: now });
+
+    const scheduler = new Scheduler({
+      pool,
+      health,
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+    });
+    let invoked = false;
+    const error = await runWithFailover({
+      scheduler,
+      health,
+      deadlineMs: start + 60_000,
+      now: () => now,
+      invoke: async () => {
+        invoked = true;
+        return {};
+      },
+    }).catch((thrown) => thrown);
+
+    assert.equal(invoked, false, '等一个到不了的到期时刻不会让请求成功，只会推迟失败');
+    assert.equal(now, start, '一点都不等');
+    assert.equal(error.code, 'TAVILY_NO_USABLE_KEY');
+    assert.match(error.message, /cooling down/u);
+  });
+
   test('固定预算内等待，且不吃掉全部剩余时间', () => {
     const now = 1_000_000;
     assert.equal(
