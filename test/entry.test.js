@@ -34,9 +34,10 @@ import { MissingHostCapabilityError } from '../lib/dsh/register.js';
  * @param options.harnessHome - `ctx.dshHomePath` 上报的 harness 主目录。
  * @param options.omitRegistration - 移除 seam 的注册函数。
  * @param options.settings - 命名空间的初始值。
+ * @param options.environment - launcher 环境快照的内容；默认为空。
  * @returns `{ ctx, registered, warnings, registerCalls, settings }`。
  */
-function fakeHost({ harnessHome, omitRegistration = false, settings = {} } = {}) {
+function fakeHost({ harnessHome, omitRegistration = false, settings = {}, environment = {} } = {}) {
   const registered = [];
   const warnings = [];
   const values = { ...settings };
@@ -68,6 +69,11 @@ function fakeHost({ harnessHome, omitRegistration = false, settings = {} } = {})
     clientModules: {},
     connection: { fetch: { register: () => async () => {} } },
     dshHomePath: (...segments) => join(harnessHome ?? '/nonexistent-home/.dsh', ...segments),
+    // 宿主总会放一份 launcher 环境快照，因此替身也必须有——**而且默认是空的**。
+    // `launchEnvironmentOf` 在快照缺席时会退回真实的 `process.env`，于是「本机没配
+    // DEEPSEEK_API_KEY」这个环境偶然事实会变成回落用例的隐含前提：开发机上装了官方
+    // 凭据，这些用例就会莫名其妙地红。默认空快照让结果只取决于测试自己给的东西。
+    launchEnvironment: { get: (name) => environment[name] },
   };
   if (omitRegistration) delete services.web.registerSearchProvider;
 
@@ -212,25 +218,151 @@ describe('PIN-2 / 硬约束 1：available() 恒为 true', () => {
   });
 });
 
-describe('搜索失败会带上可据以行动的 code 上报', () => {
-  test('空池会告诉用户去哪里添加密钥', async () => {
+describe('PIN-3 / SCHED-5：没有可用候选时回落到官方提供方', () => {
+  test('空池回落，且错误同时说清起点与回落目标', async () => {
     const host = fakeHost({ harnessHome: await temporaryHarnessHome() });
     apply(host.ctx, {});
 
     const error = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
-    assert.equal(error.code, 'TAVILY_NO_USABLE_KEY');
-    assert.match(error.message, /no Tavily key is configured/u);
-    assert.match(error.message, /dsh-tavily-pool/u);
+
+    // 本机没有官方凭据，因此回落目标报的是「凭据未配置」。要紧的是这两件事都在错误里：
+    // 用户刚被从 Tavily 那条路踢出来，只看到一条关于 DeepSeek 凭据的错误会让他去修
+    // 错的东西。
+    assert.equal(error.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
+    assert.match(error.message, /no Tavily key is configured/u, '必须说清为什么离开 Tavily');
+    assert.match(error.message, /DEEPSEEK_API_KEY/u, '必须说清回落目标缺的是什么');
   });
 
-  test('损坏的密钥池文件按路径上报，而不是报成空池', async () => {
+  test('损坏的密钥池文件回落，但仍按路径把文件问题说出来', async () => {
     const host = fakeHost({ harnessHome: await temporaryHarnessHome('not json at all') });
     apply(host.ctx, {});
 
     const error = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
-    assert.equal(error.code, 'TAVILY_NO_USABLE_KEY');
-    assert.match(error.message, /could not be read/u);
-    assert.match(error.message, /keys\.json/u);
+
+    assert.equal(error.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
+    assert.match(error.message, /could not be read/u, '文件坏了与没加密钥要用户做的事不同');
+    assert.match(error.message, /keys\.json/u, '并且要点名是哪个文件');
+    assert.match(
+      host.warnings.join('\n'),
+      /falling back to the official search provider/u,
+      '回落成功会掩盖这条线索，因此它必须至少留在日志里',
+    );
+    assert.match(host.warnings.join('\n'), /keys\.json/u, '日志里也要点名是哪个文件');
+  });
+
+  test('回落到官方并**成功**时也留下痕迹，且同一原因只记一次', async () => {
+    // 这一条不是可有可无的：本机通常配着 DEEPSEEK_API_KEY，于是密钥池为空的用户会静默地
+    // 用上官方搜索——面板上两个开关都开着、搜索也正常工作，没有任何迹象说明 Tavily 根本
+    // 没被用上。
+    const host = fakeHost({ harnessHome: await temporaryHarnessHome() });
+    apply(host.ctx, {});
+
+    const original = globalThis.fetch;
+    // 一份官方提供方会当作成功的最小 Messages 响应：它要求响应里有
+    // `web_search_tool_result` 块，缺了会按 WEB_PROVIDER_ERROR 抛错。
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      content: [{
+        type: 'web_search_tool_result',
+        content: [{ type: 'web_search_result', url: 'https://official.example', title: 'T' }],
+      }],
+    }), { status: 200 });
+    try {
+      // 给官方提供方一份字面凭据，让它走到「成功」而不是「凭据缺失」。
+      host.ctx.services.settings.get = (namespace) => (namespace === 'web-search-deepseek'
+        ? { apiKey: 'sk-literal' }
+        : { searchEnabled: true });
+      const before = host.warnings.length;
+      let served = 0;
+      for (let index = 0; index < 3; index += 1) {
+        const result = await host.registered[0].search({ query: 'q' }).catch(() => undefined);
+        if (result?.sources?.length > 0) served += 1;
+      }
+
+      assert.equal(served, 3, '三次都应当由官方提供方成功服务');
+      const logged = host.warnings.slice(before).filter((message) => /serving this search through/u.test(message));
+      assert.equal(logged.length, 1, '回落成功要留痕，但同一个原因不该每次搜索都刷一遍');
+      assert.match(logged[0], /no Tavily key is usable/u, '痕迹里要写清为什么离开 Tavily');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test('坏文件是个持续状态：连搜三次只报告一次，不刷屏', async () => {
+    const host = fakeHost({ harnessHome: await temporaryHarnessHome('not json at all') });
+    apply(host.ctx, {});
+    const before = host.warnings.length;
+
+    for (let index = 0; index < 3; index += 1) {
+      await host.registered[0].search({ query: 'q' }).catch(() => undefined);
+    }
+
+    // 每一次搜索都会重新看见同一个 loadError。若不加抑制，一次持续的文件损坏会在日志里
+    // 堆成一条与搜索次数成正比的长龙，把真正新发生的事淹掉。
+    assert.equal(
+      host.warnings.slice(before).filter((message) => /key pool at/u.test(message)).length,
+      1,
+      '同一个坏文件只报告一次',
+    );
+  });
+
+  test('换成另一种坏法时应当**再报一次**，而不是被当成同一个旧故障', async () => {
+    // `reportedPoolLoadError` 是「新发生的故障」与「同一个旧故障」的分界。去重若做得过头，
+    // 换了坏法的第二次损坏就会彻底静默——那比刷屏更糟。
+    //
+    // 注意两次损坏之间**没有**「先修好」这一步：密钥池一旦成功加载就被记忆化，此后不再
+    // 重读（面板编辑走的是同一份内存文档，因此不受影响；手工改文件要重启才生效）。而
+    // 读取失败时 `ensureLoaded` 会丢弃记忆，于是下一次搜索真的会重新读——那正是这里要压
+    // 的那条路径。
+    const home = await temporaryHarnessHome('not json at all');
+    const host = fakeHost({ harnessHome: home });
+    apply(host.ctx, {});
+
+    await host.registered[0].search({ query: 'q' }).catch(() => undefined);
+    assert.equal(host.warnings.filter((message) => /key pool at/u.test(message)).length, 1);
+
+    // 换成另一种坏法：能解析成 JSON，但不匹配 schema。
+    await writeFile(join(home, STATE_DIR_NAME, KEYS_FILE_NAME), '{"version":99}', 'utf8');
+    await host.registered[0].search({ query: 'q' }).catch(() => undefined);
+
+    const reported = host.warnings.filter((message) => /key pool at/u.test(message));
+    assert.equal(reported.length, 2, '换了坏法是一次新故障，必须再报一次');
+    assert.match(reported[1], /does not match the expected schema/u, '第二次报的是新的原因');
+  });
+
+  test('手工修好坏文件之后无需重启即可重新用上 Tavily', async () => {
+    // 这条压的是一个真实的回归：`load()` 对坏文件**不抛错**（按 POOL-7 以空池继续），
+    // 因此「成功兑现」会把密钥池的加载记忆化钉死。用户照日志里的话修好 keys.json 之后，
+    // 插件若仍抱着那份空池，症状就是「我修好了，搜索却还是不走 Tavily」，而且只有重启
+    // 才能恢复——用户没有任何线索知道要这么做。
+    const home = await temporaryHarnessHome('not json at all');
+    const host = fakeHost({ harnessHome: home });
+    apply(host.ctx, {});
+
+    const first = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
+    assert.equal(first.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING', '先是回落');
+    assert.equal(host.warnings.filter((message) => /key pool at/u.test(message)).length, 1);
+
+    // 用户按日志的指引修好文件。
+    await writeFile(
+      join(home, STATE_DIR_NAME, KEYS_FILE_NAME),
+      JSON.stringify({
+        version: 1,
+        keys: [{ id: 'a', key: 'tvly-dev-repaired-aaaaaaaaaaaa', disabled: false }],
+        order: ['a'],
+        stats: {},
+        usageCache: {},
+      }),
+      'utf8',
+    );
+
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      (calls) => host.registered[0].search({ query: 'q' }).then((value) => ({ value, calls })),
+    );
+
+    assert.equal(result.value.sources.length, 1, '修好之后就该重新走 Tavily，不该需要重启');
+    assert.match(result.calls[0].url, /api\.tavily\.com\/search/u);
+    assert.match(result.calls[0].authorization, /repaired/u, '用的应当是刚修好的那把密钥');
   });
 });
 
@@ -257,6 +389,7 @@ async function withStubbedFetch(handler, run) {
   globalThis.fetch = async (url, init) => {
     const call = {
       url,
+      method: init?.method,
       authorization: init?.headers?.authorization,
       body: JSON.parse(init?.body ?? '{}'),
     };
@@ -377,6 +510,7 @@ describe('调度与故障切换经入口真实生效', () => {
   });
 
   test('额度耗尽的密钥不会被选中，也不需要等待', async () => {
+    // 标记刚发生，尚未跨过任何月起始，因此不落在 SCHED-10 的探测窗口内。
     const home = await temporaryHarnessHome(JSON.stringify({
       version: 1,
       keys: [{ id: 'a', key: 'tvly-dev-out-of-credits-aaaaaaaa', disabled: false }],
@@ -390,8 +524,8 @@ describe('调度与故障切换经入口真实生效', () => {
     const startedAt = Date.now();
     const error = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
 
-    assert.equal(error.code, 'TAVILY_NO_USABLE_KEY');
-    assert.match(error.message, /out of credits/u);
+    assert.equal(error.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
+    assert.match(error.message, /out of credits/u, '回落的原因必须带上：用户要知道为什么离开 Tavily');
     assert.ok(Date.now() - startedAt < 5_000, '额度耗尽不可等待：恢复可能在下月 1 日');
   });
 
@@ -407,7 +541,7 @@ describe('调度与故障切换经入口真实生效', () => {
     apply(host.ctx, {});
 
     const error = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
-    assert.equal(error.code, 'TAVILY_NO_USABLE_KEY');
+    assert.equal(error.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
     assert.match(error.message, /no Tavily key is configured/u);
   });
 
@@ -416,16 +550,18 @@ describe('调度与故障切换经入口真实生效', () => {
     host.setSettings({ searchEnabled: false });
 
     let requests = 0;
-    const error = await withStubbedFetch(
+    const { result: error } = await withStubbedFetch(
       () => {
         requests += 1;
         return { status: 200, body: {} };
       },
       () => host.registered[0].search({ query: 'q' }).catch((thrown) => thrown),
-    ).then(({ result }) => result);
+    );
 
     assert.equal(requests, 0, '开关关闭时不得向 api.tavily.com 发起任何请求');
-    assert.equal(error.code, 'TAVILY_SEARCH_DISABLED', '并且要说清楚发生了什么');
+    // 本机没有官方凭据，于是回落目标报「凭据未配置」；而原因里写着起点是开关。
+    assert.equal(error.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
+    assert.match(error.message, /toggle is off/u, '要说清楚是开关关的，而不是池子空了');
   });
 
   test('开关改动即时生效，无需重新注册提供方', async () => {
@@ -434,7 +570,8 @@ describe('调度与故障切换经入口真实生效', () => {
 
     host.setSettings({ searchEnabled: false });
     const disabled = await provider.search({ query: 'q' }).catch((thrown) => thrown);
-    assert.equal(disabled.code, 'TAVILY_SEARCH_DISABLED');
+    assert.equal(disabled.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
+    assert.match(disabled.message, /toggle is off/u);
 
     host.setSettings({ searchEnabled: true });
     const { result } = await withStubbedFetch(
@@ -486,5 +623,221 @@ describe('调度与故障切换经入口真实生效', () => {
       // 恢复权限，否则临时目录无法清理。
       await chmod(stateDir, 0o700);
     }
+  });
+});
+
+describe('CFG-3：搜索参数经设置生效，且改动无需重启', () => {
+  test('默认参数被送进请求体', async () => {
+    const host = await hostWithKeys([{ label: 'only' }], { settings: { [SETTINGS_NAMESPACE]: {} } });
+
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      (calls) => host.registered[0].search({ query: 'q' }).then((value) => ({ value, calls })),
+    );
+
+    assert.equal(result.calls[0].body.search_depth, 'basic');
+    assert.equal(result.calls[0].body.topic, 'general');
+    assert.equal(result.calls[0].body.include_answer, false);
+    assert.equal(result.calls[0].body.max_results, 10);
+    assert.equal(result.calls[0].body.include_usage, true, 'REST-2：记账的前提');
+  });
+
+  test('改 searchDepth 之后下一次搜索立即生效', async () => {
+    const host = await hostWithKeys([{ label: 'only' }], { settings: { [SETTINGS_NAMESPACE]: {} } });
+    const provider = host.registered[0];
+    const respond = () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } });
+
+    const before = await withStubbedFetch(respond, (calls) => provider.search({ query: 'q' }).then((v) => ({ v, calls })));
+    assert.equal(before.result.calls[0].body.search_depth, 'basic');
+
+    host.setSettings({ searchDepth: 'advanced', topic: 'news', includeAnswer: true, maxResults: 3 });
+
+    const after = await withStubbedFetch(respond, (calls) => provider.search({ query: 'q' }).then((v) => ({ v, calls })));
+    assert.equal(after.result.calls[0].body.search_depth, 'advanced');
+    assert.equal(after.result.calls[0].body.topic, 'news');
+    assert.equal(after.result.calls[0].body.include_answer, true);
+    assert.equal(after.result.calls[0].body.max_results, 3);
+    assert.equal(host.registered.length, 1, '不得为了携带新参数而重新注册提供方');
+  });
+
+  test('调用方的 maxResults 更小时听调用方的', async () => {
+    const host = await hostWithKeys([{ label: 'only' }], {
+      settings: { [SETTINGS_NAMESPACE]: { maxResults: 20 } },
+    });
+
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      (calls) => host.registered[0].search({ query: 'q', maxResults: 4 }).then((value) => ({ value, calls })),
+    );
+
+    assert.equal(result.calls[0].body.max_results, 4);
+  });
+
+  test('include_answer 为真时响应里的 answer 成为结果的 content', async () => {
+    const host = await hostWithKeys([{ label: 'only' }], {
+      settings: { [SETTINGS_NAMESPACE]: { includeAnswer: true } },
+    });
+
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { answer: 'the answer', results: [{ url: 'https://ok.example' }] } }),
+      () => host.registered[0].search({ query: 'q' }),
+    );
+
+    assert.equal(result.content, 'the answer');
+    assert.equal(result.sources.length, 1);
+  });
+});
+
+describe('SCHED-10：跨月起始后自动探测并恢复', () => {
+  /** 一把在某个时刻被标记为额度耗尽的密钥所在的 harness home。 */
+  async function homeWithExhaustedKey(markedAt) {
+    return temporaryHarnessHome(JSON.stringify({
+      version: 1,
+      keys: [{ id: 'a', key: 'tvly-dev-exhausted-aaaaaaaaaaaa', disabled: false }],
+      order: ['a'],
+      stats: { a: { quotaExhaustedAt: new Date(markedAt).toISOString() } },
+      usageCache: {},
+    }));
+  }
+
+  /**
+   * 在桩住的时钟下加载插件并跑一个用例。
+   *
+   * 时钟必须在 `apply()` **之前**装上：协作者把 `Date.now` 作为构造参数的默认值捕获
+   * （`now = Date.now`），因此 `apply()` 之后再替换全局函数是无效的——插件仍持着原来
+   * 那个引用。这不是测试的怪癖，而是「依赖注入而非全局读取」的直接后果。
+   *
+   * @param markedAt - 额度耗尽的标记时刻。
+   * @param nowIso - 本次用例看到的当前时刻。
+   * @param run - 收到已加载的 host 与桩住的 fetch 调用记录。
+   */
+  async function withFrozenClock(markedAt, nowIso, run) {
+    const home = await homeWithExhaustedKey(markedAt);
+    const realNow = Date.now;
+    Date.now = () => Date.parse(nowIso);
+    try {
+      const host = fakeHost({ harnessHome: home });
+      apply(host.ctx, {});
+      return await run(host);
+    } finally {
+      Date.now = realNow;
+    }
+  }
+
+  test('跨过月起始后先探测，恢复则用同一把密钥完成本次搜索', async () => {
+    // 标记发生在 3 月 20 日，因此第一个月起始是 4 月 1 日 00:00 UTC。
+    await withFrozenClock('2026-03-20T10:00:00Z', '2026-04-01T00:00:30Z', async (host) => {
+      const { result } = await withStubbedFetch(
+        (call) => (call.url.includes('/usage')
+          ? { status: 200, body: { key: { usage: 0, limit: 1000 }, account: { plan_limit: 1000 } } }
+          : { status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+        (calls) => host.registered[0].search({ query: 'q' }).then((value) => ({ value, calls })),
+      );
+
+      assert.equal(result.value.sources.length, 1, '探测确认恢复之后，本次搜索应当用这把密钥完成');
+      assert.equal(result.calls[0].url, 'https://api.tavily.com/usage', '先探测');
+      assert.equal(result.calls[0].method, 'GET', '/usage 只能是 GET');
+      assert.match(result.calls[1].url, /api\.tavily\.com\/search/u, '探测确认恢复后才搜索');
+
+      // 恢复之后额度耗尽的标记应当已被清掉，且探测记录也一并清掉。
+      const onDisk = JSON.parse(await readFile(join(host.ctx.services.dshHomePath(STATE_DIR_NAME), KEYS_FILE_NAME), 'utf8'));
+      assert.equal(onDisk.stats.a.quotaExhaustedAt, undefined, 'SCHED-8：官方确认余额回升才恢复');
+    });
+  });
+
+  test('探测显示仍未恢复时回落，且不再向搜索端点发请求', async () => {
+    await withFrozenClock('2026-03-20T10:00:00Z', '2026-04-01T00:00:30Z', async (host) => {
+      const { result } = await withStubbedFetch(
+        () => ({ status: 200, body: { key: { usage: 100, limit: 100 }, account: { plan_limit: 100 } } }),
+        (calls) => host.registered[0].search({ query: 'q' }).catch((thrown) => thrown).then((value) => ({ value, calls })),
+      );
+
+      assert.equal(result.value.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
+      assert.match(result.value.message, /out of credits/u);
+      assert.equal(
+        result.calls.filter((call) => call.url.includes('/search')).length,
+        0,
+        '探测没确认恢复，就不该再向搜索端点发请求',
+      );
+    });
+  });
+
+  test('探测过后 6 小时内不再探测，避免打满官方配额', async () => {
+    const markedAt = '2026-03-20T10:00:00Z';
+    const home = await homeWithExhaustedKey(Date.parse(markedAt));
+    const realNow = Date.now;
+    let probes = 0;
+    const respond = (call) => {
+      if (call.url.includes('/usage')) {
+        probes += 1;
+        return { status: 200, body: { key: { usage: 100, limit: 100 } } };
+      }
+      return { status: 200, body: {} };
+    };
+
+    try {
+      Date.now = () => Date.parse('2026-04-01T00:00:30Z');
+      const host = fakeHost({ harnessHome: home });
+      apply(host.ctx, {});
+      await withStubbedFetch(respond, () => host.registered[0].search({ query: 'q' }).catch(() => undefined));
+
+      // 同一个探测窗口内再搜三次：一次都不该再问官方。
+      Date.now = () => Date.parse('2026-04-01T01:00:00Z');
+      for (let index = 0; index < 3; index += 1) {
+        await withStubbedFetch(respond, () => host.registered[0].search({ query: 'q' }).catch(() => undefined));
+      }
+    } finally {
+      Date.now = realNow;
+    }
+
+    assert.equal(probes, 1, '6 小时栅格内只探测一次；否则 10 分钟就能把 /usage 配额打满');
+  });
+
+  test('标记尚未跨过月起始时不探测', async () => {
+    // 同一份密钥池，时钟停在标记当天。
+    await withFrozenClock('2026-03-20T10:00:00Z', '2026-03-20T11:00:00Z', async (host) => {
+      const { result } = await withStubbedFetch(
+        () => ({ status: 200, body: {} }),
+        (calls) => host.registered[0].search({ query: 'q' }).catch((thrown) => thrown).then((value) => ({ value, calls })),
+      );
+
+      assert.match(result.value.message, /out of credits/u);
+      assert.equal(result.value.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
+      assert.equal(result.calls.length, 0, '月中探测只会浪费官方配额，一次请求都不该发出');
+    });
+  });
+});
+
+describe('USAGE-5：搜索成功后按官方积分前推余额', () => {
+  test('成功搜索把 usage.credits 记进统计', async () => {
+    const host = await hostWithKeys([{ label: 'only' }]);
+
+    await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }], usage: { credits: 2 } } }),
+      () => host.registered[0].search({ query: 'q' }),
+    );
+
+    const onDisk = JSON.parse(
+      await readFile(join(host.ctx.services.dshHomePath(STATE_DIR_NAME), KEYS_FILE_NAME), 'utf8'),
+    );
+    const [stats] = Object.values(onDisk.stats);
+    assert.equal(stats.credits, 2, 'REST-3：用响应回传的 usage.credits 记账');
+    assert.equal(stats.successes, 1);
+  });
+
+  test('缺失 credits 记「未知」而不是 0', async () => {
+    const host = await hostWithKeys([{ label: 'only' }]);
+
+    await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      () => host.registered[0].search({ query: 'q' }),
+    );
+
+    const onDisk = JSON.parse(
+      await readFile(join(host.ctx.services.dshHomePath(STATE_DIR_NAME), KEYS_FILE_NAME), 'utf8'),
+    );
+    const [stats] = Object.values(onDisk.stats);
+    assert.equal(stats.credits, undefined, 'credits 不得被记成 0：那会让余额前推长期偏低');
+    assert.equal(stats.creditsUnknown, 1, '而这次「不知道消耗了多少」必须留下痕迹');
   });
 });

@@ -15,6 +15,7 @@ Tavily-backed web search **and** page fetching for DeepSeek Harness: multi-key p
 - **Status-aware errors** — separates temporary failures, permanent key death (body-inspected, never status-code-only), and quota exhaustion (`432` / `433` treated alike: the key stays out of rotation until `/usage` confirms a positive balance)
 - **Usage accounting** — reads real `usage.credits` from responses; unknown is recorded as unknown, never as zero
 - **Balance refresh** — pulls official `/usage` with per-key sliding-window quota reservation, so it never trips the 10-per-10-minutes limit
+- **Configurable search parameters** — search depth, result cap, topic, and generated-answer toggle, all taking effect immediately
 - **Fetch takeover** — maps `web_fetch` to Tavily `/extract`; billing follows successful-URL tiers
 - **Independent toggles** — search and fetch can be switched back to the official providers separately
 - **Zero runtime dependencies** — plain ESM, no build step

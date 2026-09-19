@@ -29,8 +29,11 @@ import {
 import { KeyHealth } from './lib/health.js';
 import { PoolStore } from './lib/pool.js';
 import { Scheduler } from './lib/scheduler.js';
+import { searchParamsOf, effectiveMaxResults } from './lib/settings.js';
 import { TavilyError, searchTavily } from './lib/tavily.js';
+import { UsageQuota, UsageRefresher } from './lib/usage.js';
 import { probeCapabilities, describeMissingCapabilities } from './lib/dsh/capabilities.js';
+import { searchWithOfficialProvider } from './lib/dsh/fallback.js';
 import { resolveStateDir } from './lib/dsh/home-path.js';
 import { registerSearchProvider } from './lib/dsh/register.js';
 import { TavilySearchProvider } from './lib/dsh/search-provider.js';
@@ -67,8 +70,14 @@ export const Config = z.object({});
  * @property {PoolStore|undefined} pool
  * @property {KeyHealth|undefined} health
  * @property {Scheduler|undefined} scheduler
+ * @property {UsageRefresher|undefined} usageRefresher
  * @property {Promise<void>|undefined} poolLoad
  * @property {Error|undefined} initError
+ * @property {string|undefined} reportedPoolLoadError - 已经报告过的那次密钥池读取失败的
+ *   消息，用于让一个持续存在的坏文件只产生一条日志，而不是每次搜索各一条。
+ * @property {string|undefined} reportedFallbackReason - 已经报告过的那次回落原因，同样
+ *   用于去重：一次成功的回落会让请求静默地走上官方提供方，因此它必须留下痕迹，但同一个
+ *   原因不该每次搜索都刷一遍。
  */
 
 /**
@@ -85,8 +94,11 @@ export function apply(ctx, _config) {
     pool: undefined,
     health: undefined,
     scheduler: undefined,
+    usageRefresher: undefined,
     poolLoad: undefined,
     initError: undefined,
+    reportedPoolLoadError: undefined,
+    reportedFallbackReason: undefined,
   };
 
   // 刻意作为第一条效果语句（硬约束 5）：profile patch 把 searchProvider pin 到本插件，
@@ -108,6 +120,14 @@ export function apply(ctx, _config) {
     state.pool = new PoolStore({ dir: resolveStateDir(ctx), fileName: KEYS_FILE_NAME });
     state.health = new KeyHealth({ pool: state.pool });
     state.scheduler = new Scheduler({ pool: state.pool, health: state.health });
+    state.usageRefresher = new UsageRefresher({
+      pool: state.pool,
+      health: state.health,
+      quota: new UsageQuota(),
+      // 与搜索共用 `globalThis.fetch`：两者都是对同一个 API 的出站请求，测试里替换
+      // 一次就该同时覆盖它们，而不是留下一条绕开替换的隐藏通道。
+      fetchImpl: (...args) => globalThis.fetch(...args),
+    });
   } catch (error) {
     state.initError = error;
     report(ctx, 'warn', `dsh-tavily-pool: initialization failed, continuing with search registered: ${String(error)}`);
@@ -151,6 +171,18 @@ function report(ctx, level, message) {
  * 之所以按次解析而非在加载时捕获：密钥池会随用户编辑而变化，设置会随面板变化；把
  * 这些读取留在每次搜索的开头，正是「改动即时生效、且无需重新注册提供方」的实现。
  *
+ * **回落共有三条入口**，全部收敛到 {@link fallbackToOfficial}，因而三种情形在用户
+ * 那里得到同一套错误面（`PIN-3`、`SCHED-5`）：
+ *
+ * 1. 搜索开关关闭；
+ * 2. 密钥池文件不可读——按 `POOL-7` 以空池继续，于是落进第 3 条；
+ * 3. 池内没有任何**可能在本次请求内恢复**的候选（空池、全部停用、全部额度耗尽或
+ *    永久失效）。
+ *
+ * 第 3 条**不**覆盖「刚试过、刚失败」的情形：那时手上有真实的上游响应，`REST-10`
+ * 要求把它透穿给调用方，而不是换一个来源重试。两者的分界在编排层，见
+ * {@link runWithFailover} 的 `blocked` 字段。
+ *
  * @param state - 插件运行时状态。
  * @param request - seam 的搜索请求。
  * @param signal - 调用方取消信号。
@@ -173,64 +205,185 @@ async function search(state, request, signal) {
     });
   }
 
-  // 开关先判：它与密钥池能不能读、有没有密钥都无关，关闭时**回落**（`PIN-3`）。
-  // 回落目标属于 `05`，因此这里先给出一个说明清楚的错误，而不是静默地继续用 Tavily
-  // 搜索——后者会让面板上的开关看起来生效了，实际却没生效。
   const settings = readPluginSettings(state.ctx);
+  // 开关先判：它与密钥池能不能读、有没有密钥都无关（`PIN-3`）。这也是唯一一条**不**
+  // 需要先把池读进来的回落路径，因此它排在最前。
   if (settings.searchEnabled !== true) {
-    throw new TavilyError(
-      `Tavily search is turned off in Settings → Plugins → ${SETTINGS_NAMESPACE}, and the fallback to `
-      + 'the built-in DeepSeek search provider is not wired up yet',
-      { code: 'TAVILY_SEARCH_DISABLED' },
-    );
+    return fallbackToOfficial(state, request, signal, `the Tavily search toggle is off (${SETTINGS_NAMESPACE})`);
   }
 
   await ensureLoaded(state);
 
-  // 密钥池文件存在但不可信（`POOL-7`）时按路径上报，而不是报成「一把密钥都没配」：
-  // 前者要用户去修文件，后者要用户去加密钥，是两件事。
+  // 密钥池文件存在但不可信（`POOL-7`）：按空池继续，因此直接落进下面的「没有候选」
+  // 分支去回落。**这条线索只报告一次**——文件坏掉是个持续状态，每一次搜索都刷同一条
+  // 日志只会把真正新发生的事淹掉。回落一旦成功，这条记录就只剩日志与面板了。
+  //
+  // 按**消息文本**而不是错误对象去重：坏文件每次搜索都会被重新读一遍（见 `ensureLoaded`），
+  // 于是每次都是一个新对象，用身份比较等于没有去重。
   if (state.pool.loadError !== undefined) {
-    throw new TavilyError(
-      `the key pool could not be read (${state.pool.loadError.message}); fix or remove `
-      + `${state.pool.filePath} and add a key in Settings → Plugins → ${SETTINGS_NAMESPACE}`,
-      { code: 'TAVILY_NO_USABLE_KEY', cause: state.pool.loadError },
-    );
+    const message = state.pool.loadError.message;
+    if (state.reportedPoolLoadError !== message) {
+      state.reportedPoolLoadError = message;
+      report(
+        state.ctx,
+        'warn',
+        `dsh-tavily-pool: ${message}; falling back to the official search provider `
+        + `and starting from an empty pool. Fix or remove ${state.pool.filePath} to use Tavily again.`,
+      );
+    }
+    return fallbackToOfficial(state, request, signal, `the key pool could not be read: ${message}`);
   }
 
   const startedAt = Date.now();
   const deadlineMs = startedAt + SEARCH_TOTAL_BUDGET_MS;
-  const { result } = await runWithFailover({
-    scheduler: state.scheduler,
-    health: state.health,
-    signal,
-    // 总预算交给编排层：有界等待（`SCHED-9`）与单次尝试的超时都从它里面分。
-    deadlineMs,
-    invoke: ({ key }) => searchTavily({
-      apiKey: key,
-      query: request.query,
-      maxResults: request.maxResults,
-      params: searchParams(state.ctx),
+  let result;
+  try {
+    ({ result } = await runWithFailover({
+      scheduler: state.scheduler,
+      health: state.health,
       signal,
-      fetchImpl: globalThis.fetch,
-      timeoutMs: attemptTimeoutMs(deadlineMs),
-    }),
-  });
-
-  // 统计落盘失败不影响本次结果——它不是正确性前提——但绝不能是静默的：用户下次打开
-  // 面板时会看到一份「这把密钥从没被用过」的记录，而没有任何线索说明为什么。
-  //
-  // 报告后即清除：留着它会让一次瞬时故障在此后每一次搜索上都重复告警，而那条日志
-  // 早已完成使命。下一次真的又失败时，它会再次被设上。
-  if (state.pool.lastWriteError !== undefined) {
-    report(
-      state.ctx,
-      'warn',
-      `dsh-tavily-pool: could not record key stats in ${state.pool.filePath}: `
-      + `${String(state.pool.lastWriteError)}`,
-    );
-    state.pool.lastWriteError = undefined;
+      // 总预算交给编排层：有界等待（`SCHED-9`）与单次尝试的超时都从它里面分。
+      deadlineMs,
+      // `SCHED-5` 的例外：池内只剩额度耗尽的密钥时，先看看有没有哪把已经跨过月起始、
+      // 值得问一次官方（`SCHED-10`）。
+      probeQuota: () => probeQuotaForReset(state, signal),
+      invoke: ({ key }) => searchTavily({
+        apiKey: key,
+        query: request.query,
+        // 用户配置与调用方请求取较小者：两者都是真实的上界，见 `effectiveMaxResults`。
+        maxResults: effectiveMaxResults(settings.maxResults, request.maxResults),
+        params: searchParamsOf(settings),
+        signal,
+        fetchImpl: globalThis.fetch,
+        timeoutMs: attemptTimeoutMs(deadlineMs),
+      }),
+    }));
+  } catch (error) {
+    // 池内没有任何可能在本次请求内恢复的候选，且**没有**真实的上游失败可透穿：这正是
+    // `SCHED-5` 说的那种情形，按 `PIN-3` 回落。
+    if (error?.blocked === 'all-unusable' || error?.blocked === 'no-keys') {
+      return fallbackToOfficial(state, request, signal, `no Tavily key is usable: ${error.message}`);
+    }
+    throw error;
   }
+
+  reportWriteErrors(state);
   return result;
+}
+
+/**
+ * 回落到官方搜索提供方，并把「为什么回落」带进失败文案（`PIN-3`、`SCHED-5`、`CFG-5`）。
+ *
+ * 原因是必要的上下文而不只是日志：回落目标自己的凭据可能也没配，那时用户看到的会是一条
+ * 关于 **DeepSeek** 凭据的错误，而真正要修的东西两回事——他刚被从 Tavily 那条路踢出来。
+ * 把起点写进消息，用户才知道该看哪边。
+ *
+ * **回落成功时也记一条日志，每个不同的原因只记一次。** 这一条不是可有可无的：本机通常
+ * 配着 `DEEPSEEK_API_KEY`，于是密钥池为空的用户会**静默地**用上官方搜索——面板上两个开关
+ * 都是开的、搜索也正常工作，没有任何迹象说明 Tavily 根本没被用上。同一个原因反复刷屏同样
+ * 没有价值，因此按原因去重；原因变了（例如从「开关关了」变成「池子空了」）会重新记一次。
+ *
+ * @param state - 插件运行时状态。
+ * @param request - seam 的搜索请求。
+ * @param signal - 调用方取消信号。
+ * @param reason - 为什么回落。
+ * @returns seam 归一化后的结果。
+ */
+async function fallbackToOfficial(state, request, signal, reason) {
+  try {
+    const result = await searchWithOfficialProvider({ ctx: state.ctx, request, signal, reason });
+    if (state.reportedFallbackReason !== reason) {
+      state.reportedFallbackReason = reason;
+      report(
+        state.ctx,
+        'warn',
+        `dsh-tavily-pool: serving this search through the DeepSeek official provider instead of Tavily — `
+        + `${reason}.`,
+      );
+    }
+    return result;
+  } catch (error) {
+    if (error?.code === 'TAVILY_FALLBACK_CREDENTIAL_MISSING') {
+      throw new TavilyError(`${reason}. ${error.message}`, {
+        code: 'TAVILY_FALLBACK_CREDENTIAL_MISSING',
+        cause: error,
+      });
+    }
+    if (error?.code === 'TAVILY_FALLBACK_CREDENTIAL_INVALID') {
+      throw new TavilyError(`${reason}. ${error.message}`, {
+        code: 'TAVILY_FALLBACK_CREDENTIAL_INVALID',
+        cause: error,
+      });
+    }
+    if (error?.code === 'WEB_ABORTED') {
+      throw new TavilyError('Tavily search aborted by the caller', { code: 'TAVILY_ABORTED', cause: error });
+    }
+    throw error;
+  }
+}
+
+/**
+ * 对池内**该探测**的额度耗尽密钥各问一次官方余额（`SCHED-10`）。
+ *
+ * 「该探测」由密钥统计决定：标记之后跨过了月起始、且在 48 小时窗口内、距上次探测已满
+ * 6 小时。因此这一趟在正常情况下是空转，在最坏情况下也只发出个位数的请求——远低于
+ * `/usage` 的「10 次 / 10 分钟」配额，后者还由 {@link UsageQuota} 独立把关。
+ *
+ * **先记探测时刻、再发请求。** 顺序反过来时，一次失败的探测不会留下任何痕迹，下一次
+ * 搜索会立刻再探测一次，10 分钟内就能把官方配额打满——而被消耗的配额正好是恢复所
+ * 需要的那份。
+ *
+ * @param state - 插件运行时状态。
+ * @param signal - 调用方取消信号。
+ * @returns 探测之后至少有一把密钥重新可用时返回 true。
+ */
+async function probeQuotaForReset(state, signal) {
+  if (state.usageRefresher === undefined) return false;
+
+  const records = state.pool.keysInOrder().filter((record) => record.disabled !== true);
+  const due = state.health.quotaProbeDue(records.map((record) => record.id));
+  if (due.length === 0) return false;
+
+  const byId = new Map(records.map((record) => [record.id, record]));
+  let recovered = false;
+  for (const id of due) {
+    if (signal?.aborted === true) break;
+    await state.health.recordQuotaProbe(id);
+    const outcome = await state.usageRefresher.refresh(id, byId.get(id).key, { signal, reason: 'probe' });
+    if (outcome.recovered === true) recovered = true;
+    else if (outcome.ok === false && outcome.skipped !== 'quota') {
+      // 探测失败要说出来：它意味着「自动恢复」这条路径此刻是坏的，而用户对它的期待
+      // 正是「不用管，月初会自己好」。
+      report(
+        state.ctx,
+        'warn',
+        `dsh-tavily-pool: could not probe the balance of a quota-exhausted key: ${String(outcome.error)}`,
+      );
+    }
+  }
+  return recovered;
+}
+
+/**
+ * 把「状态没写进磁盘」上报一次，然后清掉标记。
+ *
+ * 统计落盘失败不影响本次结果——它不是正确性前提——但绝不能是静默的：用户下次打开
+ * 面板时会看到一份「这把密钥从没被用过」的记录，而没有任何线索说明为什么。
+ *
+ * 报告后即清除：留着它会让一次瞬时故障在此后每一次搜索上都重复告警，而那条日志
+ * 早已完成使命。下一次真的又失败时，它会再次被设上。
+ *
+ * @param state - 插件运行时状态。
+ */
+function reportWriteErrors(state) {
+  if (state.pool.lastWriteError === undefined) return;
+  report(
+    state.ctx,
+    'warn',
+    `dsh-tavily-pool: could not record key stats in ${state.pool.filePath}: `
+    + `${String(state.pool.lastWriteError)}`,
+  );
+  state.pool.lastWriteError = undefined;
 }
 
 /**
@@ -247,28 +400,26 @@ function attemptTimeoutMs(deadlineMs) {
 }
 
 /**
- * 搜索参数，由设置决定；`07` 落地。
+ * 加载密钥池；失败与「读到一份不可信的文件」两种情况都会在下次搜索时重试。
  *
- * 目前为空，从而保留 Tavily 自己的默认值，而不是在这里臆造一套。
+ * 记忆化是必要的（每个请求都读一次盘毫无意义），但有两种结果**不能**被记住：
  *
- * @param _ctx - 插件 context。
- * @returns 发给 Tavily 的搜索参数。
- */
-function searchParams(_ctx) {
-  return {};
-}
-
-/**
- * 加载密钥池，且失败后可重试。
- *
- * 记忆化是必要的（每个请求都读一次盘毫无意义），但在拒绝之后必须允许重试：一次
- * 临时性的文件系统故障不该让该进程此后每一次搜索都注定失败。
+ * 1. **拒绝**（读盘本身失败）：一次临时性的文件系统故障不该让该进程此后每一次搜索都
+ *    注定失败。
+ * 2. **`loadError`**（文件读到了，但内容是坏的）：`load()` 对这种情况**不抛错**——它
+ *    按 `POOL-7` 以空池继续，把问题挂在 `loadError` 上。于是「成功兑现」这个事实会
+ *    把记忆化钉死，用户手工修好 `keys.json` 之后插件仍会一直用那份空池，直到重启。
+ *    提交 `05`/`06` 之前这不成为症状（坏文件每次都抛错，用户看得见），现在它表现为
+ *    「我修好了文件，搜索却还是不走 Tavily」，因此必须在这里放开。
  *
  * @param state - 插件运行时状态。
  * @returns 加载完成的 promise。
  */
 async function ensureLoaded(state) {
-  state.poolLoad ??= state.pool.load().catch((error) => {
+  state.poolLoad ??= state.pool.load().then((pool) => {
+    if (pool.loadError !== undefined) state.poolLoad = undefined;
+    return pool;
+  }, (error) => {
     // 丢掉失败的 promise，让下一次搜索重新读取。
     state.poolLoad = undefined;
     throw error;

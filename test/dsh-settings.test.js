@@ -15,6 +15,7 @@ import test, { describe } from 'node:test';
 
 import { Context } from '@deepseek-ai/cordis';
 import { SettingsProvider } from '@deepseek-ai/dsh-settings';
+import schemaBuilder from '@deepseek-ai/schemastery';
 
 import { SETTINGS_NAMESPACE } from '../lib/constants.js';
 import { readPluginSettings, registerSettings } from '../lib/dsh/settings.js';
@@ -67,7 +68,13 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
     assert.notEqual(scope, undefined, '真实 settings 服务在场时必须注册成功');
     assert.deepEqual(
       ctx.settings.get(SETTINGS_NAMESPACE),
-      { searchEnabled: true },
+      {
+        searchEnabled: true,
+        searchDepth: 'basic',
+        maxResults: 10,
+        topic: 'general',
+        includeAnswer: false,
+      },
       '默认值必须由宿主按 schema 解析出来，而不是靠我们自己填',
     );
   });
@@ -121,19 +128,88 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
     const ctx = { get: () => undefined };
 
     assert.equal(registerSettings(ctx), undefined);
-    assert.deepEqual(readPluginSettings(ctx), { searchEnabled: true }, '缺席时用默认值');
+    assert.deepEqual(
+      readPluginSettings(ctx),
+      {
+        searchEnabled: true,
+        searchDepth: 'basic',
+        maxResults: 10,
+        topic: 'general',
+        includeAnswer: false,
+      },
+      '缺席时用默认值',
+    );
   });
 
   test('读取路径认得 schema 里的每一个字段', () => {
     // 一条防呆断言：schema 里有什么字段，`readSettings` 就得认什么字段。两处分开写是
     // 有意的（一处给宿主渲染，一处给运行时读取），代价是它们可能漂移——例如给 schema
     // 加了开关却忘了在读侧接上，那会得到一个面板上看得见、实际不生效的开关。
-    const shape = settingsSchema({
-      boolean: () => ({ default: () => ({ description: () => ({}) }) }),
-      object: (fields) => fields,
+    //
+    // 字段名取自**真实的** schema 对象：先前这里手搓了一个只认 `boolean` / `object`
+    // 的替身，于是 schema 一用到 `union` / `number` 它就先炸，报的是替身的毛病而不是
+    // 我们要防的漂移。
+    const shape = settingsSchema(schemaBuilder);
+
+    assert.deepEqual(Object.keys(readPluginSettings({ get: () => ({}) })), Object.keys(shape.dict));
+  });
+
+  test('用户文档里的越界取值被退回默认值，而不是原样发给 Tavily', async () => {
+    // settings.yaml 是一份可以直接编辑的文件，因此解析结果里完全可能出现一个 schema
+    // 永远不会写入的值。把它转发给 Tavily 会换回 400，而 400 按 REST-8 既不重试也不
+    // 切换密钥——那等于每一次搜索都注定失败。
+    const ctx = contextWithRealSettings();
+    registerSettings(ctx);
+
+    const settings = readPluginSettings({
+      get: () => ({
+        searchEnabled: true,
+        searchDepth: 'deep',
+        maxResults: 99,
+        topic: 'sports',
+        includeAnswer: 'yes',
+      }),
     });
 
-    assert.deepEqual(Object.keys(shape), ['searchEnabled']);
-    assert.deepEqual(Object.keys(readPluginSettings({ get: () => ({}) })), Object.keys(shape));
+    assert.deepEqual(settings, {
+      searchEnabled: true,
+      searchDepth: 'basic',
+      maxResults: 10,
+      topic: 'general',
+      includeAnswer: false,
+    });
+  });
+
+  test('maxResults 的下界是 1，因为 0 会被上游以 400 拒绝', async () => {
+    const ctx = contextWithRealSettings();
+    registerSettings(ctx);
+
+    await ctx.settings.update(SETTINGS_NAMESPACE, { maxResults: 1 });
+    assert.equal(readPluginSettings(ctx).maxResults, 1, '1 是合法取值');
+
+    await assert.rejects(
+      () => ctx.settings.update(SETTINGS_NAMESPACE, { maxResults: 0 }),
+      /expected number >= 1/u,
+      '0 必须被 schema 拒绝：实测上游对 max_results: 0 返回 400 Invalid max results.',
+    );
+  });
+
+  test('搜索参数的非法取值被 schema 逐一拒绝', async () => {
+    const ctx = contextWithRealSettings();
+    registerSettings(ctx);
+
+    for (const patch of [
+      { searchDepth: 'deep' },
+      { topic: 'sports' },
+      { maxResults: 21 },
+      { maxResults: 2.5 },
+      { includeAnswer: 'yes' },
+    ]) {
+      await assert.rejects(
+        () => ctx.settings.update(SETTINGS_NAMESPACE, patch),
+        TypeError,
+        `${JSON.stringify(patch)} 必须被拒绝`,
+      );
+    }
   });
 });

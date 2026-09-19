@@ -105,19 +105,29 @@ the direct form again.
 ### 5. The fallback targets this plugin constructs directly
 
 **Where:** `dsh-web-search-deepseek` and `dsh-web-fetch-http` — their public exports.
-**Then edit:** the adapter module the toggle/fallback ticket adds under `lib/dsh/`
+**Then edit:** search fallback is `lib/dsh/fallback.js`; fetch fallback will be an adapter added under `lib/dsh/`
 
-Later tickets construct `DeepSeekSearchProvider` and `HttpFetchProvider` directly, because
-the fallback path is what a user gets when they switch this plugin off. Check:
+The search fallback has landed in `lib/dsh/fallback.js`: it constructs `DeepSeekSearchProvider`
+directly, because the fallback path is what a user gets when they switch this plugin off. Check:
 
-- both classes are still exported from their packages;
-- their constructor signatures are unchanged;
-- `publicHttpNetwork.resolve` is still exported (the fetch fallback injects it);
-- the official limits this plugin mirrors are unchanged — **`maxResponseBytes: 5_000_000`,
-  `maxBodyChars: 100_000`, `timeoutMs: 30_000`, `maxRedirects: 5`, and the
-  `deepseek-harness/0.0.1 (+https://github.com/deepseek-ai)` user agent.** These are
-  constants copied from the official provider because it registers no settings namespace;
-  if they drift, "toggle off" silently stops matching the user's previous behaviour.
+- `DeepSeekSearchProvider` and `WEB_SEARCH_DEEPSEEK_SETTINGS_NAMESPACE` are still exported from
+  that package;
+- its constructor still takes a thunk returning the options object;
+- `@deepseek-ai/dsh-credentials` still exports `credentialRef` / `isCredentialRefName` (the former
+  throws on a name outside the grammar, so the latter must be checked first);
+- `@deepseek-ai/dsh-launch-environment` still exports `launchEnvironmentOf`, and its snapshot's
+  `get(name)` still returns `{ value, source }`;
+- the official defaults this plugin mirrors are unchanged — `apiKeyEnv: DEEPSEEK_API_KEY`,
+  `baseURL: https://api.deepseek.com/anthropic/v1`, `model: deepseek-v4-flash`,
+  `apiVersion: 2023-06-01`, `maxTokens: 4096`, `maxUses: 5`, and the `DEEPSEEK_SEARCH_BASE_URL`
+  endpoint override. The official package does not export its `resolveOptions`, so these are
+  copied; if they drift, only the "user configured nothing" tier diverges from the official
+  provider, and that tier already fails loudly as a missing credential.
+
+Once the fetch takeover (ticket `10`) lands, check `HttpFetchProvider` and
+`publicHttpNetwork.resolve` the same way, along with the fetch limits this plugin mirrors —
+**`maxResponseBytes: 5_000_000`, `maxBodyChars: 100_000`, `timeoutMs: 30_000`,
+`maxRedirects: 5`, and the `deepseek-harness/0.0.1 (+https://github.com/deepseek-ai)` user agent.**
 
 ### 6. Settings registration
 

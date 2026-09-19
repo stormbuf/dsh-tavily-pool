@@ -41,6 +41,19 @@ They do not affect each other — you can use Tavily for search while keeping th
 
 Toggle changes take effect **immediately**, with no restart.
 
+## Search parameters
+
+| Parameter | Values | Default | Meaning |
+|---|---|---|---|
+| **Search depth** `searchDepth` | `basic` / `advanced` / `fast` / `ultra-fast` | `basic` | The relevance-versus-latency tradeoff. `advanced` costs **2 credits** per search; the other three cost 1 |
+| **Result cap** `maxResults` | 1–20 | 10 | How many sources one search may return |
+| **Topic** `topic` | `general` / `news` / `finance` | `general` | `news` suits current events, `finance` suits financial queries |
+| **Generated answer** `includeAnswer` | on / off | off | Ask Tavily for an extra generated answer, returned as the search result's body text |
+
+Parameter changes likewise take effect **immediately**; the next search carries the new values.
+
+`maxResults` is a **cap**, not a guarantee: the model may ask for fewer results when it calls search, and then its number wins. The final result is truncated once more by DSH's seam. The lower bound is 1 — the official API reference says 0, but `0` is in practice rejected upstream with `400 Invalid max results.`, and that class of error neither retries nor switches keys, so the panel does not accept it.
+
 ## Scheduling
 
 The key pool schedules by **balance first**:
@@ -62,7 +75,18 @@ Tavily resets usage on the **1st of each month**. Because the official documenta
 
 You can also click **Refresh balance** in the panel to check immediately. If it has not recovered within 48 hours, that usually means you need to raise the limit on the [Tavily dashboard](https://app.tavily.com/account/plan) rather than wait.
 
-If no key in the pool is usable, requests **fall back** according to the toggles above.
+If no key in the pool is usable, requests **fall back** according to the toggles above. There are three ways to land there: the search toggle is off, the key-pool file is corrupt (the plugin then continues from an empty pool and reports the file in the log), or the pool holds no candidate that could **recover within this request** (empty pool, everything disabled, everything quota-exhausted or permanently invalid).
+
+> Note that "no usable key" and "just tried one and it failed" are different things: in the latter case there is a real upstream response in hand, and the plugin reports it faithfully (including its `request_id`) rather than retrying against a different source.
+
+The fallback target can itself be unavailable, and the two ways that happens produce **different codes**, because they need different things from you:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `TAVILY_FALLBACK_CREDENTIAL_MISSING` | The official credential was **never configured** | Configure one (the Models page in the panel, the `DEEPSEEK_API_KEY` environment variable, or `web-search-deepseek`'s `apiKey`) |
+| `TAVILY_FALLBACK_CREDENTIAL_INVALID` | The official credential is configured but rejected upstream with `401` / `403` | Replace it, rather than configure it again |
+
+Both errors also carry *why* the request left Tavily, because seeing only an error about a DeepSeek credential would send you to fix the wrong thing.
 
 Key failures fall into three kinds:
 

@@ -95,19 +95,27 @@ context proxy 有两种语义不同的读取方式：
 ### 5. 本插件直接构造的回落目标
 
 **看哪里：** `dsh-web-search-deepseek` 与 `dsh-web-fetch-http` 的公开导出。
-**改哪个模块：** 开关/回落那个 ticket 在 `lib/dsh/` 下新增的适配模块
+**改哪个模块：** 搜索回落在 `lib/dsh/fallback.js`；抓取回落届时在 `lib/dsh/` 下新增的适配模块
 
-后续 ticket 会直接构造 `DeepSeekSearchProvider` 与 `HttpFetchProvider`，因为回落路径正是
-用户关掉本插件后所得到的东西。检查：
+搜索回落已在 `lib/dsh/fallback.js` 落地：它直接构造 `DeepSeekSearchProvider`，因为回落路径
+正是用户关掉本插件后所得到的东西。检查：
 
-- 两个类仍从各自包中导出；
-- 它们的构造签名未变；
-- `publicHttpNetwork.resolve` 仍被导出（抓取回落要注入它）；
-- 本插件复刻的官方限值未变 —— **`maxResponseBytes: 5_000_000`、`maxBodyChars: 100_000`、
-  `timeoutMs: 30_000`、`maxRedirects: 5`，以及
-  `deepseek-harness/0.0.1 (+https://github.com/deepseek-ai)` 这个 user agent。** 这些常量是从
-  官方提供方抄来的，因为它不注册 settings 命名空间；一旦它们漂移，「关掉开关」就会静默地
-  不再等同于用户此前已有的行为。
+- `DeepSeekSearchProvider` 与 `WEB_SEARCH_DEEPSEEK_SETTINGS_NAMESPACE` 仍从该包导出；
+- 它的构造签名仍是「接收一个返回选项对象的 thunk」；
+- `@deepseek-ai/dsh-credentials` 仍导出 `credentialRef` / `isCredentialRefName`（前者在引用
+  不合语法时会抛，因此必须先用后者判断）；
+- `@deepseek-ai/dsh-launch-environment` 仍导出 `launchEnvironmentOf`，且快照的 `get(name)`
+  仍返回 `{ value, source }`；
+- **本插件复刻的官方默认值未变** —— `apiKeyEnv: DEEPSEEK_API_KEY`、
+  `baseURL: https://api.deepseek.com/anthropic/v1`、`model: deepseek-v4-flash`、
+  `apiVersion: 2023-06-01`、`maxTokens: 4096`、`maxUses: 5`，以及 `DEEPSEEK_SEARCH_BASE_URL`
+  这个端点覆盖变量。官方包的 `resolveOptions` 没有导出，所以这些值是抄来的；一旦它们漂移，
+  只有「用户什么都没配」那一档会与官方不一致，而那一档本来就会以凭据缺失响亮失败。
+
+抓取接管（ticket `10`）落地后，同样检查 `HttpFetchProvider`、`publicHttpNetwork.resolve`，以及
+本插件复刻的抓取限值 —— **`maxResponseBytes: 5_000_000`、`maxBodyChars: 100_000`、
+`timeoutMs: 30_000`、`maxRedirects: 5`，以及
+`deepseek-harness/0.0.1 (+https://github.com/deepseek-ai)` 这个 user agent。**
 
 ### 6. 设置注册
 
