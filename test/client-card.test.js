@@ -695,6 +695,32 @@ describe('PANEL-6：余额未知时显示未知', () => {
     assert.equal(textsOf(component({ t })).some((text) => text.includes('陈旧')), true);
   });
 
+  test('陈旧时**进度条本身**有视觉区分，而不只是下面多一行字', async () => {
+    // `13` 的验收原文就是「进度条需有视觉区分」：进度条是这张卡片上最先被扫到的东西，
+    // 只在它下面挂一行说明等于没区分。
+    const stale = await mountedCard({
+      hooks: {
+        ui: readyUi({ keys: [keyRecord({ usage: { key: { limit: 1000, usage: 250 }, stale: true } })] }),
+        draft: readyDraft(),
+      },
+    });
+    const staleBar = flatten(stale.component({ t: stale.t })).find(
+      (element) => element.props?.className?.startsWith('dtp-bar'),
+    );
+    assert.match(staleBar.props.className, /dtp-bar-stale/u);
+
+    const fresh = await mountedCard({
+      hooks: {
+        ui: readyUi({ keys: [keyRecord({ usage: { key: { limit: 1000, usage: 250 }, stale: false } })] }),
+        draft: readyDraft(),
+      },
+    });
+    const freshBar = flatten(fresh.component({ t: fresh.t })).find(
+      (element) => element.props?.className?.startsWith('dtp-bar'),
+    );
+    assert.equal(freshBar.props.className, 'dtp-bar', '新鲜的读数不该带陈旧样式');
+  });
+
   test('统计行显示调用、成功、失败与消耗（USAGE-7）', async () => {
     const { component, t } = await mountedCard({
       hooks: {
