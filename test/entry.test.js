@@ -15,6 +15,7 @@ import { apply, inject, name } from '../index.js';
 import { KEYS_FILE_NAME, PROVIDER_ID, SETTINGS_NAMESPACE, STATE_DIR_NAME } from '../lib/constants.js';
 import { MissingHostCapabilityError } from '../lib/dsh/register.js';
 import { officialFetchProvider, setOfficialFetchProvider } from '../lib/dsh/fallback.js';
+import { maskKey } from '../lib/pool.js';
 
 /**
  * 一个足以加载本插件的替身宿主 context。
@@ -1108,5 +1109,94 @@ describe('18：调度策略经入口真实生效（SCHED-7）', () => {
     assert.match(await keyUsedBy(host), /^Bearer tvly-dev-1-/u, '切回去又按余额');
 
     assert.equal(host.registered.length, 1, '全程只有一次注册');
+  });
+});
+
+describe('14：调用历史经入口真的落盘', () => {
+  /** 读一份落在临时 harness home 下的历史。 */
+  async function readHistory(host) {
+    const { CallHistory } = await import('../lib/history.js');
+    const { HISTORY_FILE_NAME } = await import('../lib/constants.js');
+    const history = new CallHistory({ dir: join(host.ctx.services.dshHomePath(STATE_DIR_NAME), ''), fileName: HISTORY_FILE_NAME });
+    return history.read();
+  }
+
+  test('一次成功的搜索记一条，带端点、密钥、消耗与耗时', async () => {
+    const host = await hostWithKeys([{ label: 'only' }]);
+    await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }], usage: { credits: 1 }, request_id: 'req-h1' } }),
+      () => host.registered[0].search({ query: 'q' }),
+    );
+
+    // 历史是**排队落盘**的（`recordCall` 刻意不等待），因此这里要让事件循环跑几轮再读。
+    let entries = [];
+    for (let attempt = 0; attempt < 40 && entries.length === 0; attempt += 1) {
+      await new Promise((resolve) => { setTimeout(resolve, 25); });
+      entries = await readHistory(host);
+    }
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].endpoint, 'search');
+    assert.equal(entries[0].outcome, 'ok');
+    assert.equal(entries[0].credits, 1);
+    assert.equal(entries[0].requestId, 'req-h1', 'request_id 要持久化，供上游排障');
+    assert.equal(entries[0].keyMasked, maskKey('tvly-dev-0-' + 'a'.repeat(20)), '脱敏形式当场存一份，密钥删掉后记录仍可读');
+    assert.ok(entries[0].durationMs >= 0);
+  });
+
+  test('抓取记成 extract，且消耗按成功 URL 数走', async () => {
+    const host = await hostWithKeys([{ label: 'only' }]);
+    await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://example.com', raw_content: '# 正文' }], failed_results: [] } }),
+      () => host.registeredFetch[0].fetch({ url: 'https://example.com' }),
+    );
+
+    let entries = [];
+    for (let attempt = 0; attempt < 40 && entries.length === 0; attempt += 1) {
+      await new Promise((resolve) => { setTimeout(resolve, 25); });
+      entries = await readHistory(host);
+    }
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].endpoint, 'extract');
+    assert.equal(entries[0].credits, 1);
+  });
+
+  test('每次尝试各记一条——换过密钥的那次搜索留下两条', async () => {
+    // 一次请求里的每次尝试都是一次真实的上游调用，也就各花各的积分。只记「请求级」的一条会
+    // 让故障切换花掉的量在历史里消失。
+    const host = await hostWithKeys([{ label: 'bad' }, { label: 'good' }]);
+    await withStubbedFetch(
+      (call) => (call.authorization.includes('-0-')
+        ? { status: 500, body: { detail: { error: 'boom' } } }
+        : { status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      () => host.registered[0].search({ query: 'q' }),
+    );
+
+    let entries = [];
+    for (let attempt = 0; attempt < 40 && entries.length < 2; attempt += 1) {
+      await new Promise((resolve) => { setTimeout(resolve, 25); });
+      entries = await readHistory(host);
+    }
+
+    assert.equal(entries.length, 2);
+    assert.deepEqual(entries.map((item) => item.outcome), ['failed', 'ok']);
+    assert.equal(entries[0].status, 500);
+  });
+
+  test('写不进去时不影响这次调用本身', async () => {
+    // 历史是记录而不是正确性前提：把它的目录变成只读文件，搜索仍必须成功。
+    const host = await hostWithKeys([{ label: 'only' }]);
+    const { HISTORY_FILE_NAME } = await import('../lib/constants.js');
+    const blocking = join(host.ctx.services.dshHomePath(STATE_DIR_NAME), HISTORY_FILE_NAME);
+    await mkdir(blocking, { recursive: true });
+
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      (calls) => host.registered[0].search({ query: 'q' }).then((value) => ({ value, calls })),
+    );
+
+    assert.equal(result.value.sources.length, 1, '历史写不进去也不该让搜索失败');
+    assert.equal(result.calls.length, 1);
   });
 });

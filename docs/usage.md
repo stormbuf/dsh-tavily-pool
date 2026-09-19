@@ -137,6 +137,35 @@ A single fetch therefore often costs 0 credits, because credits are charged per 
 
 Since one DSH fetch call carries one URL, the running total is what reaches each five-URL tier.
 
+## Call history
+
+Every Tavily call is recorded — the key used, the endpoint, whether it succeeded, the credits, the duration, and the upstream `request_id` when there is one — in:
+
+```
+~/.dsh/dsh-tavily-pool/history.json
+```
+
+The panel shows a **chart of daily credit spend** over the last 14 days (search and fetch as separate lines, because their magnitudes differ too much to share a vertical scale) plus a table of the most recent calls.
+
+**One request can produce several entries.** Key failover means each attempt is a separate real upstream call, so a search that tried two keys leaves one failed entry and one successful one. That is deliberate: those attempts each cost real credits, and a request-level summary would hide them.
+
+### Rotation
+
+Two limits apply **at once**, and the stricter one wins:
+
+| Limit | Value | Why |
+|---|---|---|
+| Entry count | 500 (newest kept) | Stops high-frequency use from growing the file without bound |
+| Age | 30 days | Stops low-frequency use from keeping a six-month-old entry forever |
+
+The file therefore never exceeds roughly 100 KB. Trimming happens on every write — there is no background task, and no window in which the process could exit between two trims.
+
+The age window is measured from the **newest entry**, not from the current time: a history file you copied from elsewhere, or one left behind after the system clock moved, is not wiped out the moment it is read.
+
+An entry whose credits are unknown is stored **without** a `credits` field rather than with `0`, so "this call cost nothing" and "we do not know what this call cost" stay distinguishable in the history too. Unknown-credit entries appear in the table but contribute nothing to the chart.
+
+If the history file cannot be written, calls are unaffected — the plugin reports it in the log and the chart is simply missing those entries. If it cannot be read, the panel says so instead of showing an empty chart.
+
 ## Manual rollback
 
 If the plugin fails to load and search becomes unavailable, DSH reports `WEB_PROVIDER_CONFIGURED_MISSING`. To recover, point the providers in the profile patch back at the official values.

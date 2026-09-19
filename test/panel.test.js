@@ -15,7 +15,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
-import { PANEL_ERROR_CODES, PanelError, classifyConnectivity, readPanelState, runPanelCommand } from '../lib/panel.js';
+import {
+  HISTORY_CHART_DAYS,
+  PANEL_ERROR_CODES,
+  PANEL_HISTORY_ENTRIES,
+  PanelError,
+  classifyConnectivity,
+  readPanelState,
+  runPanelCommand,
+} from '../lib/panel.js';
 import { PoolStore } from '../lib/pool.js';
 
 /** 用例里用到的那把明文密钥。任何响应里出现它，都是 `POOL-3` 的失败。 */
@@ -537,5 +545,108 @@ describe('12：单密钥连通性测试', () => {
   test('没有状态码的失败一律算网络，不硬凑一个结论', () => {
     assert.equal(classifyConnectivity({ code: 'TAVILY_UNPROCESSABLE_RESPONSE' }), 'network');
     assert.equal(classifyConnectivity(undefined), 'network');
+  });
+});
+
+describe('14：调用历史的投影', () => {
+  /** 一条调用记录。 */
+  function record(at, overrides = {}) {
+    return {
+      at: new Date(at).toISOString(),
+      endpoint: 'search',
+      keyId: 'key-1',
+      keyMasked: 'tvly-dev-…iJWq',
+      outcome: 'ok',
+      credits: 1,
+      durationMs: 100,
+      ...overrides,
+    };
+  }
+
+  test('history 缺席时给空数组，而不是让整个状态变成 undefined', () => {
+    const state = readPanelState({ settings: {}, fallback: {} });
+
+    assert.deepEqual(state.history.entries, []);
+    assert.equal(state.history.error, null);
+    assert.equal(state.history.daily.length, HISTORY_CHART_DAYS, '横轴必须是均匀的，空白天补零');
+  });
+
+  test('记录原样投影，并在状态里再截一次', () => {
+    const entries = Array.from({ length: PANEL_HISTORY_ENTRIES + 50 }, (unused, index) => (
+      record(Date.parse('2026-09-19T00:00:00.000Z') + index * 1000)
+    ));
+    const state = readPanelState({ settings: {}, fallback: {}, history: { entries, error: null } });
+
+    assert.equal(state.history.entries.length, PANEL_HISTORY_ENTRIES, '状态响应每次都整份发出，不该塞进全部历史');
+  });
+
+  test('读取失败的原因如实带出，而不是显示成「没有调用」', () => {
+    const state = readPanelState({ settings: {}, fallback: {}, history: { entries: [], error: 'boom' } });
+    assert.equal(state.history.error, 'boom');
+  });
+
+  test('按**本地**日期分桶，而不是 UTC', () => {
+    // UTC+8 的早晨会把前一晚的调用算到 UTC 的前一天去，而用户看的是「我昨天花了多少」。
+    // 取一个本地时刻，断言它落在本地那一天的桶里。
+    const now = new Date(2026, 8, 19, 10, 0, 0);
+    const state = readPanelState({
+      settings: {},
+      fallback: {},
+      history: { entries: [record(now.getTime())], error: null },
+      nowMs: now.getTime(),
+    });
+
+    const today = state.history.daily.at(-1);
+    assert.equal(today.date, '2026-09-19');
+    assert.equal(today.search, 1);
+    assert.equal(today.calls, 1);
+  });
+
+  test('搜索与抓取分开累计，未知消耗不进曲线', () => {
+    const now = new Date(2026, 8, 19, 10, 0, 0).getTime();
+    const state = readPanelState({
+      settings: {},
+      fallback: {},
+      history: {
+        entries: [
+          record(now),
+          record(now, { endpoint: 'extract', credits: 2 }),
+          record(now, { endpoint: 'extract', credits: undefined }),
+        ],
+        error: null,
+      },
+      nowMs: now,
+    });
+
+    const today = state.history.daily.at(-1);
+    assert.equal(today.search, 1);
+    assert.equal(today.extract, 2, '消耗未知的那条不加猜测值');
+    assert.equal(today.calls, 3, '但它确实发生过，因此要计入调用数');
+  });
+
+  test('今天之外的记录不影响今天的桶', () => {
+    const now = new Date(2026, 8, 19, 10, 0, 0).getTime();
+    const state = readPanelState({
+      settings: {},
+      fallback: {},
+      history: { entries: [record(now - 24 * 3600 * 1000), record(now)], error: null },
+      nowMs: now,
+    });
+
+    assert.equal(state.history.daily.at(-1).search, 1);
+    assert.equal(state.history.daily.at(-2).search, 1);
+  });
+
+  test('超出窗口的记录不出现，且窗口之外的日期根本不建桶', () => {
+    const now = new Date(2026, 8, 19, 10, 0, 0).getTime();
+    const state = readPanelState({
+      settings: {},
+      fallback: {},
+      history: { entries: [record(now - 60 * 24 * 3600 * 1000)], error: null },
+      nowMs: now,
+    });
+
+    assert.equal(state.history.daily.length, HISTORY_CHART_DAYS);
+    assert.equal(state.history.daily.reduce((total, day) => total + day.search, 0), 0);
   });
 });

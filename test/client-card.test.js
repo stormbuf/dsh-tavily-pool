@@ -224,6 +224,7 @@ function sampleState(overrides = {}) {
       fetchFormat: 'markdown',
       schedulingPolicy: 'balance',
     },
+    history: { entries: [], daily: [], error: null },
     keys: [],
     poolError: null,
     capabilities: { ok: true, missingRequired: [], missingOptional: [], summary: 'all present', findings: [] },
@@ -1013,5 +1014,155 @@ describe('HTTP 只经面板接口（PANEL-4）', () => {
   test('不请求任何返回明文或做导入导出的接口（POOL-3、Q12）', async () => {
     const source = await readFile(CLIENT_FILE, 'utf8');
     assert.equal(/\/(reveal|plaintext|export|import)/u.test(source), false);
+  });
+});
+
+describe('14：调用历史与图表', () => {
+  /** 一份按日汇总，形状与 `readPanelState` 的投影一致。 */
+  function daily() {
+    return Array.from({ length: 14 }, (unused, index) => ({
+      date: `2026-09-${String(index + 6).padStart(2, '0')}`,
+      search: index,
+      extract: index % 3,
+      calls: index + 1,
+    }));
+  }
+
+  /** 一条调用记录。 */
+  function callRecord(overrides = {}) {
+    return {
+      at: '2026-09-19T02:30:00.000Z',
+      endpoint: 'search',
+      keyId: 'key-1',
+      keyMasked: 'tvly-dev-…iJWq',
+      outcome: 'ok',
+      credits: 1,
+      durationMs: 812,
+      ...overrides,
+    };
+  }
+
+  test('曲线自绘成 SVG 折线，不引任何图表依赖', async () => {
+    const { component, t } = await mountedCard({
+      hooks: {
+        ui: readyUi({ history: { entries: [callRecord()], daily: daily(), error: null } }),
+        draft: readyDraft(),
+      },
+    });
+    const tree = component({ t });
+    const polylines = flatten(tree).filter((element) => element.type === 'polyline');
+
+    // 两条线：搜索一条、抓取一条。它们不共用纵轴刻度（量级差太远），因此必须是两条独立的折线。
+    assert.equal(polylines.length, 2);
+    for (const line of polylines) {
+      assert.match(line.props.points, /^[\d.,\s]+$/u);
+      assert.equal(line.props.points.split(' ').length, 14, '每天的桶都要有一个点，空白天补零');
+    }
+    assert.equal(flatten(tree).some((element) => element.type === 'svg'), true);
+  });
+
+  test('图表正确反映积分趋势：点的高度跟着当天的积分走', async () => {
+    // 「正确反映趋势」这句话可断言的部分就是它：数值大的那天，点在坐标系里更高（y 更小）。
+    const flat = Array.from({ length: 14 }, (unused, index) => ({
+      date: `2026-09-${String(index + 6).padStart(2, '0')}`,
+      search: 0,
+      extract: 0,
+      calls: 0,
+    }));
+    const growing = flat.map((day, index) => ({ ...day, search: index }));
+
+    const { component, t } = await mountedCard({
+      hooks: {
+        ui: readyUi({ history: { entries: [callRecord()], daily: growing, error: null } }),
+        draft: readyDraft(),
+      },
+    });
+    const [search] = flatten(component({ t })).filter((element) => element.type === 'polyline');
+    const ys = search.props.points.split(' ').map((pair) => Number(pair.split(',')[1]));
+
+    // 坐标系 y 向下，因此「更高」= 更小的 y。
+    assert.ok(ys[0] > ys[ys.length - 1], `单调上升的消耗应当画成上升的折线，实际 y=${ys.join(',')}`);
+    for (let index = 1; index < ys.length; index += 1) {
+      assert.ok(ys[index] <= ys[index - 1], '每个点都不该比前一个低');
+    }
+  });
+
+  test('明细表列出时间、端点、密钥、结果、积分与耗时', async () => {
+    const { component, t } = await mountedCard({
+      hooks: {
+        ui: readyUi({
+          history: {
+            entries: [
+              callRecord(),
+              callRecord({ endpoint: 'extract', keyMasked: 'tvly-dev-…0000', outcome: 'failed', code: 'TAVILY_HTTP_401', credits: undefined, durationMs: 41 }),
+            ],
+            daily: daily(),
+            error: null,
+          },
+        }),
+        draft: readyDraft(),
+      },
+    });
+    const texts = textsOf(component({ t }));
+
+    assert.equal(texts.includes('调用历史'), true);
+    assert.equal(texts.includes('时间'), true);
+    assert.equal(texts.some((text) => text.includes('tvly-dev-…iJWq')), true);
+    assert.equal(texts.includes('TAVILY_HTTP_401'), true, '失败行要给出机器码');
+    assert.equal(texts.includes('未知'), true, '消耗未知时显示「未知」，而不是 0（REST-3）');
+    assert.equal(texts.some((text) => text.includes('812 ms')), true);
+  });
+
+  test('没有任何记录时说「还没有调用」而不是画一条零线', async () => {
+    // 画一条贴着零的线看起来像「有数据但都是 0」，而事实是「一次都没调用过」。
+    const { component, t } = await mountedCard({
+      hooks: { ui: readyUi({ history: { entries: [], daily: daily(), error: null } }), draft: readyDraft() },
+    });
+    const tree = component({ t });
+
+    assert.equal(flatten(tree).some((element) => element.type === 'polyline'), false);
+    assert.equal(textsOf(tree).some((text) => text.includes('还没有调用记录')), true);
+  });
+
+  test('历史读不出来时如实说明，而不是显示成「没有调用」', async () => {
+    const { component, t } = await mountedCard({
+      hooks: {
+        ui: readyUi({ history: { entries: [], daily: [], error: 'Unexpected token { in JSON' } }),
+        draft: readyDraft(),
+      },
+    });
+
+    assert.equal(
+      textsOf(component({ t })).some((text) => text.includes('Unexpected token { in JSON')),
+      true,
+    );
+  });
+
+  test('明细行数有上限，超出时说明只显示了最近多少条', async () => {
+    const many = Array.from({ length: 30 }, (unused, index) => callRecord({ durationMs: index }));
+    const { component, t } = await mountedCard({
+      hooks: { ui: readyUi({ history: { entries: many, daily: daily(), error: null } }), draft: readyDraft() },
+    });
+
+    // 只渲染一次：测试里的 react 替身每次调用都从同一列 hook 值里往后取，第二次渲染会
+    // 落到「加载中」那个分支上——那样断言的就不是同一个树了。
+    const tree = component({ t });
+    const rows = flatten(tree).filter((element) => element.type === 'tr');
+    // 表头一行 + 明细若干行。
+    assert.equal(rows.length, 1 + 20);
+    assert.equal(
+      textsOf(tree).some((text) => text.includes('仅显示最近 20 条（共 30 条）')),
+      true,
+      '要说清只显示了最近多少条、总共有多少条',
+    );
+  });
+
+  test('卡片在宿主没给 history 字段时也不崩（半坏仍可用）', async () => {
+    // 面板状态的投影变了而卡片还没跟上，或者反过来——预览期这事会真的发生。
+    const { component, t } = await mountedCard({
+      hooks: { ui: { ...readyUi(), state: { ...sampleState() } }, draft: readyDraft() },
+    });
+
+    assert.doesNotThrow(() => component({ t }));
   });
 });

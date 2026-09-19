@@ -38,6 +38,7 @@ const HOST_FREE_MODULES = [
   'lib/usage.js',
   'lib/constants.js',
   'lib/panel.js',
+  'lib/history.js',
 ];
 
 /** 插件源码：入口加全部 lib/ 模块（含 lib/dsh/ 适配层）。 */

@@ -20,6 +20,7 @@ import z from '@deepseek-ai/schemastery';
 
 import { runWithFailover } from './lib/attempts.js';
 import {
+  HISTORY_FILE_NAME,
   KEYS_FILE_NAME,
   MIN_ATTEMPT_TIMEOUT_MS,
   REQUEST_TOTAL_BUDGET_MS,
@@ -27,7 +28,8 @@ import {
   TAVILY_TIMEOUT_MS,
 } from './lib/constants.js';
 import { KeyHealth } from './lib/health.js';
-import { PoolStore } from './lib/pool.js';
+import { CallHistory } from './lib/history.js';
+import { PoolStore, maskKey } from './lib/pool.js';
 import { Scheduler } from './lib/scheduler.js';
 import { searchParamsOf, effectiveMaxResults } from './lib/settings.js';
 import { TavilyError, extractTavily, searchTavily } from './lib/tavily.js';
@@ -79,6 +81,7 @@ export const Config = z.object({});
  * @property {KeyHealth|undefined} health
  * @property {Scheduler|undefined} scheduler
  * @property {UsageRefresher|undefined} usageRefresher
+ * @property {CallHistory|undefined} history - 调用历史（`14`）。
  * @property {Promise<void>|undefined} poolLoad
  * @property {Error|undefined} initError
  * @property {string|undefined} reportedPoolLoadError - 已经报告过的那次密钥池读取失败的
@@ -110,6 +113,7 @@ export function apply(ctx, _config) {
     health: undefined,
     scheduler: undefined,
     usageRefresher: undefined,
+    history: undefined,
     poolLoad: undefined,
     initError: undefined,
     reportedPoolLoadError: undefined,
@@ -184,6 +188,8 @@ export function apply(ctx, _config) {
       // 一次就该同时覆盖它们，而不是留下一条绕开替换的隐藏通道。
       fetchImpl: (...args) => globalThis.fetch(...args),
     });
+    // 调用历史（`14`）。它读盘失败、写盘失败都只上报：历史是记录，不是正确性前提。
+    state.history = new CallHistory({ dir: resolveStateDir(state.host), fileName: HISTORY_FILE_NAME });
   } catch (error) {
     state.initError = error;
     report(ctx, 'warn', `dsh-tavily-pool: initialization failed, continuing with search registered: ${String(error)}`);
@@ -362,6 +368,7 @@ async function search(state, request, signal) {
       // `SCHED-5` 的例外：池内只剩额度耗尽的密钥时，先看看有没有哪把已经跨过月起始、
       // 值得问一次官方（`SCHED-10`）。
       probeQuota: () => probeQuotaForReset(state, signal),
+      onAttempt: (attempt) => recordCall(state, 'search', attempt),
       invoke: ({ key }) => searchTavily({
         apiKey: key,
         query: request.query,
@@ -457,6 +464,7 @@ async function fetchUrl(state, request, signal) {
       health: state.health,
       signal,
       deadlineMs,
+      onAttempt: (attempt) => recordCall(state, 'extract', attempt),
       invoke: ({ key }) => extractTavily({
         apiKey: key,
         url: request.url,
@@ -478,6 +486,37 @@ async function fetchUrl(state, request, signal) {
 
   reportWriteErrors(state);
   return outcome.result;
+}
+
+/**
+ * 把一次尝试记进调用历史（`14`）。
+ *
+ * **不等待、不抛错。** 历史是记录而不是正确性前提：写不进去只让面板少一段曲线，绝不该让一次
+ * 搜索失败；而 `await` 它会把「换下一把再试」这条路径拖在一次磁盘写入后面，那正是故障切换最
+ * 不该慢的时刻。落盘因此排队进行，失败记在 `history.lastWriteError` 上，由
+ * {@link reportWriteErrors} 在上报统计写失败时一并说出。
+ *
+ * 密钥的脱敏形式**当场算一份存进去**，而不是展示时回密钥池里查：密钥被删掉之后这条记录仍然
+ * 要能读——「上个月那把已经删掉的 key 花了多少」正是历史存在的意义之一。
+ *
+ * @param state - 插件运行时状态。
+ * @param endpoint - `search` 或 `extract`。
+ * @param attempt - {@link runWithFailover} 给出的那次尝试。
+ */
+function recordCall(state, endpoint, attempt) {
+  if (state.history === undefined || state.pool === undefined) return;
+  const record = state.pool.keysInOrder().find((entry) => entry.id === attempt.keyId);
+  void state.history.append({
+    endpoint,
+    keyId: attempt.keyId,
+    keyMasked: record === undefined ? '' : maskKey(record.key),
+    outcome: attempt.outcome,
+    durationMs: attempt.durationMs,
+    credits: attempt.credits,
+    status: attempt.status,
+    code: attempt.code,
+    requestId: attempt.requestId,
+  });
 }
 
 /**
@@ -608,20 +647,34 @@ async function probeQuotaForReset(state, signal) {
  * 统计落盘失败不影响本次结果——它不是正确性前提——但绝不能是静默的：用户下次打开
  * 面板时会看到一份「这把密钥从没被用过」的记录，而没有任何线索说明为什么。
  *
+ * 调用历史（`14`）走同一条路：它也是记录，也是「写不进去不影响本次调用」，而它的失败同样
+ * 会让面板上少一段曲线而没有任何解释。两者一起上报，是因为它们对用户说的是同一件事——
+ * 「这次调用没有被记住」。
+ *
  * 报告后即清除：留着它会让一次瞬时故障在此后每一次搜索上都重复告警，而那条日志
  * 早已完成使命。下一次真的又失败时，它会再次被设上。
  *
  * @param state - 插件运行时状态。
  */
 function reportWriteErrors(state) {
-  if (state.pool.lastWriteError === undefined) return;
-  report(
-    state.host,
-    'warn',
-    `dsh-tavily-pool: could not record key stats in ${state.pool.filePath}: `
-    + `${String(state.pool.lastWriteError)}`,
-  );
-  state.pool.lastWriteError = undefined;
+  if (state.pool.lastWriteError !== undefined) {
+    report(
+      state.host,
+      'warn',
+      `dsh-tavily-pool: could not record key stats in ${state.pool.filePath}: `
+      + `${String(state.pool.lastWriteError)}`,
+    );
+    state.pool.lastWriteError = undefined;
+  }
+  if (state.history?.lastWriteError !== undefined) {
+    report(
+      state.host,
+      'warn',
+      `dsh-tavily-pool: could not record this call in ${state.history.filePath}: `
+      + `${String(state.history.lastWriteError)}`,
+    );
+    state.history.lastWriteError = undefined;
+  }
 }
 
 /**

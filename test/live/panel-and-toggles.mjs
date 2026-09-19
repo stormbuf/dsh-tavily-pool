@@ -435,6 +435,51 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
     // 测试完把这把无效密钥删掉，免得它影响后面的断言。
     await call(PANEL_ROUTE_PATHS.keys, { action: 'remove', id: invalid.id });
 
+    // ── 第 14 项：调用历史真的落盘，并经 /state 投影出来（ticket 14） ──
+    //
+    // 历史是**排队落盘**的（`recordCall` 刻意不等待），因此这里要等它真的到文件里，而不是
+    // 假设搜索一返回磁盘就更新了。
+    {
+      const { HISTORY_FILE_NAME } = await import('../../lib/constants.js');
+      const { CallHistory } = await import('../../lib/history.js');
+
+      let entries = [];
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const history = new CallHistory({
+          dir: join(harnessHome, STATE_DIR_NAME),
+          fileName: HISTORY_FILE_NAME,
+        });
+        entries = await history.read();
+        if (entries.length >= 3) break;
+        await new Promise((resolve) => {
+          setTimeout(resolve, 50);
+        });
+      }
+
+      assert.ok(entries.length >= 3, `前面几次真实搜索与抓取都该留下记录，实际 ${String(entries.length)} 条`);
+      assert.ok(
+        entries.some((entry) => entry.endpoint === 'extract'),
+        '抓取那一次也要记进历史，而不是只记搜索',
+      );
+      assert.ok(
+        entries.some((entry) => typeof entry.requestId === 'string'),
+        'request_id 要持久化——它是向上游排障时唯一的凭据',
+      );
+
+      const projected = await call(PANEL_ROUTE_PATHS.state);
+      assert.equal(projected.history.entries.length >= 3, true, '历史要经 /state 投影给卡片');
+      assert.equal(projected.history.daily.length, 14, '曲线横轴固定 14 天，空白天补零');
+      assert.equal(
+        projected.history.daily.reduce((total, day) => total + day.calls, 0) >= 3,
+        true,
+        '按日汇总要真的把调用数算进去',
+      );
+      check(
+        '第 14 项：调用历史落盘并经 /state 投影（含 request_id 与按日汇总）',
+        `${String(entries.length)} 条记录`,
+      );
+    }
+
     // ── 第 18 项：调度策略改动经真实 settings 即时影响下一次搜索（SCHED-7） ──
     //
     // 池里只有一把真密钥，而「选了哪一把」在单密钥池上无话可说。这里经**面板接口**再加一把
