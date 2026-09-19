@@ -1,13 +1,11 @@
 /**
- * Host capability probe (`COMPAT-2`, `COMPAT-3`).
+ * 宿主能力探测（`COMPAT-2`、`COMPAT-3`）。
  *
- * The behaviour under test is what happens when the host changes shape: the
- * plugin must say *which* capability is gone, at load time, and must keep
- * working as far as it can.
+ * 被测的行为是宿主形状改变时会发生什么：插件必须在加载期说出没的是**哪一项**能力，
+ * 并且必须尽可能继续工作。
  *
- * The stand-in context is deliberately shaped like the real one — services are
- * read through `get(name)`, and reading a non-injected service name *throws* —
- * because that difference is exactly what a probe gets wrong.
+ * 替身 context 刻意做成与真实的一致——服务经 `get(name)` 读取，读取未被 inject 的
+ * 服务名会**抛出**——因为这一差异恰恰是探测最容易搞错的地方。
  */
 
 import assert from 'node:assert/strict';
@@ -21,14 +19,14 @@ import {
 } from '../lib/dsh/capabilities.js';
 
 /**
- * A context that behaves like Cordis's: `get(name)` is the non-throwing read,
- * and direct property access throws for anything not in `inject`.
+ * 行为与 Cordis 一致的 context：`get(name)` 是不抛错的读取，而直接访问属性时，
+ * 凡是不在 `inject` 里的名字都会抛出。
  *
- * The returned object exposes `services` so a test can remove one — deleting
- * from `ctx.get(...)` would only mutate whatever the read returned.
+ * 返回的对象暴露 `services`，好让测试删掉其中一项——从 `ctx.get(...)` 的返回值上删
+ * 只会改动那次读取返回的对象。
  *
- * @param services - the provided services.
- * @returns the fake context, with its service map attached.
+ * @param services - 提供的服务。
+ * @returns 假 context，附有其服务表。
  */
 function fakeContext(services) {
   const ctx = new Proxy(
@@ -45,7 +43,7 @@ function fakeContext(services) {
   return ctx;
 }
 
-/** A host that satisfies every probed capability. */
+/** 一个满足全部被探测能力的宿主。 */
 function completeHost() {
   return {
     ctx: fakeContext({
@@ -58,8 +56,8 @@ function completeHost() {
   };
 }
 
-describe('COMPAT-2: the probe names what is missing', () => {
-  test('a complete host reports nothing missing', () => {
+describe('COMPAT-2：探测会点名缺了什么', () => {
+  test('完整的宿主不报告任何缺失', () => {
     const report = probeCapabilities(completeHost());
     assert.equal(report.ok, true);
     assert.deepEqual(report.missingRequired, []);
@@ -67,10 +65,9 @@ describe('COMPAT-2: the probe names what is missing', () => {
     assert.equal(describeMissingCapabilities(report), '');
   });
 
-  test('an absent service is reported, not thrown on', () => {
-    // Reading `ctx.settings` directly would throw "without inject"; the probe
-    // must therefore use the reflective read, or it reports a crash instead of
-    // a missing capability.
+  test('缺失的服务会被上报，而不是抛出', () => {
+    // 直接读 `ctx.settings` 会抛 "without inject"；因此探测必须走反射式读取，
+    // 否则它上报的是一次崩溃，而不是一项缺失的能力。
     const host = completeHost();
     delete host.ctx.services.settings;
     const report = probeCapabilities(host);
@@ -78,7 +75,7 @@ describe('COMPAT-2: the probe names what is missing', () => {
     assert.deepEqual(report.missingRequired, ['settings.register']);
   });
 
-  test('a reshaped seam is reported as missing, by name', () => {
+  test('seam 变形后会被按名字报告为缺失', () => {
     const host = completeHost();
     delete host.ctx.services.web.registerSearchProvider;
     const report = probeCapabilities(host);
@@ -89,7 +86,7 @@ describe('COMPAT-2: the probe names what is missing', () => {
     assert.match(message, /docs\/dsh-upgrade\.md/);
   });
 
-  test('every required capability is genuinely required', () => {
+  test('每一项必需能力都确实必需', () => {
     for (const id of REQUIRED_CAPABILITIES) {
       const host = completeHost();
       if (id === 'ctx.reflectiveRead') delete host.ctx.get;
@@ -102,7 +99,7 @@ describe('COMPAT-2: the probe names what is missing', () => {
     }
   });
 
-  test('a missing optional capability degrades without failing the probe', () => {
+  test('缺失的可选能力只会退化，不会让探测失败', () => {
     const host = completeHost();
     delete host.ctx.services.dshHomePath;
     delete host.ctx.services.connection;
@@ -112,21 +109,19 @@ describe('COMPAT-2: the probe names what is missing', () => {
     assert.match(describeMissingCapabilities(report), /\[optional\] dshHomePath/);
   });
 
-  test('the probe tolerates a context with no services at all', () => {
+  test('探测能容忍完全没有服务的 context', () => {
     const report = probeCapabilities({ ctx: fakeContext({}) });
     assert.equal(report.ok, false);
-    // The reflective read is present here, so it is the one required capability
-    // that is NOT reported missing.
+    // 这里反射式读取是存在的，因此它是唯一一项**不**被报告为缺失的必需能力。
     assert.deepEqual(
       report.missingRequired,
       REQUIRED_CAPABILITIES.filter((id) => id !== 'ctx.reflectiveRead'),
     );
   });
 
-  test('a host with no reflective read is reported rather than misread as healthy', () => {
-    // Without `ctx.get` nothing else can be read, so the probe must not claim
-    // the rest are present and then let registration fail right after an
-    // "all capabilities present" report.
+  test('没有反射式读取的宿主会被上报，而不会被误判为健康', () => {
+    // 没有 `ctx.get` 就什么都读不到，因此探测绝不能声称其余能力都在，然后让注册在
+    // 一份「能力齐备」的报告之后立刻失败。
     const report = probeCapabilities({ ctx: {} });
     assert.equal(report.ok, false);
     assert.ok(report.missingRequired.includes('ctx.reflectiveRead'));

@@ -1,9 +1,8 @@
 /**
- * The plugin entry, exercised through a stand-in host.
+ * 插件入口，经由替身宿主检验。
  *
- * The two rules that decide whether the takeover works at all live here:
- * registration must happen before anything that can fail, and `available()`
- * must never return false.
+ * 决定接管到底能不能成立的两条规则都在这里：注册必须先于任何可能失败的事，且
+ * `available()` 绝不能返回 false。
  */
 
 import assert from 'node:assert/strict';
@@ -17,24 +16,21 @@ import { KEYS_FILE_NAME, PROVIDER_ID, STATE_DIR_NAME } from '../lib/constants.js
 import { MissingHostCapabilityError } from '../lib/dsh/register.js';
 
 /**
- * A stand-in host context good enough to load the plugin.
+ * 一个足以加载本插件的替身宿主 context。
  *
- * It mimics the two things the real context does that the plugin depends on:
- * services are read through `get(name)` (the reflective read, which returns
- * `undefined` for an absent service), and `ctx.logger` is an **own property**
- * of the context rather than a provided service — the real host constructs a
- * `LoggerService` onto every context, so `ctx.get('logger')` is `undefined`
- * while `ctx.logger.warn` exists. Getting that wrong is how probe output ends
- * up silently discarded.
+ * 它模仿真实 context 中本插件所依赖的两件事：服务经 `get(name)` 读取（即反射式
+ * 读取，服务缺席时返回 `undefined`）；`ctx.logger` 是 context 的**自有属性**而不是
+ * 提供的服务——真实宿主会把 `LoggerService` 构造到每个 context 上，于是
+ * `ctx.get('logger')` 是 `undefined`，而 `ctx.logger.warn` 存在。这里搞错，就是探测
+ * 结果被静默丢弃的原因。
  *
- * `harnessHome` is what the host reports as the harness home; the plugin
- * appends its own state directory name to it, exactly as the real resolver
- * does, so a test can place a file where the plugin will actually look.
+ * `harnessHome` 是宿主上报的 harness 主目录；插件会像真实解析器那样，在它后面接上
+ * 自己的状态目录名，于是测试能把文件放在插件真正会去找的位置。
  *
- * @param options - host shape overrides.
- * @param options.harnessHome - harness home reported by `ctx.dshHomePath`.
- * @param options.omitRegistration - remove the seam's registration function.
- * @returns `{ ctx, registered, warnings, registerCalls }`.
+ * @param options - 宿主形状覆盖项。
+ * @param options.harnessHome - `ctx.dshHomePath` 上报的 harness 主目录。
+ * @param options.omitRegistration - 移除 seam 的注册函数。
+ * @returns `{ ctx, registered, warnings, registerCalls }`。
  */
 function fakeHost({ harnessHome, omitRegistration = false } = {}) {
   const registered = [];
@@ -62,7 +58,7 @@ function fakeHost({ harnessHome, omitRegistration = false } = {}) {
   const ctx = {
     get: (name) => services[name],
     services,
-    // Own property, not a service — deliberately absent from `services`.
+    // 自有属性，不是服务——因此刻意不出现在 `services` 里。
     logger: { warn: (message) => warnings.push(String(message)) },
   };
 
@@ -70,10 +66,10 @@ function fakeHost({ harnessHome, omitRegistration = false } = {}) {
 }
 
 /**
- * A temporary harness home plus a pool file the plugin will find.
+ * 一个临时 harness 主目录，外加插件能找到的密钥池文件。
  *
- * @param contents - the pool file's contents, when one should exist.
- * @returns the harness home path.
+ * @param contents - 密钥池文件的内容，需要在文件存在时给出。
+ * @returns harness 主目录路径。
  */
 async function temporaryHarnessHome(contents) {
   const home = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-entry-'));
@@ -85,15 +81,15 @@ async function temporaryHarnessHome(contents) {
   return home;
 }
 
-describe('plugin shape', () => {
-  test('declares the web dependency so a service rebuild re-registers it', () => {
+describe('插件形状', () => {
+  test('声明对 web 的依赖，使服务重建后会重新注册', () => {
     assert.deepEqual(inject, ['web']);
     assert.equal(name, 'tavily-pool');
   });
 });
 
-describe('PIN-5 / hard constraint 5: registration happens first', () => {
-  test('the provider is registered under the id the profile patch pins', () => {
+describe('PIN-5 / 硬约束 5：注册发生在最前', () => {
+  test('提供方以 profile patch pin 住的 id 注册', () => {
     const host = fakeHost();
     apply(host.ctx, {});
 
@@ -102,10 +98,10 @@ describe('PIN-5 / hard constraint 5: registration happens first', () => {
     assert.equal(PROVIDER_ID, 'tavily');
   });
 
-  test('a failure after registration still leaves the provider registered', () => {
+  test('注册之后的失败仍会让提供方保持已注册', () => {
     const host = fakeHost();
-    // Break a later initialization step in a way the plugin cannot swallow:
-    // the state directory cannot be resolved, so `apply()` takes its catch.
+    // 用插件无法吞掉的方式弄坏后面某个初始化步骤：状态目录解析不出来，于是
+    // `apply()` 会走它的 catch。
     host.ctx.services.dshHomePath = () => {
       throw new Error('simulated host failure');
     };
@@ -119,15 +115,15 @@ describe('PIN-5 / hard constraint 5: registration happens first', () => {
       process.env.HOME = previousHome;
     }
 
-    assert.equal(host.registered.length, 1, 'the provider must survive a broken initialization');
+    assert.equal(host.registered.length, 1, '提供方必须挺过初始化损坏');
     assert.equal(host.registered[0].available(), true);
-    assert.match(host.warnings.join('\n'), /initialization failed/u, 'and the failure must be reported');
+    assert.match(host.warnings.join('\n'), /initialization failed/u, '并且该失败必须被上报');
   });
 
-  test('a broken logger never becomes the reason search fails', () => {
+  test('logger 损坏绝不会成为搜索失败的原因', () => {
     const host = fakeHost();
-    // A logger whose methods throw must not propagate out of apply(): logging is
-    // best-effort, and this runs after the provider is already registered.
+    // 方法会抛错的 logger 不得从 apply() 里传播出去：日志是尽力而为的，而这段代码
+    // 运行在提供方已经注册之后。
     host.ctx.logger = {
       warn() {
         throw new Error('simulated logger failure');
@@ -139,22 +135,21 @@ describe('PIN-5 / hard constraint 5: registration happens first', () => {
     assert.equal(host.registered.length, 1);
   });
 
-  test('a degraded host is reported at load time, naming what is missing', () => {
+  test('退化的宿主在加载期被上报，并点名缺了什么', () => {
     const host = fakeHost();
-    // Remove an optional capability: the probe must still succeed, and the
-    // finding must reach the log rather than being silently swallowed.
+    // 移除一项可选能力：探测仍须成功，而该发现必须进入日志，而不是被静默吞掉。
     delete host.ctx.services.dshHomePath;
     apply(host.ctx, {});
 
-    assert.equal(host.registered.length, 1, 'a degraded host must not stop registration');
+    assert.equal(host.registered.length, 1, '退化的宿主不得阻止注册');
     const reported = host.warnings.join('\n');
     assert.match(reported, /dshHomePath/u);
     assert.match(reported, /docs\/dsh-upgrade\.md/u);
   });
 });
 
-describe('COMPAT-2: a reshaped seam fails loudly at load time', () => {
-  test('a missing registration function is named exactly', () => {
+describe('COMPAT-2：seam 变形会在加载期响亮地失败', () => {
+  test('缺失的注册函数会被精确点名', () => {
     const host = fakeHost({ omitRegistration: true });
     const error = (() => {
       try {
@@ -164,21 +159,21 @@ describe('COMPAT-2: a reshaped seam fails loudly at load time', () => {
         return thrown;
       }
     })();
-    assert.ok(error instanceof MissingHostCapabilityError, 'the seam must fail with a named error, not a TypeError');
+    assert.ok(error instanceof MissingHostCapabilityError, 'seam 必须以具名错误失败，而不是 TypeError');
     assert.equal(error.path, 'ctx.web.registerSearchProvider');
     assert.match(error.message, /ctx\.web\.registerSearchProvider/u);
     assert.match(error.message, /docs\/dsh-upgrade\.md/u);
   });
 });
 
-describe('PIN-2 / hard constraint 1: available() is always true', () => {
-  test('a provider with no keys still reports itself available', () => {
+describe('PIN-2 / 硬约束 1：available() 恒为 true', () => {
+  test('一把密钥都没有的提供方仍然自称可用', () => {
     const host = fakeHost({ harnessHome: '/nonexistent-home' });
     apply(host.ctx, {});
     assert.equal(host.registered[0].available(), true);
   });
 
-  test('a provider whose pool file is damaged still reports itself available', async () => {
+  test('密钥池文件损坏的提供方仍然自称可用', async () => {
     const home = await temporaryHarnessHome('not json at all');
     const host = fakeHost({ harnessHome: home });
     apply(host.ctx, {});
@@ -187,13 +182,13 @@ describe('PIN-2 / hard constraint 1: available() is always true', () => {
     assert.equal(
       host.registered[0].available(),
       true,
-      'a pinned provider reporting unavailable is a hard throw, not a fallback',
+      '被 pin 住的提供方自称不可用会硬抛，而不是回落',
     );
   });
 });
 
-describe('search failures are reported with an actionable code', () => {
-  test('an empty pool tells the user where to add a key', async () => {
+describe('搜索失败会带上可据以行动的 code 上报', () => {
+  test('空池会告诉用户去哪里添加密钥', async () => {
     const host = fakeHost({ harnessHome: await temporaryHarnessHome() });
     apply(host.ctx, {});
 
@@ -203,7 +198,7 @@ describe('search failures are reported with an actionable code', () => {
     assert.match(error.message, /dsh-tavily-pool/u);
   });
 
-  test('a damaged pool file is reported by path, not as an empty pool', async () => {
+  test('损坏的密钥池文件按路径上报，而不是报成空池', async () => {
     const host = fakeHost({ harnessHome: await temporaryHarnessHome('not json at all') });
     apply(host.ctx, {});
 
@@ -214,8 +209,8 @@ describe('search failures are reported with an actionable code', () => {
   });
 });
 
-describe('the module is importable without loading a harness service', () => {
-  test('apply() is a function and the row can carry an empty config', () => {
+describe('本模块无需加载 harness 服务即可导入', () => {
+  test('apply() 是函数，且该行可以携带空配置', () => {
     assert.equal(typeof apply, 'function');
     assert.equal(apply.length >= 1, true);
   });

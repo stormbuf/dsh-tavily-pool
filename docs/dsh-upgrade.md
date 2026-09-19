@@ -1,5 +1,7 @@
 # Re-adapting this plugin to a new DSH release
 
+**English** | [简体中文](./dsh-upgrade.zh-CN.md)
+
 DeepSeek Harness is in preview, so its plugin interfaces change between releases. This
 plugin is built around one idea: **all host-specific knowledge lives in `lib/dsh/`**, so a
 breaking change costs one directory, not the whole codebase.

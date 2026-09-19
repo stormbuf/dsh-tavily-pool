@@ -1,11 +1,10 @@
 /**
- * The seam mapping, exercised against the host's real `WebError`.
+ * seam 映射，针对宿主真实的 `WebError` 做检验。
  *
- * `lib/dsh/search-provider.js` is the boundary where this plugin's own failure
- * vocabulary becomes the host's. Getting it wrong is invisible in unit tests
- * that stub the seam, so this file asserts against the installed
- * `@deepseek-ai/dsh-web` class directly — the same one the harness checks with
- * `instanceof HarnessError` when it attaches structured failure metadata.
+ * `lib/dsh/search-provider.js` 是本插件自己的失败词汇变成宿主失败词汇的边界。搞错
+ * 它在那些把 seam 打桩的单元测试里是看不见的，因此本文件直接针对已安装的
+ * `@deepseek-ai/dsh-web` 里那个类做断言——也正是 harness 在附加结构化失败元数据时
+ * 用 `instanceof HarnessError` 检查的那个类。
  */
 
 import assert from 'node:assert/strict';
@@ -18,8 +17,8 @@ import { rethrowAsWebError, TavilySearchProvider } from '../lib/dsh/search-provi
 import { TavilyError } from '../lib/tavily.js';
 import { PROVIDER_ID } from '../lib/constants.js';
 
-describe('failures cross the seam as the host\'s own error type', () => {
-  test('a Tavily failure becomes a WebError that carries the code and cause', () => {
+describe('失败以宿主自己的错误类型穿过 seam', () => {
+  test('Tavily 失败会变成携带 code 与 cause 的 WebError', () => {
     const cause = new Error('socket hang up');
     const original = new TavilyError('Tavily search request failed', {
       code: 'TAVILY_NETWORK_ERROR',
@@ -36,13 +35,13 @@ describe('failures cross the seam as the host\'s own error type', () => {
       }
     })();
 
-    assert.ok(thrown instanceof WebError, 'the harness only recognizes its own error class');
-    assert.ok(thrown instanceof HarnessError, 'WebError extends HarnessError, which dsh-tools reads');
+    assert.ok(thrown instanceof WebError, 'harness 只认得它自己的错误类');
+    assert.ok(thrown instanceof HarnessError, 'WebError 继承 HarnessError，dsh-tools 读的是后者');
     assert.equal(thrown.code, 'TAVILY_NETWORK_ERROR');
-    assert.equal(thrown.cause, cause, 'the underlying failure must stay reachable');
+    assert.equal(thrown.cause, cause, '底层失败必须保持可达');
   });
 
-  test('cancellation is translated to the seam\'s own abort code', () => {
+  test('取消被翻译成 seam 自己的中止码', () => {
     const thrown = (() => {
       try {
         rethrowAsWebError(new TavilyError('aborted', { code: 'TAVILY_ABORTED' }));
@@ -51,10 +50,10 @@ describe('failures cross the seam as the host\'s own error type', () => {
         return error;
       }
     })();
-    assert.equal(thrown.code, 'WEB_ABORTED', 'TAVILY_ABORTED is not in the seam vocabulary');
+    assert.equal(thrown.code, 'WEB_ABORTED', 'TAVILY_ABORTED 不在 seam 的词汇表里');
   });
 
-  test('a non-Tavily error is passed through untouched', () => {
+  test('非 Tavily 错误原样穿过', () => {
     const original = new TypeError('something else entirely');
     const thrown = (() => {
       try {
@@ -64,20 +63,20 @@ describe('failures cross the seam as the host\'s own error type', () => {
         return error;
       }
     })();
-    assert.equal(thrown, original, 'only our own failures get rewritten');
+    assert.equal(thrown, original, '只有我们自己的失败会被改写');
   });
 });
 
-describe('the provider contract the seam resolves against', () => {
-  test('it registers under the id the profile patch pins', () => {
+describe('seam 据以解析的提供方契约', () => {
+  test('它以 profile patch pin 住的 id 注册', () => {
     const provider = new TavilySearchProvider(async () => ({ apiKey: 'k' }));
     assert.equal(provider.id, PROVIDER_ID);
   });
 
-  test('available() is true even when nothing is configured', () => {
-    // A pinned provider reporting unavailable is a hard
-    // WEB_PROVIDER_CONFIGURED_UNAVAILABLE throw, so this must not depend on
-    // state. The thunk throws, and available() must not call it.
+  test('即便什么都没配置，available() 也为 true', () => {
+    // 被 pin 住的提供方自称不可用，会硬抛
+    // WEB_PROVIDER_CONFIGURED_UNAVAILABLE，因此这里绝不能依赖状态。这个 thunk 会
+    // 抛错，而 available() 不得调用它。
     const provider = new TavilySearchProvider(() => {
       throw new Error('the options thunk must not run during available()');
     });
