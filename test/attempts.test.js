@@ -74,7 +74,7 @@ describe('SCHED-4：失败自动切换', () => {
     assert.equal(pool.maskedList().find((entry) => entry.id === ids.bad).stats.failures, 1);
   });
 
-  test('432 与 433 同等处理：标记额度耗尽并改用另一把', async () => {
+  test('REST-6：432 与 433 同等处理，标记额度耗尽并改用另一把', async () => {
     for (const status of [432, 433]) {
       const { pool, health, scheduler, ids } = await harness([{ label: 'out' }, { label: 'ok' }]);
       const { invoke, calls } = stubInvoke({ [ids.out]: { status } });

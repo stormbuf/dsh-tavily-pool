@@ -33,7 +33,7 @@ describe('POOL-6：写入是原子的', () => {
     assert.equal(written.order.length, 1);
   });
 
-  test('并发写入串行执行，而不是互相覆盖', async () => {
+  test('POOL-2：添加的密钥立即落盘，并发添加也全部留存', async () => {
     const store = await temporaryStore();
     await store.load();
 
