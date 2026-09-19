@@ -35,6 +35,8 @@ import { UsageQuota, UsageRefresher } from './lib/usage.js';
 import { probeCapabilities, describeMissingCapabilities } from './lib/dsh/capabilities.js';
 import { searchWithOfficialProvider } from './lib/dsh/fallback.js';
 import { resolveStateDir } from './lib/dsh/home-path.js';
+import { bindHostServices, hostView } from './lib/dsh/host-services.js';
+import { registerPanelRoutes } from './lib/dsh/panel-routes.js';
 import { registerSearchProvider } from './lib/dsh/register.js';
 import { TavilySearchProvider } from './lib/dsh/search-provider.js';
 import { readPluginSettings, registerSettings } from './lib/dsh/settings.js';
@@ -66,7 +68,12 @@ export const Config = z.object({});
  *
  * @typedef {object} PluginState
  * @property {object} ctx - 插件 context。
- * @property {import('./lib/dsh/capabilities.js').CapabilityReport|undefined} capabilityReport
+ * @property {object} host - {@link hostView} 给出的 context 视图；`lib/dsh/` 的其余模块
+ *   一律经它读取宿主服务，因为 `settings` / `connection` / `credentials` 三项在插件本体的
+ *   context 上根本看不见（实测见 `lib/dsh/host-services.js`）。
+ * @property {string|undefined} reportedCapabilities - 已经上报过的那份能力缺失清单。去重是
+ *   必需的：探测会在多个时机重跑（每个服务就绪时、第一次搜索时），而「缺了什么」是个持续
+ *   状态，每次搜索都刷一遍只会把真正新发生的事淹掉。
  * @property {PoolStore|undefined} pool
  * @property {KeyHealth|undefined} health
  * @property {Scheduler|undefined} scheduler
@@ -78,6 +85,10 @@ export const Config = z.object({});
  * @property {string|undefined} reportedFallbackReason - 已经报告过的那次回落原因，同样
  *   用于去重：一次成功的回落会让请求静默地走上官方提供方，因此它必须留下痕迹，但同一个
  *   原因不该每次搜索都刷一遍。
+ * @property {{code: string, at: string}|undefined} lastFallbackFailure - 最近一次回落
+ *   **失败**的机器码与时刻。面板据它区分「官方凭据未配置」与「官方凭据已失效」
+ *   （`CFG-5`）——那两者的区别只有一次真实失败才能提供，探测只能说「有值」。
+ * @property {boolean|undefined} panelRegistered - 面板 HTTP 接口是否已注册。
  */
 
 /**
@@ -90,7 +101,7 @@ export function apply(ctx, _config) {
   /** @type {PluginState} */
   const state = {
     ctx,
-    capabilityReport: undefined,
+    host: undefined,
     pool: undefined,
     health: undefined,
     scheduler: undefined,
@@ -99,6 +110,9 @@ export function apply(ctx, _config) {
     initError: undefined,
     reportedPoolLoadError: undefined,
     reportedFallbackReason: undefined,
+    lastFallbackFailure: undefined,
+    panelRegistered: undefined,
+    reportedCapabilities: undefined,
   };
 
   // 刻意作为第一条效果语句（硬约束 5）：profile patch 把 searchProvider pin 到本插件，
@@ -107,17 +121,34 @@ export function apply(ctx, _config) {
   // 一切可能失败的事都在下面。
   registerSearchProvider(ctx, new TavilySearchProvider((request, signal) => search(state, request, signal)));
 
-  // 以下全部非关键：即便抛错，搜索仍能用现存状态工作，失败会被记录下来供面板读取。
+  // `settings` / `connection` / `credentials` 三项**必须经 `ctx.inject` 才能看见**
+  // （实测见 `lib/dsh/host-services.js` 的表），而插件自己的 `inject` 是全有或全无的：
+  // 写进去就等于「宿主缺任何一项，搜索一并不可用」，那违背 `PIN-5`。因此这里按服务逐个
+  // 绑，缺一项只丢那一项。
   //
-  // 探测刻意放在这个 `try` 之外：它不会抛（它经 `ctx.get` 读取，缺失时返回
-  // `undefined` 而不报错），把它卷进来会让一个无关的初始化故障伪装成能力探测结果。
-  // 这里只守护真正的初始化。
-  state.capabilityReport = probeCapabilities({ ctx });
+  // 回调**不是**同步的：它们要等整个 profile 组合完成才跑（时序见下面那段注释），因此
+  // 每一处需要「服务已就绪」的判断都只能放在回调里。
+  const services = {};
+  state.host = hostView(ctx, services);
+  bindHostServices(ctx, services, {
+    settings: () => {
+      // 命名空间不可重复注册。重复注册会抛错，而它说明的是「我们注册了两次」——一个真实
+      // 的缺陷，不该被吞掉；但也不该把搜索一起关掉，所以只上报，不设 `initError`。
+      try {
+        registerSettings(state.host);
+      } catch (error) {
+        report(ctx, 'warn', `dsh-tavily-pool: could not register the settings namespace: ${String(error)}`);
+      }
+      refreshCapabilities(state);
+    },
+    connection: () => {
+      registerPanelRoutesSafely(state);
+      refreshCapabilities(state);
+    },
+  });
+
   try {
-    // 命名空间不可重复注册，而重复注册会抛错。让那个错误落进下面的 catch，而不是把
-    // 已经完成的能力探测一并作废——提供方早已注册，搜索是可用的。
-    registerSettings(ctx);
-    state.pool = new PoolStore({ dir: resolveStateDir(ctx), fileName: KEYS_FILE_NAME });
+    state.pool = new PoolStore({ dir: resolveStateDir(state.host), fileName: KEYS_FILE_NAME });
     state.health = new KeyHealth({ pool: state.pool });
     state.scheduler = new Scheduler({ pool: state.pool, health: state.health });
     state.usageRefresher = new UsageRefresher({
@@ -133,10 +164,66 @@ export function apply(ctx, _config) {
     report(ctx, 'warn', `dsh-tavily-pool: initialization failed, continuing with search registered: ${String(error)}`);
   }
 
-  // 只要缺了任何东西就上报，而不只在缺必需能力时上报：可选能力的丧失恰恰是那种会
-  // 被拖延很久、最后从症状才发现的静默退化。放在密钥池构造之后发出，于是一行日志
-  // 就能报告完整状态。
-  report(ctx, 'warn', describeMissingCapabilities(state.capabilityReport));
+  // 能力探测**不能**在这里同步做。
+  //
+  // `settings` / `connection` / `credentials` 三项只能经 `ctx.inject` 取得，而它的回调要等到
+  // 整个 profile 组合完成之后才跑。2026-09-19 在隔离的 `dsh web` 实例里实测（毫秒为相对
+  // 进程启动的时刻）：
+  //
+  //     apply:start @+817   apply:end @+817   microtask @+1417
+  //     setTimeout(0) @+3373                   inject:settings @+3385
+  //
+  // 也就是说同步探测（乃至任何固定延时）都会把这三项报成缺失，而它们随后就到了——那会把
+  // 「一切正常」报成「宿主坏了一半」。因此探测挂在**真实事件**上：每个服务就绪时刷新一次，
+  // 第一次搜索时再刷新一次（覆盖「三项一个都没到」的退化和「压根没有 inject 回调」的宿主）。
+  //
+  // 面板读到的那份是**当场探测**的，不经这里缓存（见 `lib/dsh/panel-routes.js`），因此面板
+  // 永远准。
+}
+
+/**
+ * 跑一次能力探测，并在「缺了什么」这件事发生变化时上报一次。
+ *
+ * 探测挂在真实事件上而不是某个延时上：注入回调就绪时各跑一次、第一次搜索时再跑一次。
+ * 去重按**消息文本**：它描述的是一个持续状态，每次搜索都刷一遍只会把真正新发生的事淹掉；
+ * 而清单真的变了（例如某个服务随后到位）时会重新记一条，那条恰好是最有价值的。
+ *
+ * 探测本身永不抛出（它经 `ctx.get` 读取，缺失时返回 `undefined`），因此不必包 `try`。
+ * 空清单在 {@link report} 里本来就被忽略——能力齐备时不该留下任何日志。
+ *
+ * @param state - 插件运行时状态。
+ */
+function refreshCapabilities(state) {
+  const message = describeMissingCapabilities(probeCapabilities({ ctx: state.host }));
+  if (message === state.reportedCapabilities) return;
+  state.reportedCapabilities = message;
+  report(state.host, 'warn', message);
+}
+
+/**
+ * 注册面板 HTTP 接口，失败只上报。
+ *
+ * 面板是一项**可选**能力：注册失败只该让面板缺席，绝不该被记成 `initError` 而把搜索一起
+ * 关掉（`PIN-5`）。路由**惰性**读取 `state`，因此注册时 `pool` / `usageRefresher` 还没
+ * 构造出来是没关系的——请求到达时它们已经就位；真的没就位（初始化抛过错），接口会以 503
+ * 如实回答，而不是抛出。
+ *
+ * @param state - 插件运行时状态。
+ */
+function registerPanelRoutesSafely(state) {
+  try {
+    state.panelRegistered = registerPanelRoutes(state.host, state);
+    if (state.panelRegistered !== true) {
+      report(
+        state.host,
+        'warn',
+        'dsh-tavily-pool: the host exposes no ctx.connection.fetch.register, so the settings '
+        + 'card cannot manage keys; search is unaffected.',
+      );
+    }
+  } catch (error) {
+    report(state.host, 'warn', `dsh-tavily-pool: could not register the panel HTTP API: ${String(error)}`);
+  }
 }
 
 /**
@@ -190,6 +277,9 @@ function report(ctx, level, message) {
  * @throws {TavilyError} 无法完成搜索时抛出。
  */
 async function search(state, request, signal) {
+  // 第一次真正用到宿主时再探一次：注入回调通常在插件加载后不久就绪，但「三项一个都没到」
+  // 的退化宿主不会触发任何回调，而那正是最需要留下一条日志的情形。
+  refreshCapabilities(state);
   if (signal?.aborted === true) {
     throw new TavilyError('Tavily search aborted by the caller', { code: 'TAVILY_ABORTED' });
   }
@@ -205,7 +295,7 @@ async function search(state, request, signal) {
     });
   }
 
-  const settings = readPluginSettings(state.ctx);
+  const settings = readPluginSettings(state.host);
   // 开关先判：它与密钥池能不能读、有没有密钥都无关（`PIN-3`）。这也是唯一一条**不**
   // 需要先把池读进来的回落路径，因此它排在最前。
   if (settings.searchEnabled !== true) {
@@ -225,7 +315,7 @@ async function search(state, request, signal) {
     if (state.reportedPoolLoadError !== message) {
       state.reportedPoolLoadError = message;
       report(
-        state.ctx,
+        state.host,
         'warn',
         `dsh-tavily-pool: ${message}; falling back to the official search provider `
         + `and starting from an empty pool. Fix or remove ${state.pool.filePath} to use Tavily again.`,
@@ -294,11 +384,11 @@ async function search(state, request, signal) {
  */
 async function fallbackToOfficial(state, request, signal, reason) {
   try {
-    const result = await searchWithOfficialProvider({ ctx: state.ctx, request, signal, reason });
+    const result = await searchWithOfficialProvider({ ctx: state.host, request, signal, reason });
     if (state.reportedFallbackReason !== reason) {
       state.reportedFallbackReason = reason;
       report(
-        state.ctx,
+        state.host,
         'warn',
         `dsh-tavily-pool: serving this search through the DeepSeek official provider instead of Tavily — `
         + `${reason}.`,
@@ -308,10 +398,10 @@ async function fallbackToOfficial(state, request, signal, reason) {
   } catch (error) {
     // 只换外壳，不改动 code 与文案：`searchWithOfficialProvider` 已经把原因与凭据状态都
     // 织进了消息，这里再做一次改写只会让同一句话说两遍。
-    if (error?.code === 'TAVILY_FALLBACK_CREDENTIAL_MISSING') {
-      throw new TavilyError(error.message, { code: error.code, cause: error });
-    }
-    if (error?.code === 'TAVILY_FALLBACK_CREDENTIAL_INVALID') {
+    if (error?.code === 'TAVILY_FALLBACK_CREDENTIAL_MISSING' || error?.code === 'TAVILY_FALLBACK_CREDENTIAL_INVALID') {
+      // 记下这次失败。面板要区分「未配置」与「已失效」（`CFG-5`），而那个区别只有一次
+      // **真实发生**的回落才能提供——`available()` 只会说「有值」，不会说「值还能用」。
+      state.lastFallbackFailure = { code: error.code, at: new Date().toISOString() };
       throw new TavilyError(error.message, { code: error.code, cause: error });
     }
     if (error?.code === 'WEB_ABORTED') {
@@ -354,7 +444,7 @@ async function probeQuotaForReset(state, signal) {
       // 探测失败要说出来：它意味着「自动恢复」这条路径此刻是坏的，而用户对它的期待
       // 正是「不用管，月初会自己好」。
       report(
-        state.ctx,
+        state.host,
         'warn',
         `dsh-tavily-pool: could not probe the balance of a quota-exhausted key: ${String(outcome.error)}`,
       );
@@ -377,7 +467,7 @@ async function probeQuotaForReset(state, signal) {
 function reportWriteErrors(state) {
   if (state.pool.lastWriteError === undefined) return;
   report(
-    state.ctx,
+    state.host,
     'warn',
     `dsh-tavily-pool: could not record key stats in ${state.pool.filePath}: `
     + `${String(state.pool.lastWriteError)}`,

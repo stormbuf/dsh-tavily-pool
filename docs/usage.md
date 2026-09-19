@@ -39,6 +39,11 @@ There are two **independent** toggles:
 
 They do not affect each other — you can use Tavily for search while keeping the built-in fetcher, for example.
 
+> ⚠️ **Only the search toggle exists on the card today.** Fetch takeover is still being built
+> (ticket `10`): there is no `fetchEnabled` setting yet, and `fetchProvider` still points at
+> the built-in local HTTP fetcher. Until it lands, the card renders the search toggle and says
+> so — rendering a switch that does nothing when flipped is worse than not rendering it.
+
 Toggle changes take effect **immediately**, with no restart.
 
 ## Search parameters

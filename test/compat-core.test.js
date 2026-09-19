@@ -18,6 +18,12 @@ import test, { describe } from 'node:test';
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
+ * 承载浏览器半边的文件：它是一份**脚本**（读 `window.__ModuleLoader__`），不是模块，
+ * 因此既不能 `import`，也不该出现在上面那张表里。分类见下面的「每个 lib/ 模块都要被归类」。
+ */
+const BROWSER_ONLY_MODULES = ['lib/client.js'];
+
+/**
  * 兼容性契约禁止其了解宿主的模块。
  *
  * 每当新建一个逻辑内核模块，就往这里加一条。
@@ -31,6 +37,7 @@ const HOST_FREE_MODULES = [
   'lib/settings.js',
   'lib/usage.js',
   'lib/constants.js',
+  'lib/panel.js',
 ];
 
 /** 插件源码：入口加全部 lib/ 模块（含 lib/dsh/ 适配层）。 */
@@ -63,6 +70,21 @@ describe('COMPAT-1：逻辑内核不依赖宿主', () => {
       assert.ok(Object.keys(module).length > 0, `${relativePath} 应当有导出`);
     });
   }
+});
+
+describe('COMPAT-1：每个 lib/ 模块都要被归类', () => {
+  test('新模块要么进 HOST_FREE_MODULES，要么显式声明为浏览器半边', async () => {
+    // 升级文档承诺「创建内核模块却忘了加进清单会在测试里失败」，而先前并没有这条断言：
+    // 漏加一个模块的后果是它悄悄不受 `COMPAT-1` 保护。这里把承诺兑现——一个既不在
+    // 内核清单、也不在浏览器半边清单里的 `lib/*.js` 会让这条用例红。
+    const libFiles = (await readdir(join(repoRoot, 'lib')))
+      .filter((name) => name.endsWith('.js'))
+      .map((name) => `lib/${name}`)
+      .sort();
+
+    const classified = [...HOST_FREE_MODULES, ...BROWSER_ONLY_MODULES].sort();
+    assert.deepEqual(libFiles, classified, 'lib/ 下每个模块都必须被归类');
+  });
 });
 
 describe('COMPAT-4：每个被 import 的宿主包都在 package.json 里声明', () => {

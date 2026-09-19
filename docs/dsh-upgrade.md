@@ -30,11 +30,14 @@ with the upgrade:
 | `lib/health.js` | failure classification, cooldown, quota/invalid state |
 | `lib/attempts.js` | failover across keys within one request |
 | `lib/settings.js` | setting shapes and defaults (the schema itself is host-agnostic) |
+| `lib/usage.js` | balance refresh, the `/usage` quota, the month-start probe window |
+| `lib/panel.js` | panel state projection and command execution (host-free: it knows neither `Request` nor `Response`) |
 
-`lib/usage.js` joins this layer as the balance-refresh work (`06`) lands.
 `test/compat-core.test.js` enforces the rule mechanically — it fails if any listed file
-grows a host import, and it asserts the list itself, so creating one of those modules
-without adding it here fails the suite rather than passing silently.
+grows a host import, and it asserts that **every** `lib/*.js` is classified, so a new core
+module that nobody added here fails the suite rather than silently escaping the rule.
+(`lib/client.js` is the one deliberate exception: it is a browser script rather than a
+module, and the test names it as such.)
 
 ## Checklist
 
@@ -95,12 +98,49 @@ The context proxy has two reads with different semantics:
 
 - `ctx.someService` **throws** `cannot get property "x" without inject` unless the reading
   fiber declared it in `inject`;
-- `ctx.get('someService')` returns `undefined` instead.
+- `ctx.get('someService')` returns `undefined` instead — but **only for services visible in
+  that fiber's isolation scope**. It is not the boundary-crossing read its own type
+  documentation advertises.
 
 Everything that *probes* must use the reflective form, or a missing capability is reported
-as a crash rather than as a missing capability. This is already implemented in
+as a crash rather than as a missing capability. This is implemented in
 `lib/dsh/read-service.js`; verify the trap still exists and that nothing has started using
 the direct form again.
+
+**Measured on 2026-09-19 with a probe plugin inside an isolated `dsh web` instance:**
+
+| Declared on the plugin | `settings` | `connection` | `credentials` | `clientModules` | `launchEnvironment` | `dshHomePath` |
+|---|---|---|---|---|---|---|
+| nothing | undefined | undefined | undefined | object | object | function |
+| `inject: ['web']` | undefined | undefined | undefined | object | object | function |
+| `inject: [all three]` | object | object | object | object | object | function |
+| `ctx.inject([all three], cb)` | object | object | object | object | object | function |
+
+Three services this plugin needs — `settings`, `connection`, `credentials` — are **not** in
+a plain fiber's scope, so `ctx.get` silently returned `undefined` for them: the settings
+namespace was never registered and no panel route was ever mounted. They must be obtained
+through `ctx.inject([name], callback)`, which hands the callback a child fiber where the
+service is visible (`lib/dsh/host-services.js`).
+
+Do **not** add them to the plugin's own `inject` list instead: that list is all-or-nothing
+(Cordis loads the plugin only while every declared service is available), so a host missing
+any one of them would lose search entirely — the opposite of `PIN-5`.
+
+Two timing facts that come with it, both measured (ms since process start):
+
+```
+apply:start @+817   apply:end @+817   microtask @+1417
+setTimeout(0) @+3373                   inject:settings @+3385
+```
+
+The inject callbacks run **after** the whole profile finishes composing, so neither a
+synchronous probe nor a fixed delay can see those services. Capability probing therefore
+hangs off real events (each service becoming available, and the first search), while the
+panel probes fresh on every read.
+
+**Check on upgrade:** run `test/dsh-host-services.test.js`. Its host double is deliberately
+*stricter* than the real one (its `get` returns only injected services), so a change in the
+isolation semantics fails there instead of surfacing as a silently missing panel.
 
 ### 5. The fallback targets this plugin constructs directly
 

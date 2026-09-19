@@ -20,6 +20,10 @@ Tavily-backed web search **and** page fetching for DeepSeek Harness: multi-key p
 - **Independent toggles** — search and fetch can be switched back to the official providers separately
 - **Zero runtime dependencies** — plain ESM, no build step
 
+> **Shipped so far:** the search takeover, the key pool, balance-aware scheduling, failover,
+> cooldown, usage accounting, balance refresh, the settings card and its HTTP API. Fetch
+> takeover (and therefore its toggle) is the remaining P0 work.
+
 ## Install
 
 ```sh

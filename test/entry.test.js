@@ -80,6 +80,15 @@ function fakeHost({ harnessHome, omitRegistration = false, settings = {}, enviro
   const ctx = {
     get: (name) => services[name],
     services,
+    // 与真实宿主同形的 `inject`：依赖齐全时**同步**跑回调，缺一个就永不跑。
+    //
+    // 插件用 `ctx.inject` 取 `settings` / `connection` / `credentials`（见
+    // `lib/dsh/host-services.js` 的实测表），因此替身少了这个方法，插件在真实宿主上会
+    // 走通、在这里却直接抛——那正是替身最容易掩盖的一类失败。
+    inject: (deps, callback) => {
+      if (deps.every((name) => services[name] !== undefined)) callback(ctx);
+      return { dispose: () => undefined };
+    },
     // 自有属性，不是服务——因此刻意不出现在 `services` 里。
     logger: { warn: (message) => warnings.push(String(message)) },
   };
@@ -166,13 +175,19 @@ describe('PIN-5 / 硬约束 5：注册发生在最前', () => {
     assert.equal(host.registered.length, 1);
   });
 
-  test('退化的宿主在加载期被上报，并点名缺了什么', () => {
+  test('退化的宿主在加载期被上报，并点名缺了什么', async () => {
     const host = fakeHost();
     // 移除一项可选能力：探测仍须成功，而该发现必须进入日志，而不是被静默吞掉。
     delete host.ctx.services.dshHomePath;
     apply(host.ctx, {});
 
     assert.equal(host.registered.length, 1, '退化的宿主不得阻止注册');
+    // 探测刻意推迟一轮宏任务：`settings` / `connection` / `credentials` 三项只能经
+    // `ctx.inject` 取得，而它的回调是异步的（真机实测见 `lib/dsh/host-services.js`）。
+    // 同步探测会把它们全报成缺失——那是探测自身的时序假象。
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
     const reported = host.warnings.join('\n');
     assert.match(reported, /dshHomePath/u);
     assert.match(reported, /docs\/dsh-upgrade\.md/u);

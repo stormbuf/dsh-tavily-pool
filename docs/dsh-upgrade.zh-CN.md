@@ -27,10 +27,13 @@ DeepSeek Harness 处于预览期，其插件接口会随版本变动。本插件
 | `lib/health.js` | 失败分类、冷却、额度耗尽/永久失效状态 |
 | `lib/attempts.js` | 一次请求内的跨密钥故障切换 |
 | `lib/settings.js` | 设置形状与默认值（schema 本身与宿主无关） |
+| `lib/usage.js` | 余额刷新、`/usage` 配额、月起始的探测窗口 |
+| `lib/panel.js` | 面板的状态投影与命令执行（宿主无关：既不认识 `Request` 也不认识 `Response`） |
 
-`lib/usage.js` 会随余额刷新（`06`）加入这一层。`test/compat-core.test.js` 机械执行该规则
-——任一所列文件长出宿主 import 即失败；它同时断言这份清单本身，因此创建上述模块却没加进
-清单会**直接让测试失败**，而不是静默通过。
+`test/compat-core.test.js` 机械执行该规则——任一所列文件长出宿主 import 即失败；它同时断言
+**每个** `lib/*.js` 都已被归类，因此新建的内核模块若没人加进上面那张表，会在测试里失败，而不是
+悄悄逃出这条规则。（`lib/client.js` 是唯一的例外：它是一份浏览器脚本而不是模块，测试里把它
+显式列为浏览器半边。）
 
 ## 作业清单
 
@@ -86,11 +89,42 @@ context proxy 有两种语义不同的读取方式：
 
 - `ctx.someService` 会**抛出** `cannot get property "x" without inject`，除非读取方 fiber
   在 `inject` 里声明过它；
-- `ctx.get('someService')` 则返回 `undefined`。
+- `ctx.get('someService')` 则返回 `undefined`——但**只对本 fiber 隔离作用域内可见的服务**。
+  它并不是它自己的类型文档所宣称的那种「跨边界读取」。
 
 一切**探测**都必须用反射写法，否则「能力缺失」会被报成「崩了」而不是「缺了哪项能力」。
 这一点已在 `lib/dsh/read-service.js` 实现；请确认该陷阱仍然存在，且没有代码重新开始用直接
 属性读取。
+
+**2026-09-19 用探针插件在隔离的 `dsh web` 实例里实测：**
+
+| 插件上的声明 | `settings` | `connection` | `credentials` | `clientModules` | `launchEnvironment` | `dshHomePath` |
+|---|---|---|---|---|---|---|
+| 什么都不声明 | undefined | undefined | undefined | object | object | function |
+| `inject: ['web']` | undefined | undefined | undefined | object | object | function |
+| `inject: [三项全写]` | object | object | object | object | object | function |
+| `ctx.inject([三项], cb)` | object | object | object | object | object | function |
+
+本插件需要的三项——`settings`、`connection`、`credentials`——**不在**普通 fiber 的作用域里，
+于是 `ctx.get` 对它们安静地返回 `undefined`：设置命名空间从未注册、面板路由一条也没挂上。
+它们必须经 `ctx.inject([name], callback)` 取得，那个回调拿到的子 fiber 里该服务可见
+（`lib/dsh/host-services.js`）。
+
+**不要**改为把它们写进插件自己的 `inject` 列表：那张表是全有或全无的（Cordis 只在声明的服务
+全部可用时才加载插件），宿主缺任何一项都会连搜索一起失去——与 `PIN-5` 正好相反。
+
+与之配套的两条时序事实（实测，毫秒为相对进程启动）：
+
+```
+apply:start @+817   apply:end @+817   microtask @+1417
+setTimeout(0) @+3373                   inject:settings @+3385
+```
+
+注入回调要等整个 profile 组合完成才跑，因此**同步探测与固定延时都看不见那三项**。能力探测
+因此挂在真实事件上（每项服务就绪时、第一次搜索时），而面板读到的那份是每次**当场探测**的。
+
+**升级时检查：** 跑 `test/dsh-host-services.test.js`。它的宿主替身**刻意比真实宿主更严格**
+（`get` 只返回注入过的服务），因此隔离语义一变，失败会出现在那里，而不是表现为面板悄悄消失。
 
 ### 5. 本插件直接构造的回落目标
 
