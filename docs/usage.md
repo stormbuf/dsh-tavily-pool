@@ -75,10 +75,12 @@ A fetched page comes back as **plain text, never as HTML**. Tavily already retur
 
 The key pool schedules by **balance first** by default:
 
+- A key's balance is **limit − used**. The limit comes from the key itself (`key.limit`); when that is `null` the plugin falls back to the plan limit of the account this key belongs to (`account.plan_limit`) — free accounts return `null` for `key.limit`, so reading only that field would show a 1000-credits-per-month account as "unlimited"
 - Keys with more remaining credits go first
-- Keys whose balance is "unlimited" go first of all
+- Only keys with no limit at either level count as "unlimited", and they go first of all
 - Keys whose balance is **unknown** go last (unknown is not zero)
 - Within the same balance tier, keys rotate
+- **Every key is computed on its own**: the plugin does not try to work out which keys share an account (the official API does not expose ownership), so when one account holds several keys each of them sees the same account-level limit
 
 ### Scheduling policy
 

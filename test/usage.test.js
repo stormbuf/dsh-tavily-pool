@@ -237,20 +237,38 @@ describe('SCHED-8：只有官方确认余额回升才恢复', () => {
     assert.equal(health.snapshotOf(record.id).quotaExhausted, true, '没恢复就继续排除');
   });
 
-  test('limit 为 null 视为无限，余额必然为正', async () => {
+  test('两侧都没有上限（真·无限）时，余额必然为正', async () => {
     const { health, refresher, record } = await harness({
-      respond: () => ({ status: 200, body: usageBody({ usage: 999_999, limit: null }) }),
+      respond: () => ({ status: 200, body: usageBody({ usage: 999_999, limit: null, planLimit: null }) }),
     });
     await health.recordFailure(record.id, { failure: { status: 432 } });
 
     assert.equal((await refresher.refresh(record.id, record.key)).recovered, true);
     assert.equal(health.snapshotOf(record.id).quotaExhausted, false);
   });
+
+  test('免费账号的 key.limit 也是 null，额度用尽时**不算**恢复（ticket 20）', async () => {
+    // 实测的官方响应：`key.limit` 为 `null`、`account.plan_limit` 为 1000。修之前这把额度
+    // 已经用尽的密钥会被判成「余额回升」，于是下一次搜索白撞一次 432。
+    const { health, refresher, record } = await harness({
+      respond: () => ({ status: 200, body: usageBody({ usage: 1000, limit: null, planLimit: 1000 }) }),
+    });
+    await health.recordFailure(record.id, { failure: { status: 432 } });
+
+    assert.equal((await refresher.refresh(record.id, record.key)).recovered, false);
+    assert.equal(health.snapshotOf(record.id).quotaExhausted, true, '没恢复就继续排除');
+  });
 });
 
 describe('hasPositiveBalance：读不出余额一律不算「恢复」', () => {
-  test('无限额度为正', () => {
-    assert.equal(hasPositiveBalance({ key: { usage: 1, limit: null } }), true);
+  test('两侧都没有上限时为正', () => {
+    assert.equal(hasPositiveBalance({ key: { usage: 1, limit: null }, account: { plan_limit: null } }), true);
+  });
+
+  test('免费账号按 account.plan_limit 判断（ticket 20）', () => {
+    const free = (usage) => ({ key: { usage, limit: null }, account: { current_plan: 'Researcher', plan_limit: 1000 } });
+    assert.equal(hasPositiveBalance(free(999)), true);
+    assert.equal(hasPositiveBalance(free(1000)), false, '用尽就是没有余额，哪怕 key.limit 写着 null');
   });
 
   test('用量小于上限为正', () => {
@@ -440,13 +458,26 @@ describe('USAGE-5：搜索成功后前推余额', () => {
     assert.equal(health.statsOf(record.id).creditsUnknown, 1, '但这次「未知」要留下痕迹');
   });
 
-  test('无限额度的密钥不前推：没有有限的余额可供减少', async () => {
+  test('真·无限的密钥不前推：没有有限的余额可供减少', async () => {
     const { pool, health, record } = await harness();
 
-    await pool.setUsage(record.id, usageBody({ usage: 500, limit: null }));
+    await pool.setUsage(record.id, usageBody({ usage: 500, limit: null, planLimit: null }));
     await health.recordSuccess(record.id, { credits: 2 });
 
     assert.equal(pool.usageOf(record.id).key.usage, 500, '无限额度前推不改变任何排序决策，却会污染官方读数');
+  });
+
+  test('免费账号的密钥会前推：上限在 account.plan_limit，本地估计因此有意义（ticket 20）', async () => {
+    const { pool, health, record } = await harness();
+
+    await pool.setUsage(record.id, usageBody({ usage: 500, limit: null, planLimit: 1000 }));
+    await health.recordSuccess(record.id, { credits: 2 });
+
+    assert.equal(
+      pool.usageOf(record.id).key.usage,
+      502,
+      '修之前这里也不前推（`key.limit` 是 null），于是排序一直停在官方读数上',
+    );
   });
 
   test('从未刷新过余额的密钥不前推：不凭空造一份本地估计', async () => {

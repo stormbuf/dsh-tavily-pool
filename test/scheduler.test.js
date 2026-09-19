@@ -45,27 +45,49 @@ async function harness(keys, options = {}) {
 /**
  * 给一把密钥写入一份 `/usage` 形态的余额缓存。
  *
- * 形状照抄官方响应：排序只读 `key` 那一层，因为 `account.plan_*` 对同账户的多把密钥
- * 没有区分度。
+ * 形状照抄官方响应：**上限优先取 `key.limit`，缺失时退回 `account.plan_limit`**——免费账号的
+ * `key.limit` 就是 `null`（ticket `20`），只写 `key` 那一层会把它读成「无限」。
  *
  * @param pool - 密钥池。
  * @param id - 密钥 id。
- * @param key - `key` 对象的内容；`{ limit: null }` 表示无限。
+ * @param key - `key` 对象的内容。
+ * @param account - `account` 对象的内容；默认两侧都没有上限，即真·无限。
  */
-async function setUsage(pool, id, key) {
+async function setUsage(pool, id, key, account = { plan_limit: null }) {
   await pool.update((document) => {
-    document.usageCache[id] = { key, fetchedAt: new Date().toISOString(), stale: false };
+    document.usageCache[id] = { key, account, fetchedAt: new Date().toISOString(), stale: false };
     return document;
   });
 }
 
 describe('SCHED-2：余额三态语义', () => {
   test('无限最前，未知垫底，其余按剩余量', () => {
-    assert.equal(balanceRank({ key: { limit: null, usage: 9999 } }), Number.POSITIVE_INFINITY);
+    assert.equal(
+      balanceRank({ key: { limit: null, usage: 9999 }, account: { plan_limit: null } }),
+      Number.POSITIVE_INFINITY,
+      '两侧都没有上限才是无限',
+    );
     assert.equal(balanceRank(undefined), Number.NEGATIVE_INFINITY, '从未刷新过 → 未知');
     assert.equal(balanceRank({}), Number.NEGATIVE_INFINITY, '响应里没有 key 对象 → 未知');
     assert.equal(balanceRank({ key: { limit: 1000, usage: 900 } }), 100);
     assert.equal(balanceRank({ key: { limit: 1000, usage: 1200 } }), 0, '本地前推越过上限时取 0');
+  });
+
+  test('免费账号的 key.limit 是 null，但上限在 account.plan_limit（ticket 20）', () => {
+    // 实测的官方响应：`key.limit` 为 `null`，`account.plan_limit` 为 1000。修之前这里返回
+    // `Infinity`——一把只剩 100 积分的密钥被当成用不完，而它其实是池里额度最少的那把。
+    const free = { key: { limit: null, usage: 900 }, account: { current_plan: 'Researcher', plan_limit: 1000 } };
+    assert.equal(balanceRank(free), 100, '按账号套餐的上限算剩余');
+
+    const richer = { key: { limit: 200, usage: 0 } };
+    assert.ok(balanceRank(free) < balanceRank(richer), '额度少的排在额度多的后面');
+  });
+
+  test('上限读不出来时是未知，不是无限', () => {
+    // 形状不认识（`limit` 既不是数也不是 `null`）时不再往下退：拿账号层的数字去补只会掩盖
+    // 这个问题，而「以为它用不完」比「以为它没量了」危险得多。
+    assert.equal(balanceRank({ key: { limit: '1000', usage: 0 } }), Number.NEGATIVE_INFINITY);
+    assert.equal(balanceRank({ key: { limit: null, usage: 0 } }), Number.NEGATIVE_INFINITY, '没有 account 段 → 读不出上限');
   });
 
   test('未知不是零：它排在余额为 0 的密钥之后', () => {

@@ -1136,7 +1136,53 @@ describe('PANEL-6：余额未知时显示未知', () => {
     assert.equal(fills[0].props.style.width, '75%');
   });
 
-  test('无限额度显示「无限」，仍不画进度条', async () => {
+  test('两侧都没有上限时才显示「无限」，且仍不画进度条', async () => {
+    const { component, t } = await mountedCard({
+      hooks: {
+        ui: readyUi({
+          keys: [keyRecord({
+            usage: { key: { limit: null, usage: 12 }, account: { plan_limit: null }, stale: false },
+          })],
+        }),
+        draft: readyDraft(),
+      },
+    });
+
+    const tree = component({ t });
+    assert.equal(textsOf(tree).includes('无限'), true);
+    assert.deepEqual(flatten(tree).filter((element) => element.props?.className === 'dtp-bar'), []);
+  });
+
+  test('免费账号的 key.limit 是 null，但面板要按 account.plan_limit 画真实剩余（ticket 20）', async () => {
+    // 实测的官方响应：`key.limit` 为 `null`、`account.plan_limit` 为 1000。修之前面板显示
+    // 「无限」、不画进度条——而用户实际只有 1000 积分/月，其中 250 已经用掉。
+    const { component, t } = await mountedCard({
+      hooks: {
+        ui: readyUi({
+          keys: [keyRecord({
+            usage: {
+              key: { limit: null, usage: 250 },
+              account: { current_plan: 'Researcher', plan_usage: 250, plan_limit: 1000 },
+              stale: false,
+            },
+          })],
+        }),
+        draft: readyDraft(),
+      },
+    });
+
+    const tree = component({ t });
+    assert.equal(textsOf(tree).includes('无限'), false, '免费账号不是无限额度');
+    assert.equal(textsOf(tree).some((text) => text.includes('剩余 750 / 1000 积分')), true);
+
+    const fills = flatten(tree).filter((element) => element.props?.className === 'dtp-bar-fill');
+    assert.equal(fills.length, 1, '有分母就该画进度条');
+    assert.equal(fills[0].props.style.width, '75%');
+  });
+
+  test('上限读不出来时显示「未知」，不显示「无限」', async () => {
+    // 没有 account 段的响应（形状变化、残缺）读不出上限：显示「未知」而不是「无限」——
+    // 「以为它用不完」比「以为它没量了」危险得多。
     const { component, t } = await mountedCard({
       hooks: {
         ui: readyUi({ keys: [keyRecord({ usage: { key: { limit: null, usage: 12 }, stale: false } })] }),
@@ -1145,8 +1191,8 @@ describe('PANEL-6：余额未知时显示未知', () => {
     });
 
     const tree = component({ t });
-    assert.equal(textsOf(tree).includes('无限'), true);
-    assert.deepEqual(flatten(tree).filter((element) => element.props?.className === 'dtp-bar'), []);
+    assert.equal(textsOf(tree).includes('无限'), false);
+    assert.equal(textsOf(tree).includes('未知'), true);
   });
 
   test('刷新失败的读数标成陈旧（USAGE-3）', async () => {
