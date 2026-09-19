@@ -8,7 +8,7 @@ Tavily-backed web search **and** page fetching for DeepSeek Harness: multi-key p
 
 ## Features
 
-- **Multi-key pool** — add, label, enable/disable, reorder, remove; the UI only ever shows masked keys
+- **Multi-key pool** — add one key or paste a whole batch (one per line), label, enable/disable, reorder, remove; the UI only ever shows masked keys
 - **Balance-aware rotation** — highest remaining balance first; three-state balance (`limit === null` → unlimited first, unknown → last)
 - **Automatic failover** — a failing key hands the request to the next one
 - **Cooldown** — honors upstream `Retry-After`; cooled keys are hard-excluded until it expires, and when every key is cooling the request waits for the earliest one within a bounded budget

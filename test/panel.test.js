@@ -318,6 +318,113 @@ describe('POOL-4：密钥池的增删改启停排序', () => {
   });
 });
 
+describe('POOL-8：批量添加', () => {
+  /** 五行文本：一行带缩进、一行空、一行全是空白、一行与第一行重复。 */
+  const PASTED = [
+    '  tvly-dev-batch-one-000000000000  ',
+    '',
+    'tvly-dev-batch-two-000000000000',
+    'tvly-dev-batch-one-000000000000',
+    '   ',
+  ].join('\n');
+
+  test('一行一把：两侧空白被去掉，空行不算密钥', async () => {
+    const { deps, pool } = await panelDeps();
+    const { status, body } = await runPanelCommand('keys', { action: 'addBatch', text: PASTED }, deps);
+
+    assert.equal(status, 200);
+    assert.deepEqual(
+      pool.keysInOrder().map((record) => record.key),
+      ['tvly-dev-batch-one-000000000000', 'tvly-dev-batch-two-000000000000'],
+    );
+    assert.equal(body.keys.length, 2);
+  });
+
+  test('重复的被跳过，且如实报告新增与跳过的条数', async () => {
+    const { deps } = await panelDeps();
+    const { body } = await runPanelCommand('keys', { action: 'addBatch', text: PASTED }, deps);
+
+    assert.deepEqual(body.summary, { received: 3, added: 2, duplicates: 1 });
+  });
+
+  test('池里已有的密钥也算重复：粘贴一整份清单不会得到两把一样的密钥', async () => {
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+
+    const { body } = await runPanelCommand('keys', {
+      action: 'addBatch',
+      text: `${SECRET}\ntvly-dev-batch-new-000000000000\n`,
+    }, deps);
+
+    assert.deepEqual(body.summary, { received: 2, added: 1, duplicates: 1 });
+    assert.equal(pool.keysInOrder().length, 2);
+  });
+
+  test('粘贴的全是池里已有的密钥时不算失败，只是没有新增', async () => {
+    // 「一行都没识别出来」与「识别出来了但没有一把是新的」是两回事：前者是贴错了东西，
+    // 后者是把同一份清单又贴了一遍。前者按入参非法拒绝，后者如实回一份 `added: 0`。
+    const { deps } = await panelDeps();
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+
+    const { status, body } = await runPanelCommand('keys', { action: 'addBatch', text: SECRET }, deps);
+
+    assert.equal(status, 200);
+    assert.deepEqual(body.summary, { received: 1, added: 0, duplicates: 1 });
+    assert.equal(body.keys.length, 1);
+  });
+
+  test('一行密钥都没有时按入参非法拒绝，而不是回一个静悄悄的 0', async () => {
+    const { deps } = await panelDeps();
+    for (const text of ['   ', '\n\n\n', '  \t  \n ']) {
+      await assert.rejects(
+        () => runPanelCommand('keys', { action: 'addBatch', text }, deps),
+        (error) => error instanceof PanelError && error.code === PANEL_ERROR_CODES.BAD_REQUEST,
+        `${JSON.stringify(text)} 必须被拒绝`,
+      );
+    }
+  });
+
+  test('text 缺席、不是字符串或为空串时都是 400', async () => {
+    const { deps } = await panelDeps();
+    for (const payload of [{ action: 'addBatch' }, { action: 'addBatch', text: 7 }, { action: 'addBatch', text: '' }]) {
+      await assert.rejects(
+        () => runPanelCommand('keys', payload, deps),
+        (error) => error.status === 400,
+        `${JSON.stringify(payload)} 必须被拒绝`,
+      );
+    }
+  });
+
+  test('响应里只有脱敏形式，而两把都真的加进去了（POOL-2、POOL-3）', async () => {
+    const { deps, pool } = await panelDeps();
+    const response = await runPanelCommand('keys', {
+      action: 'addBatch',
+      text: `  ${SECRET}  \n${OTHER_SECRET}`,
+    }, deps);
+
+    assert.deepEqual(pool.keysInOrder().map((record) => record.key), [SECRET, OTHER_SECRET], '落盘的是明文');
+    assert.equal(JSON.stringify(response).includes(SECRET), false);
+    assert.equal(JSON.stringify(response).includes(OTHER_SECRET), false);
+    assert.equal(response.body.keys.length, 2);
+  });
+
+  test('CRLF 文本同样一行一把：从网页表格里复制出来的常常是它', async () => {
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'addBatch', text: `${SECRET}\r\n${OTHER_SECRET}\r\n` }, deps);
+
+    assert.deepEqual(pool.keysInOrder().map((record) => record.key), [SECRET, OTHER_SECRET]);
+  });
+
+  test('parseKeyLines 给出去重后的明文与计数，不把明文带进返回值以外的地方', async () => {
+    const { parseKeyLines } = await import('../lib/panel.js');
+    const parsed = parseKeyLines(PASTED, { existing: ['tvly-dev-batch-two-000000000000'] });
+
+    assert.deepEqual(parsed.fresh, ['tvly-dev-batch-one-000000000000'], '池里已有的不算新增');
+    assert.equal(parsed.received, 3);
+    assert.equal(parsed.duplicates, 2, '批内重复与池内重复走同一条路');
+  });
+});
+
 describe('CFG-3、CFG-4：设置经宿主写入，校验失败原样透出', () => {
   test('patch 被合并进设置并读回新值', async () => {
     const { deps, box } = await panelDeps();

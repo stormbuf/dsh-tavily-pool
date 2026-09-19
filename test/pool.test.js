@@ -466,3 +466,88 @@ describe('issue 01 的密钥选择', () => {
     assert.deepEqual(store.maskedList(), []);
   });
 });
+
+describe('POOL-8：批量添加是一次编辑', () => {
+  /**
+   * 一个计着写入次数的存储。
+   *
+   * 「一次落盘」这件事只有数得出来才谈得上被检验：批量添加若退化成循环调用 `addKey`，
+   * 行为上完全看不出区别（最终还是全部留存），只有写入次数会从 1 变成 N。
+   *
+   * @returns `{ store, writes }`。
+   */
+  async function countingStore() {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-batch-'));
+    const real = await import('node:fs/promises');
+    const counter = { count: 0 };
+    const store = await new PoolStore({
+      dir,
+      fileName: 'keys.json',
+      fs: {
+        mkdir: real.mkdir,
+        readFile: real.readFile,
+        rename: real.rename,
+        unlink: real.unlink,
+        writeFile: (...args) => {
+          counter.count += 1;
+          return real.writeFile(...args);
+        },
+      },
+    }).load();
+    return { store, writes: counter };
+  }
+
+  test('12 把密钥只写一次盘，且全部留存', async () => {
+    const { store, writes } = await countingStore();
+    const keys = Array.from({ length: 12 }, (unused, index) => ({ key: `tvly-dev-batch-${String(index)}-000000000000` }));
+
+    const records = await store.addKeys({ keys });
+
+    assert.equal(records.length, 12);
+    assert.equal(writes.count, 1, '批量添加是一次编辑，不是 12 次');
+    assert.equal(store.keysInOrder().length, 12);
+    assert.equal(JSON.parse(await readFile(store.filePath, 'utf8')).keys.length, 12, '而且真落了盘');
+  });
+
+  test('同一批共享同一个 addedAt：它们是同一次动作的结果', async () => {
+    const { store } = await countingStore();
+    const records = await store.addKeys({
+      keys: [{ key: 'tvly-dev-batch-a-000000000000' }, { key: 'tvly-dev-batch-b-000000000000' }],
+      nowMs: Date.parse('2026-09-19T00:00:00.000Z'),
+    });
+
+    assert.deepEqual(records.map((record) => record.addedAt), [
+      '2026-09-19T00:00:00.000Z',
+      '2026-09-19T00:00:00.000Z',
+    ]);
+  });
+
+  test('空数组什么都不做，连一次写入都不排', async () => {
+    const { store, writes } = await countingStore();
+    assert.deepEqual(await store.addKeys({ keys: [] }), []);
+    assert.equal(writes.count, 0);
+    assert.deepEqual(store.keysInOrder(), []);
+  });
+
+  test('批量添加的新密钥排在池尾，顺序列表与密钥列表一一对应', async () => {
+    const { store } = await countingStore();
+    await store.addKey({ key: 'tvly-dev-existing-000000000000' });
+    await store.addKeys({ keys: [{ key: 'tvly-dev-new-a-000000000000' }, { key: 'tvly-dev-new-b-000000000000' }] });
+
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    assert.deepEqual(
+      store.keysInOrder().map((record) => record.key),
+      ['tvly-dev-existing-000000000000', 'tvly-dev-new-a-000000000000', 'tvly-dev-new-b-000000000000'],
+    );
+    assert.deepEqual(onDisk.order, store.keysInOrder().map((record) => record.id));
+  });
+
+  test('批量添加的密钥默认启用，且列表出口只有脱敏形式（POOL-3、POOL-5）', async () => {
+    const { store } = await countingStore();
+    const secret = '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';
+    await store.addKeys({ keys: [{ key: secret }] });
+
+    assert.equal(store.keysInOrder()[0].disabled, false);
+    assert.equal(JSON.stringify(store.maskedList()).includes(secret), false);
+  });
+});

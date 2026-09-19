@@ -70,30 +70,72 @@ const switchStub = primitiveStub('Switch');
  * 因此这里的次序是稳定的、可读的。`useEffect` 只收集不执行——首次加载会去 `fetch`，而
  * 本文件要断言的是「进入某个状态之后渲染成什么样」，不是网络行为。
  *
+ * setter 把收到的更新记进 `updates`：卡片用它们做瞬时反馈（「已添加 N 把密钥」这类提示
+ * 只存在于 `patch` 的结果里，不重渲染就看不见）。记下来之后，那些反馈也能被断言。
+ *
  * @param options - 预设的 hook 值。
  * @param options.ui - 第一次 `useState` 的返回值。
  * @param options.draft - 第二次 `useState` 的返回值。
- * @returns `{ react, effects }`。
+ * @returns `{ react, effects, updates }`。
  */
 function reactStub({ ui, draft } = {}) {
   const queue = [ui, draft];
   const effects = [];
+  const updates = [];
   let index = 0;
   return {
     effects,
+    updates,
     react: {
       createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
       Fragment: Symbol('react.fragment'),
       useState: (initial) => {
         const slot = index;
         index += 1;
-        return [slot < queue.length && queue[slot] !== undefined ? queue[slot] : initial, () => undefined];
+        return [
+          slot < queue.length && queue[slot] !== undefined ? queue[slot] : initial,
+          (next) => updates.push({ slot, next }),
+        ];
       },
       useEffect: (effect) => {
         effects.push(effect);
       },
     },
   };
+}
+
+/**
+ * 把一次 hook setter 收到的更新套到一份基准状态上。
+ *
+ * `patch` 走的是函数式更新（`setUi((current) => ...)`），因此要看它想写进去的值，只能把它
+ * 自己那份基准交给它。
+ *
+ * @param update - `reactStub` 记下的 `{ slot, next }`。
+ * @param base - 该 hook 当前的返回値。
+ * @returns 更新后的状态。
+ */
+function applied(update, base) {
+  return typeof update.next === 'function' ? update.next(base) : update.next;
+}
+
+/**
+ * 弹框用例需要的 `document` 替身（`POOL-8`）。
+ *
+ * `querySelector` 返回一个非 null 值，是为了让模块体的样式注入那一步直接跳过：本文件检验
+ * 的是渲染出什么，不是样式标签怎么挂。`body` 是 portal 的落点。
+ */
+function documentStub() {
+  return {
+    body: {},
+    querySelector: () => ({}),
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+  };
+}
+
+/** `createPortal` 的替身：把挂载点也记进元素树，于是「弹层挂在 body 上」可断言。 */
+function portalStub(children, container) {
+  return { type: 'portal', props: { container }, children: [children].flat(Infinity) };
 }
 
 /**
@@ -130,9 +172,10 @@ async function loadBundle(globals = {}) {
  */
 function instantiate(registration, options = {}) {
   const requested = [];
-  const { react, effects } = reactStub(options.hooks);
+  const { react, effects, updates } = reactStub(options.hooks);
   const modules = {
     react,
+    'react-dom': { createPortal: portalStub },
     '@deepseek-ai/dsh-client-ui-primitives': {
       Switch: switchStub,
       Tag: primitiveStub('Tag'),
@@ -146,7 +189,7 @@ function instantiate(registration, options = {}) {
     }
     return modules[specifier];
   };
-  return { exports: registration.factory(require), requested, effects };
+  return { exports: registration.factory(require), requested, effects, updates };
 }
 
 /**
@@ -206,8 +249,9 @@ function tOf(dictionaries, locale = 'zh') {
  */
 async function mountedCard(options = {}) {
   const { registration } = await loadBundle(options.globals);
-  const mounted = mountCard(instantiate(registration, { hooks: options.hooks }).exports);
-  return { ...mounted, t: tOf(mounted.dictionaries, options.locale ?? 'zh') };
+  const instantiated = instantiate(registration, { hooks: options.hooks });
+  const mounted = mountCard(instantiated.exports);
+  return { ...mounted, t: tOf(mounted.dictionaries, options.locale ?? 'zh'), updates: instantiated.updates };
 }
 
 /** 服务端状态的一份样本，字段与 `lib/panel.js` 的投影一一对应。 */
@@ -254,6 +298,8 @@ function readyUi(stateOverrides = {}) {
     renameText: '',
     newKey: '',
     newLabel: '',
+    batchOpen: false,
+    batchText: '',
     // 渲染用例一律以**展开**态断言主体内容；收起态另有专门的用例。
     expanded: true,
   };
@@ -343,7 +389,9 @@ describe('PANEL-2：零构建产物可被加载', () => {
     const { registration } = await loadBundle();
     const { requested, exports } = instantiate(registration);
 
-    assert.deepEqual(requested, ['react', '@deepseek-ai/dsh-client-ui-primitives']);
+    // 三个：`react`、`react-dom`（批量添加的弹层用 `createPortal`）、`primitives`（开关与
+    // 展开箭头）。多一个键就多一处随宿主漂移的面。
+    assert.deepEqual(requested, ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives']);
     for (const specifier of requested) {
       assert.equal(SEED_MODULES.includes(specifier), true, `${specifier} 不在种子表里`);
     }
@@ -484,6 +532,188 @@ describe('PANEL-2、PANEL-3：卡片自绘控件，只复用已核实的基础�
     const used = new Set();
     for (const match of source.matchAll(/primitives\.([A-Za-z][A-Za-z0-9]*)/gu)) used.add(match[1]);
     assert.deepEqual([...used].sort(), ['IconChevronDownOutline14', 'Switch', 'Tag']);
+  });
+});
+
+describe('POOL-8：批量添加', () => {
+  /** 一个记录请求的 fetch 替身：`keys` 路由回一份带 `summary` 的结果，其余当状态读。 */
+  function fetchStub(calls, summary) {
+    return async (path, options = {}) => {
+      calls.push({ path, body: options.body === undefined ? undefined : JSON.parse(options.body) });
+      const payload = path === '/api/tavily-pool.keys' ? { keys: [], summary } : sampleState();
+      return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+    };
+  }
+
+  /** 让 vm 里那条 async 链跑完：它的每一个 `await` 都落在已兑现的 promise 上。 */
+  async function flush() {
+    for (let index = 0; index < 4; index += 1) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    }
+  }
+
+  /**
+   * 把某一次动作里全部 hook 更新按序套到基准状态上。
+   *
+   * 一次动作会分几次 `patch`（开始、结果、收尾），只看最后一条会漏掉中间那条真正写进
+   * 提示的更新。
+   *
+   * @param updates - `reactStub` 记下的更新。
+   * @param base - 动作开始前的瞬时状态。
+   * @returns 动作结束后的瞬时状态。
+   */
+  function uiAfter(updates, base) {
+    return updates
+      .filter((update) => update.slot === 0)
+      .reduce((state, update) => applied(update, state), base);
+  }
+
+  /** 粘进框里的那段文本：首尾有换行、中间有缩进、还夹着一个重复行。 */
+  const PASTED = '\ntvly-dev-a\n  tvly-dev-b  \n\ntvly-dev-a';
+
+  /** 弹框打开时的瞬时状态。 */
+  function openUi(text = PASTED) {
+    return { ...readyUi(), batchOpen: true, batchText: text };
+  }
+
+  /** 弹框里的按钮——按类名先定位弹框，免得撞上单把添加表单里那个同名的「添加」。 */
+  function dialogButton(tree, text) {
+    const dialog = flatten(tree).find((element) => element.props?.className === 'dtp-dialog');
+    assert.notEqual(dialog, undefined, '弹框没有渲染出来');
+    return flatten(dialog).find((element) => element.type === 'button' && textsOf(element).includes(text));
+  }
+
+  test('密钥池标题行给出入口，没点开时一个弹层都不渲染', async () => {
+    const { component, t } = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
+    const tree = component({ t });
+
+    assert.notEqual(buttonWithText(tree, '批量添加'), undefined, '标题行要有批量添加的入口');
+    assert.equal(flatten(tree).some((element) => element.type === 'portal'), false);
+    assert.equal(flatten(tree).some((element) => element.props?.className === 'dtp-dialog'), false);
+  });
+
+  test('打开后弹框挂在 document.body 上，里面有文本框与「一行一个」的说明', async () => {
+    const { component, t } = await mountedCard({
+      globals: { document: documentStub() },
+      hooks: { ui: openUi(), draft: readyDraft() },
+    });
+    const tree = component({ t });
+
+    const portal = flatten(tree).find((element) => element.type === 'portal');
+    assert.notEqual(portal, undefined);
+    assert.notEqual(portal.props.container, undefined, '弹层要挂到卡片之外，否则定位受祖先元素摆布');
+
+    const dialog = flatten(tree).find((element) => element.props?.className === 'dtp-dialog');
+    assert.equal(dialog.props.role, 'dialog');
+    assert.equal(dialog.props['aria-modal'], true);
+
+    const textarea = flatten(dialog).find((element) => element.type === 'textarea');
+    assert.notEqual(textarea, undefined, '要有一个能粘贴几十行的多行文本框');
+    assert.equal(textarea.props.value, PASTED);
+    assert.equal(textarea.props.autoFocus, true);
+
+    const texts = textsOf(dialog);
+    assert.equal(texts.includes('批量添加密钥'), true);
+    assert.equal(texts.some((text) => text.includes('一行一个密钥')), true);
+    assert.equal(texts.some((text) => text.includes('空行与重复的会被跳过')), true, '规则要说在按钮前面');
+  });
+
+  test('文本框为空时确认按钮不可用——空粘贴不该发一趟请求', async () => {
+    const { component, t } = await mountedCard({
+      globals: { document: documentStub() },
+      hooks: { ui: openUi('  \n\n'), draft: readyDraft() },
+    });
+
+    assert.equal(dialogButton(component({ t }), '添加').props.disabled, true);
+  });
+
+  test('提交中弹框保持打开且禁用：刚粘进去的文本不会丢', async () => {
+    const { component, t } = await mountedCard({
+      globals: { document: documentStub() },
+      hooks: { ui: { ...openUi(), busy: 'addBatch' }, draft: readyDraft() },
+    });
+    const tree = component({ t });
+
+    assert.equal(dialogButton(tree, '添加中…').props.disabled, true);
+    assert.equal(flatten(tree).find((element) => element.type === 'textarea').props.disabled, true);
+  });
+
+  test('确认把整段文本原样发给 keys 路由：切行与去重只有服务端一份实现', async () => {
+    const calls = [];
+    const { component, t, updates } = await mountedCard({
+      globals: {
+        document: documentStub(),
+        fetch: fetchStub(calls, { received: 3, added: 2, duplicates: 1 }),
+      },
+      hooks: { ui: openUi(), draft: readyDraft() },
+    });
+
+    await dialogButton(component({ t }), '添加').props.onClick();
+    await flush();
+
+    const post = calls.find((call) => call.path === '/api/tavily-pool.keys');
+    assert.notEqual(post, undefined, '确认要经面板接口提交');
+    assert.deepEqual(
+      post.body,
+      { action: 'addBatch', text: 'tvly-dev-a\n  tvly-dev-b  \n\ntvly-dev-a' },
+      '只有整段首尾被 trim；行内空白、空行与重复行都原样交给服务端',
+    );
+
+    // 结果要**说出来**：批量添加不像单把那样能在列表里一眼看出多了几行。
+    const ui = uiAfter(updates, openUi());
+    assert.equal(ui.batchOpen, false, '成功后弹框关闭');
+    assert.equal(ui.batchText, '', '明文不该留在界面状态里等着下次打开');
+    assert.equal(ui.notice, '已添加 2 把密钥，跳过 1 把重复的。');
+  });
+
+  test('一把重复都没有时，提示不啰嗦地报一句「已添加 N 把」', async () => {
+    const calls = [];
+    const { component, t, updates } = await mountedCard({
+      globals: {
+        document: documentStub(),
+        fetch: fetchStub(calls, { received: 2, added: 2, duplicates: 0 }),
+      },
+      hooks: { ui: openUi('tvly-dev-a\ntvly-dev-b'), draft: readyDraft() },
+    });
+
+    await dialogButton(component({ t }), '添加').props.onClick();
+    await flush();
+
+    assert.equal(
+      uiAfter(updates, openUi('tvly-dev-a\ntvly-dev-b')).notice,
+      '已添加 2 把密钥。',
+    );
+  });
+
+  test('失败时弹框不关：文本还在，用户能就地改一行重试', async () => {
+    const calls = [];
+    const { component, t, updates } = await mountedCard({
+      globals: {
+        document: documentStub(),
+        fetch: async (path, options = {}) => {
+          calls.push({ path, body: options.body === undefined ? undefined : JSON.parse(options.body) });
+          if (path === '/api/tavily-pool.keys') {
+            return {
+              ok: false,
+              status: 400,
+              text: async () => JSON.stringify({ error: { code: 'PANEL_BAD_REQUEST', message: 'no key' } }),
+            };
+          }
+          return { ok: true, status: 200, text: async () => JSON.stringify(sampleState()) };
+        },
+      },
+      hooks: { ui: openUi(), draft: readyDraft() },
+    });
+
+    await dialogButton(component({ t }), '添加').props.onClick();
+    await flush();
+
+    const ui = uiAfter(updates, openUi());
+    assert.equal(ui.batchOpen, true, '失败不该把弹框连同文本一起丢掉');
+    assert.equal(ui.batchText, PASTED, '文本原样留在框里，改一行就能重试');
+    assert.equal(ui.notice, 'no key', '失败原因经卡片自己的提示说出来');
   });
 });
 

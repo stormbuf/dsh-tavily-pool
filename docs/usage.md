@@ -20,6 +20,8 @@ This plugin does **not** read environment variables, and does not read DSH's cre
 2. Paste a Tavily API key (form `tvly-...`) into the key field
 3. Save
 
+To add several at once, click **Add several**: a dialog opens with a text box. Paste one key per line and confirm — every line becomes a key. Leading and trailing whitespace is trimmed, blank lines are ignored, and lines that are already in the pool (or repeated within the same paste) are skipped; the card then reports how many were added and how many were skipped. Downstream nothing differs from a single paste: the same local file, the same masked list.
+
 You can add as many as you like. The list only ever shows a masked form (`tvly-...xxxx`); the plaintext is stored locally only:
 
 ```

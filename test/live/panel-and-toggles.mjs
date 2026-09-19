@@ -15,7 +15,9 @@
  * 5. **抓取接管同样落到 seam 上**（第 10 项）：`fetchProvider: tavily` 解析到本插件的抓取
  *    提供方、请求真的抵达 `/extract`，且两个开关互不影响；
  * 6. **调度策略改动即时生效**（第 18 项）：`schedulingPolicy` 切成 `manual` 之后，下一次
- *    搜索立刻改用顺序最前的那把密钥，而不是余额最高的那把。
+ *    搜索立刻改用顺序最前的那把密钥，而不是余额最高的那把；
+ * 7. **批量添加是服务端的一次编辑**（第 19 项）：一段带缩进、空行与重复行的粘贴文本经**一次**
+ *    面板请求加进去多把密钥，重复的被如实跳过，出口只有脱敏形式。
  *
  * 它需要一把真实密钥，因此不属于 `npm test`：
  *
@@ -434,6 +436,44 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
 
     // 测试完把这把无效密钥删掉，免得它影响后面的断言。
     await call(PANEL_ROUTE_PATHS.keys, { action: 'remove', id: invalid.id });
+
+    // ── 第 19 项：批量添加经一次面板请求加进去多把，重复的如实跳过（ticket 19） ──
+    //
+    // 两把不存在的假密钥，因此不会碰用户的真密钥：一次请求、一段带缩进与空行、且夹着一行
+    // 批内重复的文本。加完之后再发一次同样的文本，池内去重也该全部跳过。
+    {
+      const before = new Set((await call(PANEL_ROUTE_PATHS.state)).keys.map((entry) => entry.id));
+      const pasted = [
+        '  tvly-dev-livebatch-a-000000000000  ',
+        '',
+        'tvly-dev-livebatch-b-000000000000',
+        'tvly-dev-livebatch-a-000000000000',
+      ].join('\n');
+
+      const added = await call(PANEL_ROUTE_PATHS.keys, { action: 'addBatch', text: pasted });
+      assert.deepEqual(
+        added.summary,
+        { received: 3, added: 2, duplicates: 1 },
+        `一行一把、空行跳过、批内重复跳过，实际 ${JSON.stringify(added.summary)}`,
+      );
+      assert.equal(JSON.stringify(added).includes('tvly-dev-livebatch-a-000000000000'), false, '出口只有脱敏形式');
+
+      const fresh = (await call(PANEL_ROUTE_PATHS.state)).keys.filter((entry) => !before.has(entry.id));
+      assert.equal(fresh.length, 2, '两把新密钥都进了池子');
+      check('第 19 项：一次请求批量添加，缩进与空行被忽略、批内重复被跳过', JSON.stringify(added.summary));
+
+      const again = await call(PANEL_ROUTE_PATHS.keys, { action: 'addBatch', text: pasted });
+      assert.deepEqual(
+        again.summary,
+        { received: 3, added: 0, duplicates: 3 },
+        `池里已有的同样算重复，实际 ${JSON.stringify(again.summary)}`,
+      );
+      check('第 19 项：再贴一次时同一份文本全部算重复，池里不会出现两把一样的密钥');
+
+      // 清理：把这两把假密钥删掉，免得影响后面的断言。
+      for (const entry of fresh) await call(PANEL_ROUTE_PATHS.keys, { action: 'remove', id: entry.id });
+      assert.equal((await call(PANEL_ROUTE_PATHS.state)).keys.length, before.size, '清理干净');
+    }
 
     // ── 第 14 项：调用历史真的落盘，并经 /state 投影出来（ticket 14） ──
     //

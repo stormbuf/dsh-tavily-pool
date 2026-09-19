@@ -570,6 +570,36 @@ describe('index.js 真的把接口接上了', () => {
     assert.equal(JSON.stringify(body).includes(SECRET), false);
   });
 
+  test('一次请求就能批量添加，行解析与去重都在服务端（POOL-8）', async () => {
+    const second = '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';
+    const host = await hostWithRoutes();
+    apply(host.ctx, {});
+
+    const { response, body } = await callJson(host.connection, PANEL_ROUTE_PATHS.keys, {
+      method: 'POST',
+      body: { action: 'addBatch', text: `\n${SECRET}\n  ${second}  \n${SECRET}\n` },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(body.keys.length, 2, '两把密钥经一次请求加进去');
+    assert.deepEqual(body.summary, { received: 3, added: 2, duplicates: 1 });
+    assert.equal(JSON.stringify(body).includes(SECRET), false, '出口仍然只有脱敏形式');
+    assert.equal(JSON.stringify(body).includes(second), false);
+  });
+
+  test('批量添加的入参非法时回一个 400，而不是把异常漏给宿主（POOL-8）', async () => {
+    const host = await hostWithRoutes();
+    apply(host.ctx, {});
+
+    const { response, body } = await callJson(host.connection, PANEL_ROUTE_PATHS.keys, {
+      method: 'POST',
+      body: { action: 'addBatch', text: '   \n\n' },
+    });
+
+    assert.equal(response.status, 400);
+    assert.equal(body.error.code, 'PANEL_BAD_REQUEST');
+  });
+
   test('apply() 注册的面板设置写入落到宿主的命名空间上（CFG-1）', async () => {
     const host = await hostWithRoutes();
     apply(host.ctx, {});

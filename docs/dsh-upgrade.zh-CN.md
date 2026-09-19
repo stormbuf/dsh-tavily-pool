@@ -187,7 +187,9 @@ setTimeout(0) @+3373                   inject:settings @+3385
 **改哪个模块：** `lib/client.js`
 
 种子模块表精确列出了零构建 bundle 可以 `require` 哪些说明符。若面板用到的一项被移除，
-卡片就会加载失败。slot 契约在
+卡片就会加载失败。本卡片目前用三个：`react`、`react-dom`（批量添加的弹层经它的
+`createPortal` 挂到 `document.body`）与 `@deepseek-ai/dsh-client-ui-primitives`
+（`Switch` / `Tag` / `IconChevronDownOutline14`）。slot 契约在
 `dsh-client-ui-settings-plugins/lib/types/client/slot-contract.d.ts`；卡片必须用 **`key`**
 字段（即设置命名空间）注册，绝不能用 `id` 或 `order`。
 

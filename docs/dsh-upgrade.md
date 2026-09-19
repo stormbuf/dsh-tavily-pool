@@ -213,7 +213,10 @@ the bundle id must equal the package name.
 **Then edit:** `lib/client.js`
 
 The seed module table lists exactly which specifiers a zero-build bundle may `require`. If
-an entry the panel uses was removed, the card fails to load. The slot contract is
+an entry the panel uses was removed, the card fails to load. This card uses three: `react`,
+`react-dom` (the batch-add dialog mounts through its `createPortal`) and
+`@deepseek-ai/dsh-client-ui-primitives` (`Switch` / `Tag` / `IconChevronDownOutline14`).
+The slot contract is
 `dsh-client-ui-settings-plugins/lib/types/client/slot-contract.d.ts`; the card must register
 with the **`key`** field (the settings namespace), never `id` or `order`.
 
