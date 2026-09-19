@@ -1,22 +1,21 @@
 /**
- * Live seam check: the real host service, the real plugin, the real Tavily API.
+ * 真机 seam 检查：真实宿主服务、真实插件、真实 Tavily API。
  *
- * This is the issue-16 style verification that unit tests cannot replace. It
- * builds an actual `ctx.web` service from `@deepseek-ai/dsh-web`, mounts this
- * plugin's `apply()` into a real Cordis context, and drives a search the way
- * `dsh-tool-web` does. What it proves, which no stub can:
+ * 这是单测无法替代的、issue-16 式的验证。它从 `@deepseek-ai/dsh-web` 构造一个真正的
+ * `ctx.web` 服务，把本插件的 `apply()` 挂进一个真实 Cordis context，并像
+ * `dsh-tool-web` 那样驱动一次搜索。它证明的是任何桩件都证明不了的事：
  *
- * - the seam resolves `searchProvider: 'tavily'` to this plugin's provider;
- * - `available()` never trips `WEB_PROVIDER_CONFIGURED_UNAVAILABLE`;
- * - the request really reaches `api.tavily.com` and the response maps back;
- * - the seam's own `maxResults` enforcement runs on our result.
+ * - seam 把 `searchProvider: 'tavily'` 解析到本插件的提供方；
+ * - `available()` 不会触发 `WEB_PROVIDER_CONFIGURED_UNAVAILABLE`；
+ * - 请求真的抵达 `api.tavily.com`，且响应能正确映射回来；
+ * - seam 自己对 `maxResults` 的执行作用在本次结果上。
  *
- * It needs a key, so it is not part of `npm test`. Point it at one of these:
+ * 它需要一把密钥，因此不属于 `npm test`。用下面任一方式提供：
  *
  *   TAVILY_API_KEY=tvly-... node test/live/seam-check.mjs
  *   node test/live/seam-check.mjs --keys-dir ~/.dsh/dsh-tavily-pool
  *
- * Exits non-zero on the first failed check.
+ * 任一项检查失败即以非零码退出。
  */
 
 import assert from 'node:assert/strict';
@@ -32,25 +31,24 @@ import { apply, inject } from '../../index.js';
 import { PROVIDER_ID, STATE_DIR_NAME } from '../../lib/constants.js';
 import { PoolStore } from '../../lib/pool.js';
 
-/** Parse `--flag value` arguments without pulling in a parser. */
+/** 解析 `--flag value` 形式的参数，不引入参数解析库。 */
 function flag(name, fallback) {
   const index = process.argv.indexOf(`--${name}`);
   return index >= 0 && process.argv[index + 1] !== undefined ? process.argv[index + 1] : fallback;
 }
 
-/** Report one check with a stable prefix, so output is greppable. */
+/** 输出一条带固定前缀的检查结果，便于用 grep 筛查。 */
 function check(label, detail) {
   process.stdout.write(`  ok   ${label}${detail === undefined ? '' : ` — ${detail}`}\n`);
 }
 
 /**
- * Point `DSH_HOME` at a directory holding a key.
+ * 把 `DSH_HOME` 指向一个放着密钥的目录。
  *
- * The plugin resolves its pool through `ctx.dshHomePath`, which reads
- * `$DSH_HOME` at call time, so setting it here is exactly what a different
- * harness home would do — no test-only hook in the plugin.
+ * 插件经 `ctx.dshHomePath` 解析密钥池，而它在调用时读取 `$DSH_HOME`，所以在这里设置
+ * 它就等同于换了一个 harness home——插件里没有任何仅供测试的钩子。
  *
- * @returns the harness home, once a key is in place.
+ * @returns harness home；此时密钥已就位。
  */
 async function prepareHarnessHome() {
   const configured = flag('keys-dir');
@@ -68,65 +66,61 @@ async function prepareHarnessHome() {
   const store = new PoolStore({ dir: join(home, STATE_DIR_NAME), fileName: 'keys.json' });
   await store.load();
   await store.addKey({ key: apiKey, label: 'seam-check' });
-  check('seeded a temporary harness home', home);
+  check('已准备临时 harness home', home);
   return home;
 }
 
 const harnessHome = await prepareHarnessHome();
 process.env.DSH_HOME = harnessHome;
 
-// A real Cordis context, and the real seam service pinned exactly the way the
-// profile patch pins it.
+// 一个真实的 Cordis context，以及一个完全按 profile patch 的方式 pin 住的真实 seam 服务。
 const ctx = new Context();
 new WebRuntime(ctx, { searchProvider: PROVIDER_ID, fetchProvider: PROVIDER_ID });
 
-assert.deepEqual(inject, ['web'], 'the plugin must declare the web dependency');
+assert.deepEqual(inject, ['web'], '插件必须声明 web 依赖');
 apply(ctx, {});
-check('plugin applied', `registered searchProvider=${PROVIDER_ID}`);
+check('插件已加载', `registered searchProvider=${PROVIDER_ID}`);
 
 const result = await ctx.web.search({ query: 'DeepSeek Harness plugin architecture', maxResults: 3 });
 
-assert.ok(Array.isArray(result.sources), 'sources must be an array');
-assert.ok(result.sources.length > 0, 'a live search should return at least one source');
-assert.ok(result.sources.length <= 3, 'the seam must enforce maxResults on our result');
+assert.ok(Array.isArray(result.sources), 'sources 必须是数组');
+assert.ok(result.sources.length > 0, '真实搜索应至少返回一条来源');
+assert.ok(result.sources.length <= 3, 'seam 必须对本次结果执行 maxResults');
 for (const source of result.sources) {
-  assert.match(source.url, /^https?:\/\//u, `source url must be absolute: ${String(source.url)}`);
+  assert.match(source.url, /^https?:\/\//u, `来源 url 必须是绝对地址：${String(source.url)}`);
 }
-check('search returned sources', `${String(result.sources.length)} (maxResults=3 enforced)`);
-check('first source', result.sources[0].url);
-if (result.content !== undefined) check('provider answer present', `${String(result.content.length)} chars`);
+check('搜索返回了来源', `${String(result.sources.length)} 条（maxResults=3 已执行）`);
+check('首条来源', result.sources[0].url);
+if (result.content !== undefined) check('提供方答案存在', `${String(result.content.length)} 字符`);
 
-// `available()` is the one contract whose violation is a hard throw rather than
-// a fallback, so it must be verified without reading the registry — that is
-// private state this plugin is forbidden to touch (COMPAT-6). Registering the
-// same id twice is the public surface that proves ours is in there: the seam
-// refuses duplicates. `registerSearchProvider` throws synchronously.
+// `available()` 是唯一「违反即硬抛而非回落」的契约，因此必须在**不读注册表**的前提下
+// 验证它——注册表是本插件被禁止触碰的宿主私有状态（COMPAT-6）。重复注册同一个 id 是
+// 证明我们已在其中的公开面：seam 拒绝重复。`registerSearchProvider` 是同步抛出。
 const probeCtx = new Context();
 new WebRuntime(probeCtx, { searchProvider: PROVIDER_ID });
 apply(probeCtx, {});
 assert.throws(
   () => probeCtx.web.registerSearchProvider({ id: PROVIDER_ID, available: () => true, search: async () => ({}) }),
   (error) => error.code === 'WEB_DUPLICATE_PROVIDER',
-  'registering the same id twice must fail, which proves ours is registered',
+  '重复注册同一 id 必须失败，这证明我们的提供方已注册',
 );
-check('the provider id is registered (duplicate registration is refused)');
+check('提供方 id 已注册（重复注册被拒）');
 
-// The pin resolves our provider through `available()`, so a second live search
-// completing proves it is still `true` after real use.
+// pin 会经 `available()` 解析到我们的提供方，因此第二次真实搜索能完成，即证明它在
+// 真实使用之后仍是 `true`。
 const second = await ctx.web.search({ query: 'DeepSeek Harness release notes', maxResults: 1 });
-assert.ok(second.sources.length >= 1, 'a second search through the pin must still resolve');
-check('available() is still true on a second live call');
+assert.ok(second.sources.length >= 1, '经 pin 的第二次搜索仍必须解析成功');
+check('第二次真实调用时 available() 仍为 true');
 
-// And prove the seam would have thrown had the pin pointed at nothing, so the
-// checks above are not vacuous.
+// 再证明：若 pin 指向一个并不存在的 id，seam 会抛错——上面几项检查因此不是空转。
 const unpinned = new Context();
 new WebRuntime(unpinned, { searchProvider: 'definitely-not-registered' });
 await assert.rejects(
   () => unpinned.web.search({ query: 'x' }),
   (error) => error.code === 'WEB_PROVIDER_CONFIGURED_MISSING',
-  'an unregistered pin must throw WEB_PROVIDER_CONFIGURED_MISSING',
+  '未注册的 pin 必须抛 WEB_PROVIDER_CONFIGURED_MISSING',
 );
-check('control: an unregistered pin throws WEB_PROVIDER_CONFIGURED_MISSING');
+check('对照项：未注册的 pin 抛 WEB_PROVIDER_CONFIGURED_MISSING');
 
-process.stdout.write('seam-check: all live checks passed\n');
+process.stdout.write('seam-check: 全部真机检查通过\n');
 process.exit(0);
