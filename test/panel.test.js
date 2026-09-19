@@ -24,6 +24,7 @@ import {
   readPanelState,
   runPanelCommand,
 } from '../lib/panel.js';
+import { HISTORY_MAX_ENTRIES } from '../lib/constants.js';
 import { PoolStore } from '../lib/pool.js';
 
 /** 用例里用到的那把明文密钥。任何响应里出现它，都是 `POOL-3` 的失败。 */
@@ -571,13 +572,18 @@ describe('14：调用历史的投影', () => {
     assert.equal(state.history.daily.length, HISTORY_CHART_DAYS, '横轴必须是均匀的，空白天补零');
   });
 
-  test('记录原样投影，并在状态里再截一次', () => {
-    const entries = Array.from({ length: PANEL_HISTORY_ENTRIES + 50 }, (unused, index) => (
+  test('面板回传的条数上限与文件层面的条数上限一致', () => {
+    // 先前这里取 200，而文件上限是 500：14 天里调用超过 200 次时，曲线会**静默**少算前面那
+    // 300 条，而「图表正确反映积分趋势」正是这张票的验收之一。体积由文件那一层的裁剪兜住，
+    // 面板没有理由再截一刀——这一条断言钉的就是那两个上限相等。
+    assert.equal(PANEL_HISTORY_ENTRIES, HISTORY_MAX_ENTRIES);
+
+    const entries = Array.from({ length: HISTORY_MAX_ENTRIES }, (unused, index) => (
       record(Date.parse('2026-09-19T00:00:00.000Z') + index * 1000)
     ));
     const state = readPanelState({ settings: {}, fallback: {}, history: { entries, error: null } });
 
-    assert.equal(state.history.entries.length, PANEL_HISTORY_ENTRIES, '状态响应每次都整份发出，不该塞进全部历史');
+    assert.equal(state.history.entries.length, HISTORY_MAX_ENTRIES, '文件里有多少条就投影多少条');
   });
 
   test('读取失败的原因如实带出，而不是显示成「没有调用」', () => {

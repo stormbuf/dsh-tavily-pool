@@ -234,3 +234,24 @@ describe('14：落盘与读回', () => {
     assert.equal(history.retentionMs, HISTORY_RETENTION_MS);
   });
 });
+
+describe('14：裁剪与输入顺序无关', () => {
+  test('输入不是升序时，窗口仍按**最新一条**算', () => {
+    // 正常路径上 `append` 追加在尾部，因此输入总是升序；但一份被外部编辑过、或由别的工具写出
+    // 的历史文件可以不是。若不排序，窗口会按「数组最后一个元素」算，于是这里会保留 2 条而不是 1 条
+    // ——即一条 100 天前的记录被判成「在窗口内」。
+    const recent = entry(0);
+    const ancient = entry(-100 * 24 * 3600 * 1000);
+    const kept = pruneHistory([recent, ancient], { maxEntries: 500, retentionMs: 30 * 24 * 3600 * 1000 });
+
+    assert.deepEqual(kept.map((item) => item.at), [recent.at]);
+  });
+
+  test('输出总是按时间升序，无论输入顺序', () => {
+    const entries = [entry(2 * MINUTE), entry(0), entry(MINUTE)];
+    assert.deepEqual(
+      pruneHistory(entries, { maxEntries: 500, retentionMs: 365 * 24 * 3600 * 1000 }).map((item) => item.at),
+      [entry(0).at, entry(MINUTE).at, entry(2 * MINUTE).at],
+    );
+  });
+});
