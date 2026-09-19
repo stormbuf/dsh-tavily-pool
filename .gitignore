@@ -1,0 +1,33 @@
+# ============================================================================
+# Private working files — never published
+# ============================================================================
+# This repo is public and publishes SOURCE CODE AND END-USER DOCS ONLY.
+# Everything below stays on this machine and out of git history.
+#
+# Git ignore rules only control PUBLISHING. They have no effect on what you can
+# read or write locally — keep using these files normally.
+
+# Agent working state: specs, tickets, and source material for the local tracker.
+.scratch/
+
+# Agent-facing docs and project instructions.
+# AGENTS.md, CLAUDE.md and CONTEXT.md have no slash, so they match at ANY depth.
+# That is deliberate: nested instruction files (packages/*/AGENTS.md) and
+# per-context CONTEXT.md files stay covered, and over-matching only ever hides
+# a file from git — it can never leak one. The one known collision is a future
+# `docs/agents.md`, which would also be ignored; anchor with /AGENTS.md if that
+# file ever needs to publish.
+AGENTS.md
+CLAUDE.md
+CONTEXT.md
+docs/agents/
+docs/adr/
+
+# NOTE: `docs/` itself is deliberately NOT ignored, so future end-user docs
+# (e.g. docs/usage.md) publish normally. Never ignore `docs/` wholesale.
+
+# ============================================================================
+# Dependencies and build output
+# ============================================================================
+node_modules/
+dist/
