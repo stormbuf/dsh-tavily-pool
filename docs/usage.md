@@ -56,6 +56,10 @@ Parameter changes likewise take effect **immediately**; the next search carries 
 
 `maxResults` is a **cap**, not a guarantee: the model may ask for fewer results when it calls search, and then its number wins. The final result is truncated once more by DSH's seam. The lower bound is 1 — the official API reference says 0, but `0` is in practice rejected upstream with `400 Invalid max results.`, and that class of error neither retries nor switches keys, so the panel does not accept it.
 
+The host's own orchestration imposes one more cap: DSH's `tool-web` asks this plugin for `searchMaxResults` results (default **8**) on every search, and the plugin sends whichever is **smaller** — that or the panel value. So on DSH, setting `maxResults` anywhere in 9–20 behaves exactly like 8; only lowering it (1–8) changes how many sources actually come back.
+
+Depth and count are independent dimensions: **depth decides how thoroughly the search runs, the cap decides how many sources come back.** Billing looks only at depth (`advanced` costs 2 credits, the other three cost 1); the cap does not affect credits.
+
 ## Fetch parameters
 
 | Parameter | Values | Default | Meaning |
