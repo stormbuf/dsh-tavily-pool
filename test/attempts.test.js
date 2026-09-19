@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
 import { MAX_ATTEMPTS, runWithFailover, waitAllowance } from '../lib/attempts.js';
-import { SEARCH_WAIT_BUDGET_MS, WAIT_BUDGET_SHARE } from '../lib/constants.js';
+import { WAIT_BUDGET_MS, WAIT_BUDGET_SHARE } from '../lib/constants.js';
 import { KeyHealth } from '../lib/health.js';
 import { PoolStore } from '../lib/pool.js';
 import { Scheduler } from '../lib/scheduler.js';
@@ -388,7 +388,7 @@ describe('SCHED-9：等待预算的折算', () => {
     );
     assert.equal(
       waitAllowance(undefined, now),
-      now + SEARCH_WAIT_BUDGET_MS,
+      now + WAIT_BUDGET_MS,
       '调用方没给总预算时只受固定上限约束',
     );
   });

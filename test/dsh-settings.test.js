@@ -70,10 +70,13 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
       ctx.settings.get(SETTINGS_NAMESPACE),
       {
         searchEnabled: true,
+        fetchEnabled: true,
         searchDepth: 'basic',
         maxResults: 10,
         topic: 'general',
         includeAnswer: false,
+        fetchDepth: 'basic',
+        fetchFormat: 'markdown',
       },
       '默认值必须由宿主按 schema 解析出来，而不是靠我们自己填',
     );
@@ -123,6 +126,26 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
     );
   });
 
+  test('抓取参数的非法取值同样被 schema 拒绝（CFG-2、CFG-4 同款机制）', async () => {
+    // 两项抓取参数直接进 `/extract` 的请求体，因此「面板能存下一个上游必然拒绝的值」
+    // 这件事与 `maxResults` 的 0 是同一类问题：唯一的把关点是这份 schema。
+    const ctx = contextWithRealSettings();
+    registerSettings(ctx);
+
+    await assert.rejects(
+      () => ctx.settings.update(SETTINGS_NAMESPACE, { fetchDepth: 'deep' }),
+      /expected|string/u,
+    );
+    await assert.rejects(
+      () => ctx.settings.update(SETTINGS_NAMESPACE, { fetchFormat: 'pdf' }),
+      /expected|string/u,
+    );
+    await assert.rejects(
+      () => ctx.settings.update(SETTINGS_NAMESPACE, { fetchEnabled: 'yes' }),
+      /expected boolean/u,
+    );
+  });
+
   test('settings 服务缺席时注册退化为 undefined，而不是抛错', () => {
     // 可选能力缺席不能让插件加载失败：搜索仍要可用，只是开关按默认值走。
     const ctx = { get: () => undefined };
@@ -132,10 +155,13 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
       readPluginSettings(ctx),
       {
         searchEnabled: true,
+        fetchEnabled: true,
         searchDepth: 'basic',
         maxResults: 10,
         topic: 'general',
         includeAnswer: false,
+        fetchDepth: 'basic',
+        fetchFormat: 'markdown',
       },
       '缺席时用默认值',
     );
@@ -168,15 +194,21 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
         maxResults: 99,
         topic: 'sports',
         includeAnswer: 'yes',
+        fetchEnabled: 'yes',
+        fetchDepth: 'deep',
+        fetchFormat: 'pdf',
       }),
     });
 
     assert.deepEqual(settings, {
       searchEnabled: true,
+      fetchEnabled: true,
       searchDepth: 'basic',
       maxResults: 10,
       topic: 'general',
       includeAnswer: false,
+      fetchDepth: 'basic',
+      fetchFormat: 'markdown',
     });
   });
 

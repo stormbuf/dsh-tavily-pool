@@ -14,6 +14,7 @@ import test, { describe } from 'node:test';
 import { apply, inject, name } from '../index.js';
 import { KEYS_FILE_NAME, PROVIDER_ID, SETTINGS_NAMESPACE, STATE_DIR_NAME } from '../lib/constants.js';
 import { MissingHostCapabilityError } from '../lib/dsh/register.js';
+import { officialFetchProvider, setOfficialFetchProvider } from '../lib/dsh/fallback.js';
 
 /**
  * 一个足以加载本插件的替身宿主 context。
@@ -37,8 +38,9 @@ import { MissingHostCapabilityError } from '../lib/dsh/register.js';
  * @param options.environment - launcher 环境快照的内容；默认为空。
  * @returns `{ ctx, registered, warnings, registerCalls, settings }`。
  */
-function fakeHost({ harnessHome, omitRegistration = false, settings = {}, environment = {} } = {}) {
+function fakeHost({ harnessHome, omitRegistration = false, omitFetchRegistration = false, settings = {}, environment = {} } = {}) {
   const registered = [];
+  const registeredFetch = [];
   const warnings = [];
   const values = { ...settings };
   let registerCalls = 0;
@@ -50,7 +52,10 @@ function fakeHost({ harnessHome, omitRegistration = false, settings = {}, enviro
         registered.push(provider);
         return () => undefined;
       },
-      registerFetchProvider() {
+      // 抓取提供方单独收集：两个注册表在 seam 里本来就是分开的，混进一个数组会让
+      // 「抓取注册失败时搜索仍在」这条断言无从写起。
+      registerFetchProvider(provider) {
+        registeredFetch.push(provider);
         return () => undefined;
       },
     },
@@ -76,6 +81,7 @@ function fakeHost({ harnessHome, omitRegistration = false, settings = {}, enviro
     launchEnvironment: { get: (name) => environment[name] },
   };
   if (omitRegistration) delete services.web.registerSearchProvider;
+  if (omitFetchRegistration) delete services.web.registerFetchProvider;
 
   const ctx = {
     get: (name) => services[name],
@@ -96,6 +102,7 @@ function fakeHost({ harnessHome, omitRegistration = false, settings = {}, enviro
   return {
     ctx,
     registered,
+    registeredFetch,
     warnings,
     registerCalls: () => registerCalls,
     /** 改一个设置值，供「改动即时生效」的检验使用。 */
@@ -437,7 +444,10 @@ async function hostWithKeys(keys, options = {}) {
   for (const [index, entry] of keys.entries()) {
     await store.addKey({ key: `tvly-dev-${index}-${'a'.repeat(20)}`, label: entry.label });
   }
-  return host;
+  // 密钥池的真实落盘位置一并交出去：落盘断言若自己拼一遍路径，拼错的症状会是一条
+  // ENOENT，而那看起来像「没写盘」——把路径的来源留在解析它的那一处，断言才在断言它
+  // 想断言的东西。
+  return { ...host, keyPoolPath: join(home, STATE_DIR_NAME, KEYS_FILE_NAME) };
 }
 
 describe('POOL-1：密钥池落在用户级 harness 目录，而不是 profile 目录', () => {
@@ -854,5 +864,173 @@ describe('USAGE-5：搜索成功后按官方积分前推余额', () => {
     const [stats] = Object.values(onDisk.stats);
     assert.equal(stats.credits, undefined, 'credits 不得被记成 0：那会让余额前推长期偏低');
     assert.equal(stats.creditsUnknown, 1, '而这次「不知道消耗了多少」必须留下痕迹');
+  });
+});
+
+describe('10：抓取接管经入口真实生效', () => {
+  /** 在桩件 `fetch` 之下跑一次抓取。 */
+  async function fetchVia(host, url) {
+    const provider = host.registeredFetch[0];
+    assert.notEqual(provider, undefined, '抓取提供方必须在 apply() 之后存在');
+    return withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url, raw_content: '# 正文' }], failed_results: [] } }),
+      (calls) => provider.fetch({ url }).then((value) => ({ value, calls })),
+    );
+  }
+
+  test('抓取提供方与搜索提供方共用 id，分别注册进两个注册表', async () => {
+    const host = await hostWithKeys([{ label: 'only' }]);
+    assert.equal(host.registeredFetch.length, 1);
+    assert.equal(host.registeredFetch[0].id, PROVIDER_ID);
+    assert.equal(host.registeredFetch[0].available(), true, '被 pin 的提供方自称不可用会让 web_fetch 硬抛');
+  });
+
+  test('FETCH-1：开关为开且池中有密钥时走 /extract，并返回纯文本', async () => {
+    const host = await hostWithKeys([{ label: 'only' }]);
+    const { result } = await fetchVia(host, 'https://example.com');
+
+    assert.equal(result.calls.length, 1);
+    assert.match(result.calls[0].url, /api\.tavily\.com\/extract/u);
+    assert.match(result.calls[0].authorization, /^Bearer tvly-dev-0-/u);
+    assert.deepEqual(result.calls[0].body.urls, ['https://example.com']);
+
+    assert.equal(result.value.body.kind, 'text');
+    assert.equal(result.value.body.content, '# 正文');
+    assert.equal(result.value.statusCode, 200);
+  });
+
+  test('抓取参数从设置里来（WebFetchRequest 只有 url）', async () => {
+    const host = await hostWithKeys([{ label: 'only' }], {
+      settings: { [SETTINGS_NAMESPACE]: { fetchDepth: 'advanced', fetchFormat: 'text' } },
+    });
+    const { result } = await fetchVia(host, 'https://example.com');
+
+    assert.equal(result.calls[0].body.extract_depth, 'advanced');
+    assert.equal(result.calls[0].body.format, 'text');
+  });
+
+  test('USAGE-6：抓取按成功 URL 数记账，而不是按请求计费', async () => {
+    const host = await hostWithKeys([{ label: 'only' }]);
+    await fetchVia(host, 'https://example.com');
+
+    // 计费口径的**值**由内核用例逐个钉住（`extractCredits`）；这里要证明的是入口真的把它
+    // 记进了密钥统计——一条「算得对但没记」的路径在单测里是看不见的。
+    const onDisk = JSON.parse(await readFile(host.keyPoolPath, 'utf8'));
+    const [stats] = Object.values(onDisk.stats);
+    assert.equal(stats.successes, 1, '抓取成功同样记一次成功');
+    assert.equal(stats.credits, 1, '单 URL 成功（basic）= 1 积分');
+    assert.equal(stats.creditsUnknown, undefined, '这一次的消耗是已知的，不该落进「未知」那一档');
+  });
+
+  test('CFG-2：抓取开关独立于搜索开关——关掉抓取不影响搜索', async () => {
+    const host = await hostWithKeys([{ label: 'only' }], {
+      settings: { [SETTINGS_NAMESPACE]: { fetchEnabled: false } },
+    });
+
+    // 回落目标换成记录调用的桩件：这里要观察的是「请求交给了**谁**」，而真实官方实例
+    // 一旦跑起来就会去做真实的 DNS 解析——那既慢又取决于本机网络，还会被「域名解析到
+    // 非公网地址」那条策略挡下，得到一条与本需求无关的错误。限值是否逐字段一致由下面那条
+    // 读官方 schema 的用例负责，两者合起来才是完整的回落契约。
+    const original = officialFetchProvider();
+    const seen = [];
+    setOfficialFetchProvider({
+      id: 'http',
+      available: () => true,
+      fetch: async (request) => {
+        seen.push(request);
+        return { url: request.url, statusCode: 200, body: { kind: 'text', content: 'official' }, truncated: false };
+      },
+    });
+    try {
+      const fetched = await host.registeredFetch[0].fetch({ url: 'https://example.com' });
+
+      assert.deepEqual(seen, [{ url: 'https://example.com' }], '回落目标收到的就是 seam 的原始请求');
+      assert.equal(fetched.body.content, 'official');
+      assert.match(String(host.warnings.join('\n')), /the Tavily fetch toggle is off/u);
+
+      // 而搜索开关没动，因此下一次搜索照旧走 Tavily。
+      const searched = await withStubbedFetch(
+        () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+        (calls) => host.registered[0].search({ query: 'q' }).then((value) => ({ value, calls })),
+      );
+      assert.match(searched.result.calls[0].url, /api\.tavily\.com\/search/u);
+    } finally {
+      setOfficialFetchProvider(original);
+    }
+  });
+
+  test('反过来也成立：关掉搜索不影响抓取', async () => {
+    const host = await hostWithKeys([{ label: 'only' }], {
+      settings: { [SETTINGS_NAMESPACE]: { searchEnabled: false } },
+    });
+
+    const { result } = await fetchVia(host, 'https://example.com');
+    assert.match(result.calls[0].url, /api\.tavily\.com\/extract/u);
+  });
+
+  test('池内无可用密钥时回落到官方抓取器，而不是抛错', async () => {
+    const host = await hostWithKeys([]);
+    const original = officialFetchProvider();
+    const seen = [];
+    setOfficialFetchProvider({
+      id: 'http',
+      available: () => true,
+      fetch: async (request) => {
+        seen.push(request.url);
+        return { url: request.url, statusCode: 200, body: { kind: 'text', content: 'official' }, truncated: false };
+      },
+    });
+    try {
+      const fetched = await host.registeredFetch[0].fetch({ url: 'https://example.com' });
+
+      assert.deepEqual(seen, ['https://example.com']);
+      assert.equal(fetched.statusCode, 200);
+      assert.match(String(host.warnings.join('\n')), /official local HTTP fetcher instead of Tavily/u);
+    } finally {
+      setOfficialFetchProvider(original);
+    }
+  });
+
+  test('宿主没有 registerFetchProvider 时只丢抓取，搜索照常注册', () => {
+    const host = fakeHost({ omitFetchRegistration: true });
+    apply(host.ctx, {});
+
+    assert.equal(host.registeredFetch.length, 0);
+    assert.equal(host.registered.length, 1, 'PIN-5：抓取的注册失败不得把搜索一起拖下水');
+    assert.match(String(host.warnings.join('\n')), /could not register the Tavily fetch provider/u);
+  });
+});
+
+describe('10：回落契约——关掉开关后逐字段复现官方抓取器', () => {
+  test('我们照抄的限值与官方 Config schema 逐字段一致', async () => {
+    // ticket `10` 的回落契约要求「关闭开关后，抓取行为与本机原有官方实现逐字段一致」。
+    // 这条断言直接读**官方包自己的** schema，因此上游一改默认值它当场变红——而不是等到
+    // 某个用户发现超时时间不对。
+    const { Config } = await import('@deepseek-ai/dsh-web-fetch-http');
+    const { officialFetchLimits } = await import('../lib/dsh/fallback.js');
+
+    const official = Config({});
+    assert.deepEqual(officialFetchLimits(), {
+      maxResponseBytes: official.maxResponseBytes,
+      maxBodyChars: official.maxBodyChars,
+      timeoutMs: official.timeoutMs,
+      maxRedirects: official.maxRedirects,
+      userAgent: official.userAgent,
+    });
+  });
+
+  test('回落目标就是官方类本身，且 id 是 http', async () => {
+    // `COMPAT-6`：不访问未导出字段。官方包根导出 `HttpFetchProvider` 与
+    // `DEFAULT_USER_AGENT`，而我们只用这两个加上一份照抄的限值表。
+    const official = await import('@deepseek-ai/dsh-web-fetch-http');
+    const { officialFetchProvider, setOfficialFetchProvider } = await import('../lib/dsh/fallback.js');
+
+    setOfficialFetchProvider(undefined);
+    const provider = officialFetchProvider();
+    assert.ok(provider instanceof official.HttpFetchProvider);
+    assert.equal(provider.id, official.LOCAL_FETCH_PROVIDER_ID);
+    assert.equal(provider.id, 'http');
+    // 只造一次：抓取开关每关一次就重造一个实例，只会让「谁是回落目标」多出很多答案。
+    assert.equal(officialFetchProvider(), provider);
   });
 });

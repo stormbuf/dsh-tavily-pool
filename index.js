@@ -22,22 +22,23 @@ import { runWithFailover } from './lib/attempts.js';
 import {
   KEYS_FILE_NAME,
   MIN_ATTEMPT_TIMEOUT_MS,
-  SEARCH_TIMEOUT_MS,
-  SEARCH_TOTAL_BUDGET_MS,
+  REQUEST_TOTAL_BUDGET_MS,
   SETTINGS_NAMESPACE,
+  TAVILY_TIMEOUT_MS,
 } from './lib/constants.js';
 import { KeyHealth } from './lib/health.js';
 import { PoolStore } from './lib/pool.js';
 import { Scheduler } from './lib/scheduler.js';
 import { searchParamsOf, effectiveMaxResults } from './lib/settings.js';
-import { TavilyError, searchTavily } from './lib/tavily.js';
+import { TavilyError, extractTavily, searchTavily } from './lib/tavily.js';
 import { UsageQuota, UsageRefresher } from './lib/usage.js';
 import { probeCapabilities, describeMissingCapabilities } from './lib/dsh/capabilities.js';
-import { searchWithOfficialProvider } from './lib/dsh/fallback.js';
+import { officialFetchProvider, searchWithOfficialProvider } from './lib/dsh/fallback.js';
+import { TavilyFetchProvider } from './lib/dsh/fetch-provider.js';
 import { resolveStateDir } from './lib/dsh/home-path.js';
 import { bindHostServices, hostView } from './lib/dsh/host-services.js';
 import { registerPanelRoutes } from './lib/dsh/panel-routes.js';
-import { registerSearchProvider } from './lib/dsh/register.js';
+import { registerFetchProvider, registerSearchProvider } from './lib/dsh/register.js';
 import { TavilySearchProvider } from './lib/dsh/search-provider.js';
 import { readPluginSettings, registerSettings } from './lib/dsh/settings.js';
 
@@ -85,6 +86,9 @@ export const Config = z.object({});
  * @property {string|undefined} reportedFallbackReason - 已经报告过的那次回落原因，同样
  *   用于去重：一次成功的回落会让请求静默地走上官方提供方，因此它必须留下痕迹，但同一个
  *   原因不该每次搜索都刷一遍。
+ * @property {string|undefined} reportedFetchFallbackReason - 抓取回落的原因，去重规则与
+ *   上一条相同，但**分开记**：两个开关各自控制一条路径，共用一个字段会让「关掉抓取开关」
+ *   把上一次「搜索开关关了」的记录覆盖掉，于是改回搜索时又刷一遍同一条日志。
  * @property {{code: string, at: string}|undefined} lastFallbackFailure - 最近一次回落
  *   **失败**的机器码与时刻。面板据它区分「官方凭据未配置」与「官方凭据已失效」
  *   （`CFG-5`）——那两者的区别只有一次真实失败才能提供，探测只能说「有值」。
@@ -110,6 +114,7 @@ export function apply(ctx, _config) {
     initError: undefined,
     reportedPoolLoadError: undefined,
     reportedFallbackReason: undefined,
+    reportedFetchFallbackReason: undefined,
     lastFallbackFailure: undefined,
     panelRegistered: undefined,
     reportedCapabilities: undefined,
@@ -120,6 +125,20 @@ export function apply(ctx, _config) {
   // WEB_PROVIDER_CONFIGURED_MISSING。上面的 provider 构造与状态字面量都不会失败；
   // 一切可能失败的事都在下面。
   registerSearchProvider(ctx, new TavilySearchProvider((request, signal) => search(state, request, signal)));
+
+  // 抓取提供方同理，但**包在 `try` 里**：`web.registerFetchProvider` 是可选能力
+  // （`lib/dsh/capabilities.js`），宿主少了它只该让 `web_fetch` 走官方提供方，不该连
+  // 搜索一起拖下水。注册本身仍然发生在任何可能失败的事之前——它是这一段里第一件做的事。
+  try {
+    registerFetchProvider(ctx, new TavilyFetchProvider((request, signal) => fetchUrl(state, request, signal)));
+  } catch (error) {
+    report(
+      ctx,
+      'warn',
+      `dsh-tavily-pool: could not register the Tavily fetch provider, so web_fetch keeps using the `
+      + `host's own provider; search is unaffected: ${String(error)}`,
+    );
+  }
 
   // `settings` / `connection` / `credentials` 三项**必须经 `ctx.inject` 才能看见**
   // （实测见 `lib/dsh/host-services.js` 的表），而插件自己的 `inject` 是全有或全无的：
@@ -325,7 +344,7 @@ async function search(state, request, signal) {
   }
 
   const startedAt = Date.now();
-  const deadlineMs = startedAt + SEARCH_TOTAL_BUDGET_MS;
+  const deadlineMs = startedAt + REQUEST_TOTAL_BUDGET_MS;
   let result;
   try {
     ({ result } = await runWithFailover({
@@ -359,6 +378,130 @@ async function search(state, request, signal) {
 
   reportWriteErrors(state);
   return result;
+}
+
+/**
+ * 一次完整的抓取：读设置、必要时回落，否则按余额调度并跨密钥故障切换（`10`）。
+ *
+ * 结构与 {@link search} 逐段对应，因为两者的判断次序出自同一条理由：**开关先判**——它与
+ * 密钥池能不能读、有没有密钥都无关（`PIN-3`），因此它是唯一一条不需要先把池读进来的
+ * 回落路径。
+ *
+ * 三处与搜索**有意的**不同：
+ *
+ * 1. 没有 `maxResults` 那样的参数折算：`WebFetchRequest` 只有 `url`，`extract_depth` 与
+ *    `format` 全部来自设置。
+ * 2. 抓取**不做**额度重置探测（`SCHED-10`，搜索里的 `probeQuota`）：那条探测服务于
+ *    「月初自动恢复」这个用户期待，而它与抓取无关——抓取没有理由比搜索更早去问一次官方
+ *    余额，多问一次只会多占一格 `/usage` 配额。
+ * 3. 抓取回落的是官方**本地 HTTP 抓取器**，它不需要凭据，因此没有 `CFG-5` 那两档错误。
+ *
+ * @param state - 插件运行时状态。
+ * @param request - seam 的抓取请求。
+ * @param signal - 调用方取消信号。
+ * @returns seam 归一化后的抓取结果。
+ * @throws {TavilyError} 无法完成抓取时抛出。
+ */
+async function fetchUrl(state, request, signal) {
+  refreshCapabilities(state);
+  if (signal?.aborted === true) {
+    throw new TavilyError('Tavily fetch aborted by the caller', { code: 'TAVILY_ABORTED' });
+  }
+  if (state.initError !== undefined) {
+    throw new TavilyError(
+      `dsh-tavily-pool failed to initialize and has no key pool: ${String(state.initError)}`,
+      { code: 'TAVILY_NOT_INITIALIZED', cause: state.initError },
+    );
+  }
+  if (state.pool === undefined || state.health === undefined || state.scheduler === undefined) {
+    throw new TavilyError('dsh-tavily-pool has no key pool; the plugin did not finish loading', {
+      code: 'TAVILY_NOT_INITIALIZED',
+    });
+  }
+
+  const settings = readPluginSettings(state.host);
+  if (settings.fetchEnabled !== true) {
+    return fallbackToOfficialFetch(state, request, signal, `the Tavily fetch toggle is off (${SETTINGS_NAMESPACE})`);
+  }
+
+  await ensureLoaded(state);
+
+  // 与搜索同一条线索、同一份去重：坏掉的密钥池文件每次都重读，因此按**消息文本**而不是
+  // 错误对象去重；两个开关各自看到它时也只留一条日志。
+  if (state.pool.loadError !== undefined) {
+    const message = state.pool.loadError.message;
+    if (state.reportedPoolLoadError !== message) {
+      state.reportedPoolLoadError = message;
+      report(
+        state.host,
+        'warn',
+        `dsh-tavily-pool: ${message}; falling back to the official fetch provider `
+        + `and starting from an empty pool. Fix or remove ${state.pool.filePath} to use Tavily again.`,
+      );
+    }
+    return fallbackToOfficialFetch(state, request, signal, `the key pool could not be read: ${message}`);
+  }
+
+  const startedAt = Date.now();
+  const deadlineMs = startedAt + REQUEST_TOTAL_BUDGET_MS;
+  let outcome;
+  try {
+    outcome = await runWithFailover({
+      scheduler: state.scheduler,
+      health: state.health,
+      signal,
+      deadlineMs,
+      invoke: ({ key }) => extractTavily({
+        apiKey: key,
+        url: request.url,
+        // `WebFetchRequest` 只有 `url`，因此这两个值只能来自设置——模型无法按次控制
+        // `extract_depth`，而它直接决定计费档位（`FETCH-1`、`USAGE-6`）。
+        depth: settings.fetchDepth,
+        format: settings.fetchFormat,
+        signal,
+        fetchImpl: globalThis.fetch,
+        timeoutMs: attemptTimeoutMs(deadlineMs),
+      }),
+    });
+  } catch (error) {
+    if (error?.blocked === 'all-unusable' || error?.blocked === 'no-keys') {
+      return fallbackToOfficialFetch(state, request, signal, `no Tavily key is usable: ${error.message}`);
+    }
+    throw error;
+  }
+
+  reportWriteErrors(state);
+  return outcome.result;
+}
+
+/**
+ * 回落到官方本地 HTTP 抓取器（`PIN-4`、ticket `10` 的回落契约）。
+ *
+ * 与搜索回落相比它简单得多，且**这个简单是刻意的**：官方抓取器不需要凭据，因此没有
+ * 「未配置 / 已失效」那一对错误码，也没有任何需要改写的失败。这里只做两件事——把请求转交
+ * 过去，以及为**每个不同的原因**记一条日志。
+ *
+ * 日志与搜索那边同样必要：抓取回落是**完全静默**的（用户看到的是正常抓到的页面内容，
+ * 没有任何迹象说明 Tavily 没被用上），而「我明明配了密钥却没走 Tavily」正是最需要一条
+ * 线索的时刻。
+ *
+ * @param state - 插件运行时状态。
+ * @param request - seam 的抓取请求。
+ * @param signal - 调用方取消信号。
+ * @param reason - 为什么回落。
+ * @returns seam 归一化后的抓取结果。
+ */
+async function fallbackToOfficialFetch(state, request, signal, reason) {
+  if (state.reportedFetchFallbackReason !== reason) {
+    state.reportedFetchFallbackReason = reason;
+    report(
+      state.host,
+      'warn',
+      'dsh-tavily-pool: serving this fetch through the official local HTTP fetcher instead of Tavily — '
+      + `${reason}.`,
+    );
+  }
+  return officialFetchProvider().fetch(request, signal);
 }
 
 /**
@@ -485,7 +628,7 @@ function reportWriteErrors(state) {
  * @returns 超时毫秒数。
  */
 function attemptTimeoutMs(deadlineMs) {
-  return Math.max(MIN_ATTEMPT_TIMEOUT_MS, Math.min(SEARCH_TIMEOUT_MS, deadlineMs - Date.now()));
+  return Math.max(MIN_ATTEMPT_TIMEOUT_MS, Math.min(TAVILY_TIMEOUT_MS, deadlineMs - Date.now()));
 }
 
 /**

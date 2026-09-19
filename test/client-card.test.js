@@ -215,10 +215,13 @@ function sampleState(overrides = {}) {
   return {
     settings: {
       searchEnabled: true,
+      fetchEnabled: true,
       searchDepth: 'basic',
       maxResults: 10,
       topic: 'general',
       includeAnswer: false,
+      fetchDepth: 'basic',
+      fetchFormat: 'markdown',
     },
     keys: [],
     poolError: null,
@@ -231,7 +234,6 @@ function sampleState(overrides = {}) {
       reason: null,
       lastFailureAt: null,
     },
-    fetchToggleAvailable: false,
     ...overrides,
   };
 }
@@ -262,7 +264,16 @@ function collapsedUi(stateOverrides = {}) {
 
 /** 与 `sampleState().settings` 一致的草稿。 */
 function readyDraft() {
-  return { searchEnabled: true, searchDepth: 'basic', maxResults: '10', topic: 'general', includeAnswer: false };
+  return {
+    searchEnabled: true,
+    fetchEnabled: true,
+    searchDepth: 'basic',
+    maxResults: '10',
+    topic: 'general',
+    includeAnswer: false,
+    fetchDepth: 'basic',
+    fetchFormat: 'markdown',
+  };
 }
 
 /** 一条脱敏后的密钥记录。 */
@@ -411,11 +422,11 @@ describe('PANEL-1：卡片注册进 settings.plugin.item', () => {
 });
 
 describe('PANEL-2、PANEL-3：卡片自绘控件，只复用已核实的基础组件', () => {
-  test('开关用种子模块里的 Switch——搜索接管与「生成答案」各一个', async () => {
+  test('开关用种子模块里的 Switch——两个接管开关与「生成答案」各一个', async () => {
     const { component, t } = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
 
     const switches = flatten(component({ t })).filter((element) => element.type === switchStub);
-    assert.deepEqual(switches.map((element) => element.props.checked), [true, false]);
+    assert.deepEqual(switches.map((element) => element.props.checked), [true, true, false]);
   });
 
   test('表单字段与列表控件都是自绘的（input / select / button / ul / li）', async () => {
@@ -490,7 +501,7 @@ describe('PANEL-5：卡片渲染出中英双语文案', () => {
 
     const texts = textsOf(tree);
     assert.equal(texts.includes('Tavily 密钥池'), true, '标题始终可见');
-    assert.equal(texts.includes('已接管搜索 · 1 把密钥'), true, '摘要行要说清当前状态');
+    assert.equal(texts.includes('已接管搜索 · 已接管抓取 · 1 把密钥'), true, '摘要行要说清当前状态');
   });
 
   test('标题行是一个 aria-expanded 的按钮，点一下才展开', async () => {
@@ -507,12 +518,27 @@ describe('PANEL-5：卡片渲染出中英双语文案', () => {
     const off = await mountedCard({
       hooks: { ui: collapsedUi(), draft: { ...readyDraft(), searchEnabled: false } },
     });
-    assert.equal(textsOf(off.component({ t: off.t })).includes('搜索已关闭 · 尚无密钥'), true);
+    assert.equal(
+      textsOf(off.component({ t: off.t })).includes('搜索未接管 · 已接管抓取 · 尚无密钥'),
+      true,
+    );
+
+    // 两个开关彼此独立（`CFG-2`）：摘要必须分别反映它们，否则用户无从知道抓取此刻走的是谁。
+    const fetchOff = await mountedCard({
+      hooks: { ui: collapsedUi(), draft: { ...readyDraft(), fetchEnabled: false } },
+    });
+    assert.equal(
+      textsOf(fetchOff.component({ t: fetchOff.t })).includes('已接管搜索 · 抓取未接管 · 尚无密钥'),
+      true,
+    );
 
     const many = await mountedCard({
       hooks: { ui: collapsedUi({ keys: [keyRecord(), keyRecord({ id: 'key-2' })] }), draft: readyDraft() },
     });
-    assert.equal(textsOf(many.component({ t: many.t })).includes('已接管搜索 · 2 把密钥'), true);
+    assert.equal(
+      textsOf(many.component({ t: many.t })).includes('已接管搜索 · 已接管抓取 · 2 把密钥'),
+      true,
+    );
   });
 
   test('诊断块**始终可见**，收起也藏不住', async () => {
@@ -551,20 +577,43 @@ describe('PANEL-5：卡片渲染出中英双语文案', () => {
     assert.equal(texts.includes('重试'), true);
   });
 
-  test('就绪态渲染标题、说明、开关与密钥池', async () => {
+  test('就绪态渲染标题、说明、两个开关与密钥池', async () => {
     const { component, t } = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
     const tree = component({ t });
     const texts = textsOf(tree);
 
     assert.equal(texts.includes('Tavily 密钥池'), true);
     assert.equal(texts.includes('接管搜索（web_search）'), true);
+    assert.equal(texts.includes('接管抓取（web_fetch）'), true);
     assert.equal(texts.includes('搜索参数'), true);
+    assert.equal(texts.includes('抓取参数'), true);
     assert.equal(texts.includes('密钥池'), true);
-    assert.equal(
-      flatten(tree).some((element) => element.type === switchStub && /抓取|fetch/iu.test(element.props.label)),
-      false,
-      '抓取开关属于 ticket 10，此刻不该出现在卡片上',
-    );
+
+    // 两个开关都必须是**真的开关**，而不是一句说明（`CFG-2`）。
+    const switches = flatten(tree).filter((element) => element.type === switchStub);
+    assert.deepEqual(switches.map((element) => element.props.label), [
+      '接管搜索（web_search）',
+      '接管抓取（web_fetch）',
+      '生成答案',
+    ]);
+  });
+
+  test('两个开关各自读自己那一项设置，而不是共用一个值', async () => {
+    // 「独立开关」（`CFG-2`）的实质是两个开关各自由自己那一项设置驱动。只断言「渲染了
+    // 两个 Switch」会漏掉「两个都读 searchEnabled」这种把独立性抹掉的实现。
+    const onlyFetch = await mountedCard({
+      hooks: { ui: readyUi({ settings: { ...sampleState().settings, searchEnabled: false } }), draft: { ...readyDraft(), searchEnabled: false } },
+    });
+    const onlyFetchSwitches = flatten(onlyFetch.component({ t: onlyFetch.t }))
+      .filter((element) => element.type === switchStub);
+    assert.deepEqual(onlyFetchSwitches.slice(0, 2).map((element) => element.props.checked), [false, true]);
+
+    const onlySearch = await mountedCard({
+      hooks: { ui: readyUi({ settings: { ...sampleState().settings, fetchEnabled: false } }), draft: { ...readyDraft(), fetchEnabled: false } },
+    });
+    const onlySearchSwitches = flatten(onlySearch.component({ t: onlySearch.t }))
+      .filter((element) => element.type === switchStub);
+    assert.deepEqual(onlySearchSwitches.slice(0, 2).map((element) => element.props.checked), [true, false]);
   });
 
   test('传入宿主自己的 t 时优先用它', async () => {
@@ -575,23 +624,20 @@ describe('PANEL-5：卡片渲染出中英双语文案', () => {
     assert.equal(texts.includes('Tavily 密钥池'), false, '宿主给了 t 就不该用自带词表');
   });
 
-  test('「抓取接管尚在开发中」这句绑在服务端事实上，而不是写死的', async () => {
-    // `10` 落地之后 `fetchToggleAvailable` 会变成 true；那时这句话必须自己消失，否则卡片会
-    // 继续宣称一个早已完成的开发状态，而没有任何测试会发现。
-    const developing = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
-    assert.equal(
-      textsOf(developing.component({ t: developing.t })).some((text) => text.includes('抓取接管尚在开发中')),
-      true,
-    );
+  test('抓取参数与抓取开关一起出现，取值与 schema 的词表一致', async () => {
+    // `10` 之前卡片上有一句「抓取接管尚在开发中」，它绑在服务端的 `fetchToggleAvailable`
+    // 上。那个字段随本票一起删掉了：**没有消费方的字段位就是一个空洞**，而它的前任正是
+    // 「一句必然会过时的说明」。这条用例盯住取而代之的事实——两项抓取参数都可选且选项与
+    // `lib/settings.js` 的词表逐字一致。
+    const { component, t } = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
+    const selects = flatten(component({ t })).filter((element) => element.type === 'select');
+    const values = selects.map((element) => element.props.value);
+    // `maxResults` 是 `<input type="number">`，不在这一列里。
+    assert.deepEqual(values, ['basic', 'general', 'basic', 'markdown']);
 
-    const shipped = await mountedCard({
-      hooks: { ui: readyUi({ fetchToggleAvailable: true }), draft: readyDraft() },
-    });
-    assert.equal(
-      textsOf(shipped.component({ t: shipped.t })).some((text) => text.includes('抓取接管尚在开发中')),
-      false,
-      '开关已经存在时不该再说它还在开发中',
-    );
+    const options = selects.map((element) => element.children.map((child) => child.props.value));
+    assert.deepEqual(options[2], ['basic', 'advanced'], '抽取深度的词表要与 EXTRACT_DEPTH_VALUES 一致');
+    assert.deepEqual(options[3], ['markdown', 'text'], '返回格式的词表要与 EXTRACT_FORMAT_VALUES 一致');
   });
 
   test('每把密钥的最近耗时也显示出来（USAGE-7）', async () => {

@@ -39,11 +39,6 @@ There are two **independent** toggles:
 
 They do not affect each other — you can use Tavily for search while keeping the built-in fetcher, for example.
 
-> ⚠️ **Only the search toggle exists on the card today.** Fetch takeover is still being built
-> (ticket `10`): there is no `fetchEnabled` setting yet, and `fetchProvider` still points at
-> the built-in local HTTP fetcher. Until it lands, the card renders the search toggle and says
-> so — rendering a switch that does nothing when flipped is worse than not rendering it.
-
 Toggle changes take effect **immediately**, with no restart.
 
 ## Search parameters
@@ -58,6 +53,17 @@ Toggle changes take effect **immediately**, with no restart.
 Parameter changes likewise take effect **immediately**; the next search carries the new values.
 
 `maxResults` is a **cap**, not a guarantee: the model may ask for fewer results when it calls search, and then its number wins. The final result is truncated once more by DSH's seam. The lower bound is 1 — the official API reference says 0, but `0` is in practice rejected upstream with `400 Invalid max results.`, and that class of error neither retries nor switches keys, so the panel does not accept it.
+
+## Fetch parameters
+
+| Parameter | Values | Default | Meaning |
+|---|---|---|---|
+| **Extraction depth** `fetchDepth` | `basic` / `advanced` | `basic` | `advanced` retrieves more content, at **twice the credits** |
+| **Output format** `fetchFormat` | `markdown` / `text` | `markdown` | The text Tavily returns; `text` costs extra latency upstream |
+
+There are no per-call fetch controls: DSH's fetch request type carries **only a URL**, so the model cannot ask for a different depth or format on an individual call. These two settings are the only way to change it.
+
+A fetched page comes back as **plain text, never as HTML**. Tavily already returns markdown, so the plugin tells DSH it is text and DSH passes it straight through; marking it as HTML would make DSH convert a markdown document a second time and mangle the content.
 
 ## Scheduling
 
@@ -112,7 +118,9 @@ The plugin **does not infer the billing cycle** — balances always come from th
 - **Search**: `basic` / `fast` / `ultra-fast` cost 1 credit, `advanced` costs 2
 - **Fetch**: every **5 successful** URL extractions cost 1 credit (`basic`) or 2 (`advanced`); failed URLs are **not charged**
 
-A single fetch therefore often costs 0 credits.
+A single fetch therefore often costs 0 credits, because credits are charged per five successful URLs rather than per request. The plugin computes what a fetch was worth from the number of URLs that actually succeeded — it does not read back Tavily's own per-response `usage.credits`, which is rounded against Tavily's own running total and is therefore frequently `0` on a response that did cost credit.
+
+Since one DSH fetch call carries one URL, the running total is what reaches each five-URL tier.
 
 ## Manual rollback
 
@@ -134,6 +142,8 @@ Find the section overriding the `web` row and change `searchProvider` and `fetch
 ```
 
 > ⚠️ **Both fields must be written out.** A patch's `config` is **replaced wholesale**, not merged; writing only one leaves the other "unconfigured", which falls back to auto-selection — that does not error, but it is no longer the behaviour you asked for.
+
+To roll back only one of the two capabilities, change that field and keep the other one pointing at `tavily` — but keep **both lines** present either way. The table in [Toggles](#toggles) says which official value each field takes.
 
 Saving takes effect immediately, with no restart (the profile's `patchReload` is `live`).
 

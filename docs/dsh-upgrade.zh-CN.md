@@ -129,7 +129,7 @@ setTimeout(0) @+3373                   inject:settings @+3385
 ### 5. 本插件直接构造的回落目标
 
 **看哪里：** `dsh-web-search-deepseek` 与 `dsh-web-fetch-http` 的公开导出。
-**改哪个模块：** 搜索回落在 `lib/dsh/fallback.js`；抓取回落届时在 `lib/dsh/` 下新增的适配模块
+**改哪个模块：** 两个回落都在 `lib/dsh/fallback.js`
 
 搜索回落已在 `lib/dsh/fallback.js` 落地：它直接构造 `DeepSeekSearchProvider`，因为回落路径
 正是用户关掉本插件后所得到的东西。检查：
@@ -146,10 +146,19 @@ setTimeout(0) @+3373                   inject:settings @+3385
   这个端点覆盖变量。官方包的 `resolveOptions` 没有导出，所以这些值是抄来的；一旦它们漂移，
   只有「用户什么都没配」那一档会与官方不一致，而那一档本来就会以凭据缺失响亮失败。
 
-抓取接管（ticket `10`）落地后，同样检查 `HttpFetchProvider`、`publicHttpNetwork.resolve`，以及
-本插件复刻的抓取限值 —— **`maxResponseBytes: 5_000_000`、`maxBodyChars: 100_000`、
-`timeoutMs: 30_000`、`maxRedirects: 5`，以及
-`deepseek-harness/0.0.1 (+https://github.com/deepseek-ai)` 这个 user agent。**
+抓取回落（ticket `10`）只在 `lib/dsh/fallback.js` 的 `officialFetchProvider()` 里。它比搜索
+那一条简单得多——官方抓取器不需要凭据，因此没有 `CFG-5` 那两档。检查三点：
+
+- `HttpFetchProvider` 与 `DEFAULT_USER_AGENT` 仍从包根导出。**`publicHttpNetwork` 不在其中**：
+  它只在源码里导出，`package.json` 的 exports 只映射 `./src/*` 与 `./package.json`，没有任何
+  子路径能到达包根的 `lib/index.js`。因此构造时**省略第二个参数**，让官方包自己填默认解析器
+  （构造签名的默认值就是 `publicHttpNetwork.resolve`，行为因此一致）。ticket `10` 原先写的
+  「取自已导出的 `publicHttpNetwork.resolve`」不成立，已在该票的 Comments 里更正。
+- **本插件复刻的四项限值未变**：`maxResponseBytes: 5_000_000`、`maxBodyChars: 100_000`、
+  `timeoutMs: 30_000`、`maxRedirects: 5`（第五项 `userAgent` 取的是导出的常量）。
+  这四项在包里只存在于 schema 的 `.default(...)` 里，只能照抄。
+- `test/dsh-fetch-provider.test.js` 直接读**官方包的 `Config` schema** 逐字段比对，因此上游
+  一改默认值它就红，而不必等人工复核这一节。
 
 ### 6. 设置注册
 

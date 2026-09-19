@@ -3,14 +3,16 @@
  *
  * 单测打的是桩件，而这里打的是**真实宿主服务**：真实的 `WebRuntime`（pin 到本插件）、
  * 真实的 `SettingsProvider`（宿主的基类，不是替身）、真实的 Tavily API 与真实网络。它能
- * 证明而单测证明不了的四件事：
+ * 证明而单测证明不了的五件事：
  *
  * 1. **开关即时生效**（第 7 项）：改设置之后**不重新加载插件**，下一次搜索立刻换路径；
  * 2. **回落路径**（第 8 项）：关掉开关后请求转交官方提供方，并记下官方凭据在本机的**真实**
  *    错误码——这一条只有在真机上才有答案；
  * 3. **半坏仍可用**（第 6 项）：密钥池文件损坏时搜索不中断，而是走回落；
  * 4. **patch 的接管真正落到 seam 上**（第 1 项的服务侧一半）：`searchProvider: tavily`
- *    解析到本插件，而不是靠 id 相同碰巧对上。
+ *    解析到本插件，而不是靠 id 相同碰巧对上；
+ * 5. **抓取接管同样落到 seam 上**（第 10 项）：`fetchProvider: tavily` 解析到本插件的抓取
+ *    提供方、请求真的抵达 `/extract`，且两个开关互不影响。
  *
  * 它需要一把真实密钥，因此不属于 `npm test`：
  *
@@ -122,8 +124,9 @@ async function prepareHarnessHome() {
 function bootHost(harnessHome, { connection } = {}) {
   process.env.DSH_HOME = harnessHome;
   const ctx = new Context();
-  // profile patch 的等价物：`web` 行被 pin 到本插件，两个提供方字段都写全。
-  new WebRuntime(ctx, { searchProvider: PROVIDER_ID, fetchProvider: 'http' });
+  // profile patch 的等价物：`web` 行被 pin 到本插件，**两个提供方字段都写全**——patch 的
+  // `config` 是整包替换而不是合并，少写一个的后果正是 ticket `16` 第 2 项要防的那件事。
+  new WebRuntime(ctx, { searchProvider: PROVIDER_ID, fetchProvider: PROVIDER_ID });
   if (connection !== undefined) ctx.provide('connection', connection);
   const settings = memorySettings(ctx);
   apply(ctx, {});
@@ -171,6 +174,15 @@ async function waitForSettings(settings) {
 async function trySearch(ctx, query) {
   try {
     return { ok: true, result: await ctx.web.search({ query, maxResults: 3 }) };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
+/** 一次真实抓取，返回结果或抛出的错误。 */
+async function tryFetch(ctx, url) {
+  try {
+    return { ok: true, result: await ctx.web.fetch({ url }) };
   } catch (error) {
     return { ok: false, error };
   }
@@ -248,6 +260,82 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
     '第 11 项：调用数/成功数/积分落在 keys.json 的 stats 里',
     `calls=${String(stats.calls)} successes=${String(stats.successes)} credits=${String(stats.credits ?? '未知')}`,
   );
+}
+
+// ── 第 10 项：抓取接管与它的独立开关（ticket 10） ──────────────────────────────
+{
+  // 抓取开关为开：请求必须走 Tavily `/extract`，且返回纯文本。
+  //
+  // 出站请求在这里被**换掉**而不是真的发出去：本脚本要证明的是「接管的接线对不对」——
+  // 请求有没有抵达 Tavily 的抽取端点、参数对不对、返回值是不是被标成 `text`——而
+  // `example.com` 在真机上解析到什么地址取决于本机 DNS，那属于另一件事（官方抓取器的
+  // 策略），把它混进来只会让这条检查时红时绿。真实密钥的真实搜索已经由前面几项证明。
+  const extractCalls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    const url = typeof input === 'string' ? input : String(input?.url);
+    extractCalls.push({ url, body: JSON.parse(init?.body ?? '{}'), authorization: init?.headers?.authorization });
+    return Promise.resolve(new Response(JSON.stringify({
+      results: [{ url: 'https://example.com', title: 'Example Domain', raw_content: '# Example Domain\n\n正文' }],
+      failed_results: [],
+      usage: { credits: 0 },
+      request_id: 'req-live-extract',
+    }), { status: 200 }));
+  };
+
+  try {
+    const fetched = await tryFetch(ctx, 'https://example.com');
+    assert.equal(fetched.ok, true, `抓取开关为开时必须走 Tavily：${fetched.ok ? '' : String(fetched.error)}`);
+    assert.equal(extractCalls.length, 1, '一次抓取只该发一个出站请求');
+    assert.match(extractCalls[0].url, /api\.tavily\.com\/extract$/u, '必须打到 /extract，而不是 /search');
+    assert.match(String(extractCalls[0].authorization), /^Bearer tvly-/u, '抽取请求同样用池中的密钥认证');
+    assert.deepEqual(extractCalls[0].body.urls, ['https://example.com']);
+
+    // 硬约束：Tavily 给的已是 markdown，标成 `html` 会被 turndown 二次转换。
+    assert.equal(fetched.result.body.kind, 'text');
+    assert.equal(fetched.result.body.content, '# Example Domain\n\n正文');
+    assert.equal(fetched.result.statusCode, 200);
+    check('第 10 项：抓取开关为开时走 /extract，且返回 body.kind = text', extractCalls[0].url);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  // 抓取开关独立于搜索开关：关掉抓取，抓取换路径，而搜索不受影响。
+  //
+  // 回落目标在这里被换成一个记录调用的桩件，理由与上面相同（真实的官方抓取器会去做
+  // DNS 解析）。**限值是否逐字段复现官方默认**由 `test/dsh-fetch-provider.test.js` 直接
+  // 读官方 schema 断言，两者合起来才是完整的回落契约。
+  const { officialFetchProvider, setOfficialFetchProvider } = await import('../../lib/dsh/fallback.js');
+  const previousTarget = officialFetchProvider();
+  const fallbackCalls = [];
+  setOfficialFetchProvider({
+    id: 'http',
+    available: () => true,
+    fetch: async (request) => {
+      fallbackCalls.push(request.url);
+      return { url: request.url, statusCode: 200, body: { kind: 'text', content: 'official fetcher' }, truncated: false };
+    },
+  });
+
+  try {
+    await settings.update(SETTINGS_NAMESPACE, { fetchEnabled: false });
+    assert.equal(settings.get(SETTINGS_NAMESPACE).fetchEnabled, false, '写入必须落到真实 settings 上');
+
+    const afterOff = await tryFetch(ctx, 'https://example.com');
+    assert.equal(afterOff.ok, true, `关掉抓取开关后必须回落而不是抛错：${afterOff.ok ? '' : String(afterOff.error)}`);
+    assert.deepEqual(fallbackCalls, ['https://example.com'], '回落目标收到的就是 seam 的原始请求');
+    assert.equal(afterOff.result.body.content, 'official fetcher');
+
+    // 搜索开关没被动过，因此搜索照旧走 Tavily——这正是「两个开关彼此独立」（`CFG-2`）。
+    const stillTavily = await trySearch(ctx, 'Tavily extract endpoint');
+    assert.equal(stillTavily.ok, true, '关掉抓取不得影响搜索');
+    check('第 10 项：关掉抓取开关后抓取转交官方抓取器，搜索仍然走 Tavily');
+
+    await settings.update(SETTINGS_NAMESPACE, { fetchEnabled: true });
+    assert.equal(settings.get(SETTINGS_NAMESPACE).fetchEnabled, true);
+  } finally {
+    setOfficialFetchProvider(previousTarget);
+  }
 }
 
 // ── 第 12、13 项：走面板接口的真实入口做一次连通性测试与余额刷新 ────────────────
@@ -329,6 +417,17 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
       `默认路径只该打 /usage，实际 ${calls.join(', ')}`,
     );
     check('第 12 项：默认路径打的是 /usage，不消耗搜索积分', `${String(calls.length)} 次请求，全部为 /usage`);
+
+    // ── 第 10 项：面板状态里同时投影两个开关与两项抓取参数 ──
+    //
+    // 卡片据这份投影渲染两张开关，因此「两个独立开关」这件事在服务端这一侧的证据就是它们
+    // 同时出现在同一次 `/state` 里，且各自是自己的字段。
+    const projected = await call(PANEL_ROUTE_PATHS.state);
+    assert.equal(typeof projected.settings.searchEnabled, 'boolean');
+    assert.equal(typeof projected.settings.fetchEnabled, 'boolean');
+    assert.equal(projected.settings.fetchDepth, 'basic');
+    assert.equal(projected.settings.fetchFormat, 'markdown');
+    check('第 10 项：/state 同时投影两个开关与两项抓取参数');
 
     // 测试完把这把无效密钥删掉，免得它影响后面的断言。
     await call(PANEL_ROUTE_PATHS.keys, { action: 'remove', id: invalid.id });

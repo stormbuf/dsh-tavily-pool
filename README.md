@@ -16,13 +16,14 @@ Tavily-backed web search **and** page fetching for DeepSeek Harness: multi-key p
 - **Usage accounting** — reads real `usage.credits` from responses; unknown is recorded as unknown, never as zero
 - **Balance refresh** — pulls official `/usage` with per-key sliding-window quota reservation, so it never trips the 10-per-10-minutes limit
 - **Configurable search parameters** — search depth, result cap, topic, and generated-answer toggle, all taking effect immediately
-- **Fetch takeover** — maps `web_fetch` to Tavily `/extract`; billing follows successful-URL tiers
+- **Fetch takeover** — maps `web_fetch` to Tavily `/extract`, returning plain text (never HTML, which DSH would convert a second time); extraction depth and output format are configurable
+- **Fetch billing by successful URLs** — charged per five successful extractions, so a single fetch usually costs 0
 - **Independent toggles** — search and fetch can be switched back to the official providers separately
 - **Zero runtime dependencies** — plain ESM, no build step
 
-> **Shipped so far:** everything the spec marks P0 — the search takeover and its toggle, the
-> key pool, failover with cooldown, search parameters, balance refresh, and the settings card
-> with its HTTP API. Of the P1 set, fetch takeover (and therefore its toggle) is next.
+> **Shipped:** everything the spec marks P0 and P1 — search takeover and its toggle, the key
+> pool, failover with cooldown, search parameters, balance refresh, fetch takeover with its own
+> toggle, and the settings card with its HTTP API. Of the P2 set, call history and charts remain.
 
 ## Install
 

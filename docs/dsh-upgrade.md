@@ -145,7 +145,7 @@ isolation semantics fails there instead of surfacing as a silently missing panel
 ### 5. The fallback targets this plugin constructs directly
 
 **Where:** `dsh-web-search-deepseek` and `dsh-web-fetch-http` — their public exports.
-**Then edit:** search fallback is `lib/dsh/fallback.js`; fetch fallback will be an adapter added under `lib/dsh/`
+**Then edit:** both fallbacks live in `lib/dsh/fallback.js`
 
 The search fallback has landed in `lib/dsh/fallback.js`: it constructs `DeepSeekSearchProvider`
 directly, because the fallback path is what a user gets when they switch this plugin off. Check:
@@ -164,10 +164,24 @@ directly, because the fallback path is what a user gets when they switch this pl
   copied; if they drift, only the "user configured nothing" tier diverges from the official
   provider, and that tier already fails loudly as a missing credential.
 
-Once the fetch takeover (ticket `10`) lands, check `HttpFetchProvider` and
-`publicHttpNetwork.resolve` the same way, along with the fetch limits this plugin mirrors —
-**`maxResponseBytes: 5_000_000`, `maxBodyChars: 100_000`, `timeoutMs: 30_000`,
-`maxRedirects: 5`, and the `deepseek-harness/0.0.1 (+https://github.com/deepseek-ai)` user agent.**
+The fetch fallback (ticket `10`) lives in `officialFetchProvider()` in the same file, and is much
+simpler — the official fetcher needs no credential, so there is no `CFG-5` pair here. Check three
+things:
+
+- `HttpFetchProvider` and `DEFAULT_USER_AGENT` are still exported from the package root.
+  **`publicHttpNetwork` is not**: it is exported from the source module only, and the package's
+  `exports` map covers just `./src/*` and `./package.json`, so no subpath reaches the root
+  `lib/index.js`. The constructor therefore **omits the second argument**, letting the official
+  package supply its own default resolver (the constructor's default value *is*
+  `publicHttpNetwork.resolve`, so behaviour is identical). Ticket `10` originally claimed it was
+  reachable as an export; that is corrected in that ticket's Comments.
+- the four limits this plugin mirrors are unchanged: `maxResponseBytes: 5_000_000`,
+  `maxBodyChars: 100_000`, `timeoutMs: 30_000`, `maxRedirects: 5` (the fifth, `userAgent`, comes
+  from the exported constant). Those four exist only as schema `.default(...)` values inside the
+  package, so copying is the only option.
+- `test/dsh-fetch-provider.test.js` reads the official package's `Config` schema and compares field
+  by field, so an upstream default change turns it red without anyone having to re-read this
+  section by hand.
 
 ### 6. Settings registration
 

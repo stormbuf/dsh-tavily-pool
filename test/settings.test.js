@@ -28,6 +28,9 @@ describe('CFG-3：搜索参数可配置', () => {
   test('默认值与 Tavily 自己的默认一致', () => {
     assert.deepEqual(read(undefined), {
       searchEnabled: true,
+      fetchEnabled: true,
+      fetchDepth: 'basic',
+      fetchFormat: 'markdown',
       searchDepth: 'basic',
       maxResults: 10,
       topic: 'general',

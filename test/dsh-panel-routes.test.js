@@ -552,7 +552,9 @@ describe('index.js 真的把接口接上了', () => {
     assert.equal(response.status, 200);
     assert.deepEqual(body.keys, []);
     assert.equal(body.settings.searchEnabled, true, '设置由宿主按 schema 解析出默认值');
-    assert.equal(body.fetchToggleAvailable, false, '抓取开关属于 ticket 10，此刻不该出现');
+    assert.equal(body.settings.fetchEnabled, true, '第二个开关同样经宿主 schema 解析（CFG-2）');
+    assert.equal(body.settings.fetchDepth, 'basic');
+    assert.equal(body.settings.fetchFormat, 'markdown');
   });
 
   test('apply() 注册的路由能真的添加密钥', async () => {

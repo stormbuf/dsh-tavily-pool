@@ -1,4 +1,4 @@
-# dsh-tavily-pool bundle patch: mount the plugin and pin the search provider.
+# dsh-tavily-pool bundle patch: mount the plugin and pin both providers.
 #
 # ⚠️ `config` on an id-targeted patch REPLACES the whole config object
 # (`cordis-plugin-include`'s `applyEntryPatches` does `target[key] = value` for
@@ -10,14 +10,17 @@
 # `applyEntryPatches` against the base row, and by `dsh --profile <p>
 # --dump-config`: a patch writing only `searchProvider` loses `fetchProvider`.
 #
-# `fetchProvider` currently stays on the official HTTP fetcher. Ticket 01 takes
-# over search only; page fetching is ticket 10. Pinning fetch to `tavily` before
-# that provider exists would make every `web_fetch` throw
-# `WEB_PROVIDER_CONFIGURED_MISSING`, which is a regression, not a takeover.
-# Ticket 10 flips this line to `tavily`.
+# Both fields point at the single provider id `tavily`: the seam keeps search and
+# fetch in two registries, and this plugin registers into both (ticket 01 for
+# search, ticket 10 for fetch). Pinning an id that is not registered makes every
+# call throw `WEB_PROVIDER_CONFIGURED_MISSING` — so a half-loaded plugin is a
+# broken one, which is why `apply()` registers both providers before anything
+# that can fail.
 #
-# To roll back by hand, point the pinned field back at the official provider:
+# To roll back by hand, point either field back at the official provider and keep
+# BOTH lines present:
 #   searchProvider: deepseek-official
+#   fetchProvider: http
 # See docs/usage.md ("Manual rollback").
 
 - insert:
@@ -27,4 +30,4 @@
 - id: web
   config:
     searchProvider: tavily
-    fetchProvider: http
+    fetchProvider: tavily

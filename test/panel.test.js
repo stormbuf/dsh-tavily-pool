@@ -158,10 +158,20 @@ describe('面板状态投影', () => {
     assert.equal(state.capabilities.findings[0].remedy, 'ctx.settings.register', '面板要能说清该去哪里看');
   });
 
-  test('抓取开关在 10 落地前如实报告为不可用', async () => {
-    // 渲染一个不存在的开关比不渲染更糟：用户会去拨它，然后什么也不会发生。
-    const state = readPanelState({ settings: {}, pool: undefined, capabilityReport: undefined, fallback: {} });
-    assert.equal(state.fetchToggleAvailable, false);
+  test('两个开关都经 settings 投影出去，面板不需要额外的可用性字段', async () => {
+    // `09` 落地时这里曾断言 `fetchToggleAvailable === false`：那时抓取开关确实不存在
+    // （属于 `10`），而渲染一个拨了没反应的开关比不渲染更糟。`10` 落地后两个开关都真的
+    // 存在，于是那个字段**连同它的断言一起删掉**——留着一个恒为 `true` 的字段，只会让下一
+    // 个读代码的人以为它还在表达什么。
+    const state = readPanelState({
+      settings: { searchEnabled: true, fetchEnabled: false },
+      pool: undefined,
+      capabilityReport: undefined,
+      fallback: {},
+    });
+    assert.equal(state.settings.searchEnabled, true);
+    assert.equal(state.settings.fetchEnabled, false);
+    assert.equal('fetchToggleAvailable' in state, false, '那个字段的消费方已随 10 一起消失');
   });
 });
 
