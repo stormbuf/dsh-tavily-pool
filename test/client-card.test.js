@@ -122,14 +122,19 @@ function applied(update, base) {
  * 弹框用例需要的 `document` 替身（`POOL-8`）。
  *
  * `querySelector` 返回一个非 null 值，是为了让模块体的样式注入那一步直接跳过：本文件检验
- * 的是渲染出什么，不是样式标签怎么挂。`body` 是 portal 的落点。
+ * 的是渲染出什么，不是样式标签怎么挂。`body` 是 portal 的落点，`listeners` 记下挂在
+ * document 上的按键监听器——Esc 那条路径只有真的执行 effect 才谈得上被检验。
+ *
+ * @returns 替身；`listeners` 按事件名索引。
  */
 function documentStub() {
+  const listeners = new Map();
   return {
-    body: {},
+    body: { tag: 'body' },
     querySelector: () => ({}),
-    addEventListener: () => undefined,
-    removeEventListener: () => undefined,
+    addEventListener: (type, handler) => listeners.set(type, handler),
+    removeEventListener: (type) => listeners.delete(type),
+    listeners,
   };
 }
 
@@ -251,7 +256,12 @@ async function mountedCard(options = {}) {
   const { registration } = await loadBundle(options.globals);
   const instantiated = instantiate(registration, { hooks: options.hooks });
   const mounted = mountCard(instantiated.exports);
-  return { ...mounted, t: tOf(mounted.dictionaries, options.locale ?? 'zh'), updates: instantiated.updates };
+  return {
+    ...mounted,
+    t: tOf(mounted.dictionaries, options.locale ?? 'zh'),
+    updates: instantiated.updates,
+    effects: instantiated.effects,
+  };
 }
 
 /** 服务端状态的一份样本，字段与 `lib/panel.js` 的投影一一对应。 */
@@ -595,15 +605,16 @@ describe('POOL-8：批量添加', () => {
   });
 
   test('打开后弹框挂在 document.body 上，里面有文本框与「一行一个」的说明', async () => {
+    const doc = documentStub();
     const { component, t } = await mountedCard({
-      globals: { document: documentStub() },
+      globals: { document: doc },
       hooks: { ui: openUi(), draft: readyDraft() },
     });
     const tree = component({ t });
 
     const portal = flatten(tree).find((element) => element.type === 'portal');
     assert.notEqual(portal, undefined);
-    assert.notEqual(portal.props.container, undefined, '弹层要挂到卡片之外，否则定位受祖先元素摆布');
+    assert.equal(portal.props.container, doc.body, '弹层要挂到卡片之外，否则定位受祖先元素摆布');
 
     const dialog = flatten(tree).find((element) => element.props?.className === 'dtp-dialog');
     assert.equal(dialog.props.role, 'dialog');
@@ -618,6 +629,89 @@ describe('POOL-8：批量添加', () => {
     assert.equal(texts.includes('批量添加密钥'), true);
     assert.equal(texts.some((text) => text.includes('一行一个密钥')), true);
     assert.equal(texts.some((text) => text.includes('空行与重复的会被跳过')), true, '规则要说在按钮前面');
+  });
+
+  test('入口按钮打开弹框，并把上一次的文本清掉', async () => {
+    const stale = { ...readyUi(), batchText: '上一次留下的明文' };
+    const { component, t, updates } = await mountedCard({
+      globals: { document: documentStub() },
+      hooks: { ui: stale, draft: readyDraft() },
+    });
+
+    buttonWithText(component({ t }), '批量添加').props.onClick();
+
+    const ui = uiAfter(updates, stale);
+    assert.equal(ui.batchOpen, true);
+    assert.equal(ui.batchText, '', '打开时清空：上一次的明文不该在框里等着');
+  });
+
+  test('Esc 关闭弹框并清空文本，关闭后摘掉监听器', async () => {
+    const doc = documentStub();
+    const { component, t, effects, updates } = await mountedCard({
+      globals: { document: doc },
+      hooks: { ui: openUi(), draft: readyDraft() },
+    });
+    component({ t });
+
+    // 第一个 effect 是首次加载，第二个才是 Esc（顺序即组件里 `useEffect` 的调用顺序）。
+    const cleanup = effects[1]();
+    const onKeyDown = doc.listeners.get('keydown');
+    assert.notEqual(onKeyDown, undefined, '弹框打开时要挂上 Esc 监听');
+
+    onKeyDown({ key: 'a' });
+    assert.equal(uiAfter(updates, openUi()).batchOpen, true, '别的键不该把弹框关掉');
+
+    onKeyDown({ key: 'Escape' });
+    const closed = uiAfter(updates, openUi());
+    assert.equal(closed.batchOpen, false);
+    assert.equal(closed.batchText, '', '关掉之后明文不该留在状态里');
+
+    cleanup();
+    assert.equal(doc.listeners.has('keydown'), false, '关闭之后要摘掉监听器');
+  });
+
+  test('提交中按 Esc 不关弹框：请求还在飞，文本不能丢', async () => {
+    const doc = documentStub();
+    const working = { ...openUi(), busy: 'addBatch' };
+    const { component, t, effects, updates } = await mountedCard({
+      globals: { document: doc },
+      hooks: { ui: working, draft: readyDraft() },
+    });
+    component({ t });
+
+    effects[1]();
+    doc.listeners.get('keydown')({ key: 'Escape' });
+
+    assert.equal(uiAfter(updates, working).batchOpen, true, '失败时用户要靠框里的文本重试');
+  });
+
+  test('点遮罩关闭、点弹框内部不关闭', async () => {
+    const { component, t, updates } = await mountedCard({
+      globals: { document: documentStub() },
+      hooks: { ui: openUi(), draft: readyDraft() },
+    });
+    const mask = flatten(component({ t })).find((element) => element.props?.className === 'dtp-mask');
+    assert.notEqual(mask, undefined);
+
+    const inside = {};
+    mask.props.onClick({ target: inside, currentTarget: {} });
+    assert.equal(uiAfter(updates, openUi()).batchOpen, true, '面板内部的点击会冒泡到遮罩，不能因此关掉弹框');
+
+    mask.props.onClick({ target: inside, currentTarget: inside });
+    assert.equal(uiAfter(updates, openUi()).batchOpen, false);
+  });
+
+  test('取消按钮关闭弹框并清空文本', async () => {
+    const { component, t, updates } = await mountedCard({
+      globals: { document: documentStub() },
+      hooks: { ui: openUi(), draft: readyDraft() },
+    });
+
+    dialogButton(component({ t }), '取消').props.onClick();
+
+    const ui = uiAfter(updates, openUi());
+    assert.equal(ui.batchOpen, false);
+    assert.equal(ui.batchText, '');
   });
 
   test('文本框为空时确认按钮不可用——空粘贴不该发一趟请求', async () => {
@@ -657,8 +751,8 @@ describe('POOL-8：批量添加', () => {
     assert.notEqual(post, undefined, '确认要经面板接口提交');
     assert.deepEqual(
       post.body,
-      { action: 'addBatch', text: 'tvly-dev-a\n  tvly-dev-b  \n\ntvly-dev-a' },
-      '只有整段首尾被 trim；行内空白、空行与重复行都原样交给服务端',
+      { action: 'addBatch', text: PASTED },
+      '前端一个字符都不动：首尾换行、行内空白、空行与重复行全部原样交给服务端',
     );
 
     // 结果要**说出来**：批量添加不像单把那样能在列表里一眼看出多了几行。
@@ -684,6 +778,26 @@ describe('POOL-8：批量添加', () => {
     assert.equal(
       uiAfter(updates, openUi('tvly-dev-a\ntvly-dev-b')).notice,
       '已添加 2 把密钥。',
+    );
+  });
+
+  test('一把都没加进去时说「没有新增」，而不是「已添加 0 把」', async () => {
+    const calls = [];
+    const { component, t, updates } = await mountedCard({
+      globals: {
+        document: documentStub(),
+        fetch: fetchStub(calls, { received: 2, added: 0, duplicates: 2 }),
+      },
+      hooks: { ui: openUi('tvly-dev-a\ntvly-dev-a'), draft: readyDraft() },
+    });
+
+    await dialogButton(component({ t }), '添加').props.onClick();
+    await flush();
+
+    assert.equal(
+      uiAfter(updates, openUi('tvly-dev-a\ntvly-dev-a')).notice,
+      '没有新增：这 2 把密钥都已在池中。',
+      '数字诚实但「已添加 0 把」读起来像出错',
     );
   });
 

@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { describe } from 'node:test';
@@ -374,7 +374,7 @@ describe('POOL-8：批量添加', () => {
   });
 
   test('一行密钥都没有时按入参非法拒绝，而不是回一个静悄悄的 0', async () => {
-    const { deps } = await panelDeps();
+    const { deps, pool } = await panelDeps();
     for (const text of ['   ', '\n\n\n', '  \t  \n ']) {
       await assert.rejects(
         () => runPanelCommand('keys', { action: 'addBatch', text }, deps),
@@ -382,6 +382,14 @@ describe('POOL-8：批量添加', () => {
         `${JSON.stringify(text)} 必须被拒绝`,
       );
     }
+    // 拒绝要**什么都不留下**：密钥池没变，也没落过一次盘（spec 的 POOL-10 场景）。
+    assert.deepEqual(pool.keysInOrder(), []);
+    assert.equal(pool.lastWriteError, undefined);
+    await assert.rejects(
+      () => readFile(pool.filePath, 'utf8'),
+      (error) => error.code === 'ENOENT',
+      '被拒绝的批量添加不该开出一个池文件',
+    );
   });
 
   test('text 缺席、不是字符串或为空串时都是 400', async () => {
