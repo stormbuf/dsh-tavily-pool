@@ -40,6 +40,11 @@ DeepSeek Harness 处于预览期，其架构与插件接口可能随版本变动
 
 **已测试版本：DSH `0.1.5-rc.2`。** 在更新的版本上可能需要重新适配；届时插件会报出**明确指出缺失能力**的错误，而不是静默失败。逐条重适配清单见 [`docs/dsh-upgrade.zh-CN.md`](./docs/dsh-upgrade.zh-CN.md)。
 
+经 `dsh plugin add` 安装后，本包会成为目标 profile 的一个 **bundle 层**（进入该 profile 的
+`dsh.profile.bundles`，排在 DSH 各 bundle 之后），它的 `cordis.patch.yml` 因此能 pin 住提供方。
+你自己的 profile patch 在**所有 bundle 层之后**应用，因此随时可以覆盖或停用本插件的行为——
+见[手动回退](./usage.zh-CN.md#手动回退)。
+
 ## 许可
 
 MIT

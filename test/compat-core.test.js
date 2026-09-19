@@ -114,3 +114,49 @@ describe('COMPAT-4：每个被 import 的宿主包都在 package.json 里声明'
     assert.deepEqual(undeclared, [], '这些宿主包被 import 却没在 package.json 里声明');
   });
 });
+
+describe('DOC-1：包清单完整，且发布出去的内容是完整的', () => {
+  /** 读一次清单；下面每条断言都用它。 */
+  async function manifest() {
+    return JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8'));
+  }
+
+  test('name / version / type / main / exports(含 ./client) / dsh 两项都在', async () => {
+    const pkg = await manifest();
+
+    assert.equal(pkg.name, 'dsh-tavily-pool');
+    assert.match(pkg.version, /^\d+\.\d+\.\d+$/u, 'version 必须是可发布的三段式');
+    assert.equal(pkg.type, 'module');
+    assert.equal(pkg.main, 'index.js');
+    assert.equal(pkg.exports['.'].default, './index.js');
+    assert.equal(pkg.exports['./client'].default, './lib/client.js', './client 是宿主加载零构建卡片的那条路径');
+    assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml');
+    assert.equal(pkg.dsh.client.platform, 'web');
+  });
+
+  test('零运行时依赖', async () => {
+    // 宿主包全走 peerDependencies，业务代码只用 node: 内置模块。声明成 dependencies 会让
+    // 用户在 profile 目录里多装一份宿主包，那份副本与宿主自己的版本可能不同——而插件在
+    // 运行期经 `ctx` 拿到的永远是宿主那一份，于是两份会悄悄分叉。
+    const pkg = await manifest();
+    assert.deepEqual(pkg.dependencies ?? {}, {});
+  });
+
+  test('files 白名单收全了运行期需要的每一个文件', async () => {
+    // `files` 是白名单，漏一项的症状是「本地好好的，装完就 404」。这里按**运行期真的会
+    // 被读到的路径**逐项核对，而不是照抄一遍清单。
+    const pkg = await manifest();
+    const published = new Set(pkg.files ?? []);
+
+    for (const required of ['index.js', 'lib', 'cordis.patch.yml', 'LICENSE']) {
+      assert.equal(published.has(required), true, `files 白名单缺少 ${required}`);
+    }
+    // `lib/client.js` 由 lib/ 整目录覆盖；这里守住的是「它确实在那个目录下」。
+    assert.equal(published.has('lib'), true);
+
+    // 中英双语文档必须成对发布：用户被告知的可选语言不该只有一半。
+    for (const pair of [['README.md', 'README.zh-CN.md'], ['docs/usage.md', 'docs/usage.zh-CN.md']]) {
+      for (const name of pair) assert.equal(published.has(name), true, `files 白名单缺少 ${name}`);
+    }
+  });
+});

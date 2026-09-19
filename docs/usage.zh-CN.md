@@ -164,6 +164,11 @@ Tavily 对该接口限流为 **10 次 / 10 分钟**，因此本插件对每把�
 
 保存即可生效，无需重启（profile 的 `patchReload` 为 `live`）。
 
+`dsh plugin add` 初始化的 profile 就是这个形状：`dsh-tavily-pool` 出现在该 profile 的
+`dsh.profile.bundles` 里，排在 `@deepseek-ai/dsh-base` 与 `@deepseek-ai/dsh-web-app` 之后，而提供方的
+pin 是以 bundle patch 层的形式生效的。你自己的 `cordis.patch.yml` 在**所有 bundle 层之后**应用，
+因此它能覆盖那两个字段。
+
 改完后可以停用或移除本插件。
 
 ## 与其它 DSH Tavily 插件的区别

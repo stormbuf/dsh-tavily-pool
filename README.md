@@ -40,6 +40,8 @@ DeepSeek Harness is in preview, so its architecture and plugin interfaces may ch
 
 **Tested against DSH `0.1.5-rc.2`.** On a newer release, the plugin may need re-adaptation; it will report a clear error naming the missing capability rather than failing silently. The step-by-step checklist lives in [`docs/dsh-upgrade.md`](./docs/dsh-upgrade.md).
 
+Installing through `dsh plugin add` makes this package a **bundle layer** of the target profile (it lands in that profile's `dsh.profile.bundles`, after the DSH bundles), which is what lets its `cordis.patch.yml` pin the providers. Your own profile patch is applied after every bundle layer, so it can always override or disable what this plugin does — see [Manual rollback](./docs/usage.md#manual-rollback).
+
 ## License
 
 MIT

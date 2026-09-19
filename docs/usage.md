@@ -162,6 +162,8 @@ To roll back only one of the two capabilities, change that field and keep the ot
 
 Saving takes effect immediately, with no restart (the profile's `patchReload` is `live`).
 
+A profile initialized by `dsh plugin add` has exactly this shape: `dsh-tavily-pool` is listed in the profile's `dsh.profile.bundles`, after `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app`, and the provider pin arrives as a bundle patch layer. Your own `cordis.patch.yml` is applied **after** every bundle layer, so it overrides both fields.
+
 Afterwards you can disable or remove this plugin.
 
 ## How this differs from other DSH Tavily plugins
