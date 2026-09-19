@@ -1,10 +1,8 @@
 /**
- * Key-pool persistence, against a real temporary directory.
+ * 密钥池持久化，针对真实的临时目录检验。
  *
- * The behaviours that matter here are the ones a user would notice: a damaged
- * file must not lose their keys or stop the plugin, a write must never leave a
- * half-written file, and no surface outside the local file may ever see a
- * plaintext key.
+ * 这里要紧的行为都是用户会注意到的：文件损坏不得弄丢用户的密钥或让插件停摆；一次
+ * 写入绝不能留下半写完的文件；本地文件之外的任何界面都绝不能看到明文密钥。
  */
 
 import assert from 'node:assert/strict';
@@ -15,48 +13,47 @@ import test, { describe } from 'node:test';
 
 import { maskKey, PoolFileError, PoolStore, validatePool } from '../lib/pool.js';
 
-/** A store backed by a fresh temporary directory. */
+/** 一个以全新临时目录为后端的存储。 */
 async function temporaryStore() {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
   return new PoolStore({ dir, fileName: 'keys.json' });
 }
 
-describe('POOL-6: writes are atomic', () => {
-  test('a write replaces the file through a rename, leaving no temporary behind', async () => {
+describe('POOL-6：写入是原子的', () => {
+  test('写入经 rename 替换文件，不留下临时文件', async () => {
     const store = await temporaryStore();
     await store.load();
     await store.addKey({ key: 'tvly-dev-aaaaaaaaaaaaaaaaaaaa' });
 
     const entries = await readdir(store.dir);
-    assert.deepEqual(entries, ['keys.json'], 'no .tmp file may survive a successful write');
+    assert.deepEqual(entries, ['keys.json'], '成功写入后不得残留任何 .tmp 文件');
 
     const written = JSON.parse(await readFile(store.filePath, 'utf8'));
     assert.equal(written.keys.length, 1);
     assert.equal(written.order.length, 1);
   });
 
-  test('concurrent writes serialize instead of clobbering each other', async () => {
+  test('并发写入串行执行，而不是互相覆盖', async () => {
     const store = await temporaryStore();
     await store.load();
 
-    // Five writers entering at once. If the store did not chain them, each
-    // would snapshot the same empty document and the last rename would win,
-    // leaving one key where five were added.
+    // 五个写入方同时进入。如果存储没有把它们串起来，每个都会对同一份空文档做快照，
+    // 最后一次 rename 胜出，于是添加了五把密钥却只剩一把。
     await Promise.all(
       ['a', 'b', 'c', 'd', 'e'].map((suffix) => store.addKey({ key: `tvly-dev-key-${suffix}-000000000000` })),
     );
 
-    assert.equal(store.keysInOrder().length, 5, 'every add must survive');
+    assert.equal(store.keysInOrder().length, 5, '每次添加都必须留存');
     const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
-    assert.equal(onDisk.keys.length, 5, 'and every add must be on disk');
+    assert.equal(onDisk.keys.length, 5, '并且每次添加都必须落盘');
     assert.deepEqual(
       onDisk.order.slice().sort(),
       onDisk.keys.map((entry) => entry.id).sort(),
-      'the order list must still name exactly the stored keys',
+      'order 列表必须仍然精确列出已存储的密钥',
     );
   });
 
-  test('a failed write does not poison later writes', async () => {
+  test('失败的写入不会毒害后续写入', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
     let fail = true;
     const real = await import('node:fs/promises');
@@ -80,7 +77,7 @@ describe('POOL-6: writes are atomic', () => {
     assert.equal(store.firstUsableKey(), 'tvly-dev-working-bbbbbbbbbbbb');
   });
 
-  test('a rejected mutation leaves neither the file nor memory changed', async () => {
+  test('被拒绝的变更既不改变文件，也不改变内存', async () => {
     const store = await temporaryStore();
     await store.load();
     await store.addKey({ key: 'tvly-dev-original-aaaaaaaaaaaa' });
@@ -92,11 +89,11 @@ describe('POOL-6: writes are atomic', () => {
       });
     }, /changed its mind/u);
 
-    assert.equal(await readFile(store.filePath, 'utf8'), before, 'the file must be untouched');
-    assert.equal(store.keysInOrder().length, 1, 'and so must the in-memory document');
+    assert.equal(await readFile(store.filePath, 'utf8'), before, '文件必须原样未动');
+    assert.equal(store.keysInOrder().length, 1, '内存中的文档也必须原样未动');
   });
 
-  test('an interrupted write leaves the previous file intact', async () => {
+  test('被打断的写入让先前的文件保持完整', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
     let writes = 0;
     const store = new PoolStore({
@@ -122,21 +119,21 @@ describe('POOL-6: writes are atomic', () => {
 
     await assert.rejects(() => store.addKey({ key: 'tvly-dev-second-key-bbbbbbbb' }));
 
-    assert.equal(await readFile(store.filePath, 'utf8'), before, 'the file must be byte-identical');
+    assert.equal(await readFile(store.filePath, 'utf8'), before, '文件必须逐字节相同');
     const entries = await readdir(dir);
-    assert.deepEqual(entries, ['keys.json'], 'the abandoned temporary must be cleaned up');
+    assert.deepEqual(entries, ['keys.json'], '被遗弃的临时文件必须清理掉');
   });
 });
 
-describe('POOL-7: a damaged file is reported, not thrown', () => {
-  test('a missing file is a normal first run', async () => {
+describe('POOL-7：文件损坏时只上报，不抛出', () => {
+  test('文件不存在属于正常的首次运行', async () => {
     const store = await temporaryStore();
     await store.load();
     assert.equal(store.loadError, undefined);
     assert.deepEqual(store.keysInOrder(), []);
   });
 
-  test('invalid JSON starts empty and keeps the file untouched', async () => {
+  test('JSON 非法时以空池启动，并保持文件原样未动', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
     const filePath = join(dir, 'keys.json');
     await writeFile(filePath, '{ this is not json', 'utf8');
@@ -145,11 +142,11 @@ describe('POOL-7: a damaged file is reported, not thrown', () => {
 
     assert.ok(store.loadError instanceof PoolFileError);
     assert.equal(store.loadError.reason, 'malformed');
-    assert.deepEqual(store.keysInOrder(), [], 'the plugin must still work, with an empty pool');
-    assert.equal(await readFile(filePath, 'utf8'), '{ this is not json', 'the original must be preserved');
+    assert.deepEqual(store.keysInOrder(), [], '插件必须仍以空池工作');
+    assert.equal(await readFile(filePath, 'utf8'), '{ this is not json', '原文件必须保留');
   });
 
-  test('a schema mismatch starts empty and keeps the file untouched', async () => {
+  test('schema 不匹配时以空池启动，并保持文件原样未动', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
     const filePath = join(dir, 'keys.json');
     const original = JSON.stringify({ version: 99, keys: 'not an array' });
@@ -162,8 +159,8 @@ describe('POOL-7: a damaged file is reported, not thrown', () => {
   });
 });
 
-describe('pool document validation', () => {
-  test('accepts a well-formed document', () => {
+describe('密钥池文档校验', () => {
+  test('接受形状良好的文档', () => {
     const document = validatePool({
       version: 1,
       keys: [{ id: 'a', key: 'tvly-dev-aaaaaaaaaaaaaaaa', disabled: false }],
@@ -174,23 +171,23 @@ describe('pool document validation', () => {
     assert.equal(document.keys.length, 1);
   });
 
-  test('repairs a stale order list instead of discarding the keys', () => {
+  test('修复陈旧的 order 列表，而不是丢弃密钥', () => {
     const document = validatePool({
       version: 1,
       keys: [{ id: 'a', key: 'k-a' }, { id: 'b', key: 'k-b' }],
       order: ['b', 'ghost', 'b'],
     });
-    assert.deepEqual(document.order, ['b', 'a'], 'unknown ids drop, missing ids append, duplicates collapse');
+    assert.deepEqual(document.order, ['b', 'a'], '未知 id 丢弃，缺失 id 追加，重复项折叠');
   });
 
-  test('rejects a key with no id', () => {
+  test('拒绝没有 id 的密钥', () => {
     assert.throws(
       () => validatePool({ version: 1, keys: [{ key: 'k' }], order: [] }),
       /has no id/u,
     );
   });
 
-  test('rejects a key with no key material', () => {
+  test('拒绝没有密钥内容的密钥', () => {
     assert.throws(
       () => validatePool({ version: 1, keys: [{ id: 'a', key: '' }], order: ['a'] }),
       /has no key/u,
@@ -198,32 +195,32 @@ describe('pool document validation', () => {
   });
 });
 
-describe('POOL-3: masking', () => {
-  test('shows enough to recognize a key and not enough to use it', () => {
+describe('POOL-3：脱敏', () => {
+  test('展示的信息足以认出密钥，但不足以使用它', () => {
     const masked = maskKey('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');
     assert.equal(masked, 'tvly-dev-…iJWq');
-    assert.equal(masked.includes('U03Fq7'), false, 'the middle must not survive');
+    assert.equal(masked.includes('U03Fq7'), false, '中间部分不得留存');
   });
 
-  test('masks a short key without revealing a usable prefix', () => {
+  test('脱敏短密钥时不泄露可用的前缀', () => {
     assert.equal(maskKey('tvly-abc'), 'tv…c');
   });
 
-  test('the masked list never carries plaintext', async () => {
+  test('脱敏列表绝不携带明文', async () => {
     const store = await temporaryStore();
     await store.load();
     const secret = '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';
     await store.addKey({ key: secret, label: 'primary' });
 
     const serialized = JSON.stringify(store.maskedList());
-    assert.equal(serialized.includes(secret), false, 'plaintext must not appear in the panel view');
-    assert.equal(serialized.includes('U03Fq7'), false, 'nor any long interior slice of it');
+    assert.equal(serialized.includes(secret), false, '明文不得出现在面板视图里');
+    assert.equal(serialized.includes('U03Fq7'), false, '也不得出现其中任何一段较长的中间片段');
     assert.match(serialized, /tvly-dev-…iJWq/u);
   });
 });
 
-describe('key selection for issue 01', () => {
-  test('uses the first enabled key in user order', async () => {
+describe('issue 01 的密钥选择', () => {
+  test('按用户顺序使用第一把启用的密钥', async () => {
     const store = await temporaryStore();
     await store.load();
     const first = await store.addKey({ key: 'tvly-dev-first-aaaaaaaaaaaa' });
@@ -238,7 +235,7 @@ describe('key selection for issue 01', () => {
     assert.equal(store.firstUsableKey(), 'tvly-dev-second-bbbbbbbbbbbb');
   });
 
-  test('reports no key when the pool is empty', async () => {
+  test('池为空时报告没有密钥', async () => {
     const store = await temporaryStore();
     await store.load();
     assert.equal(store.firstUsableKey(), undefined);
