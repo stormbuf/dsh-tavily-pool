@@ -324,6 +324,75 @@ describe('POOL-4：增删改启停排序即时落盘', () => {
     assert.deepEqual(store.statsOf('key-id'), { calls: 1 }, '内存状态仍然更新：调度决策读的是它');
   });
 
+  test('失败的编辑整体回滚，内存与磁盘仍一致', async () => {
+    // 编辑落盘失败时不能只改内存：那会留下一份重启就消失的密钥池，而面板此刻显示的
+    // 正是它。回滚之后两边都停在编辑之前的状态。
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
+    const real = await import('node:fs/promises');
+    let writes = 0;
+    const store = new PoolStore({
+      dir,
+      fileName: 'keys.json',
+      fs: {
+        ...real,
+        writeFile: async (...args) => {
+          writes += 1;
+          // 第一次写入建立初始文件，之后的那次编辑写入失败。
+          if (writes === 2) throw new Error('simulated edit failure');
+          return real.writeFile(...args);
+        },
+      },
+    });
+    await store.load();
+    const record = await store.addKey({ key: 'tvly-dev-base-aaaaaaaaaaaa' });
+
+    await assert.rejects(() => store.setDisabled(record.id, true), /simulated edit failure/u);
+
+    assert.equal(store.maskedList()[0].disabled, false, '失败的那次编辑不生效');
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    assert.equal(onDisk.keys[0].disabled, false, '磁盘上也不生效（不是只活了在内存里）');
+  });
+
+  test('失败的编辑不被后续写入连带回滚，两者最终都与磁盘一致', async () => {
+    // 回滚必须只撤掉**这一次编辑**：若同一条队列上已有别的写入接管了文档，无条件
+    // 回滚会把它们的成果一起抹掉，而它们要么已经写好、要么即将写好——磁盘与内存从此
+    // 不一致，且内存里少掉的那次统计再也不会自己回来。
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
+    const real = await import('node:fs/promises');
+    let writes = 0;
+    const store = new PoolStore({
+      dir,
+      fileName: 'keys.json',
+      fs: {
+        ...real,
+        writeFile: async (...args) => {
+          writes += 1;
+          if (writes === 2) throw new Error('simulated edit failure');
+          return real.writeFile(...args);
+        },
+      },
+    });
+    await store.load();
+    const record = await store.addKey({ key: 'tvly-dev-base-aaaaaaaaaaaa' });
+
+    const editing = store.setDisabled(record.id, true);
+    // 先接上拒绝处理，否则 Node 会把它报成 unhandledRejection。
+    const editingSettled = editing.then(() => undefined, (error) => error);
+    await store.writeStats(record.id, () => ({ calls: 5 }));
+
+    assert.match(String((await editingSettled).message), /simulated edit failure/u);
+    assert.equal(store.statsOf(record.id).calls, 5, '并发写入的统计不得被回滚抹掉');
+
+    // 关键断言：内存与磁盘必须一致——无论那次编辑最终生效与否。
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    assert.equal(
+      store.maskedList()[0].disabled,
+      onDisk.keys[0].disabled,
+      '两次写入都排在同一队列上，最终状态必须两边一致',
+    );
+    assert.equal(store.statsOf(record.id).calls, onDisk.stats[record.id].calls);
+  });
+
   test('编辑与统计写入并发时不丢更新，内存与磁盘最终一致', async () => {
     // 面板的编辑（`update`）与搜索的记账（`writeStats`）写的是同一份文档。两条路径若
     // 一条同步、一条等落盘之后才改内存，慢的那条就会把快的那条的成果覆盖掉——症状是
