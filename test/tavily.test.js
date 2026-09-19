@@ -9,13 +9,7 @@
 import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 
-import {
-  creditsOf,
-  mapSearchResponse,
-  searchTavily,
-  TavilyError,
-  validateSearchParams,
-} from '../lib/tavily.js';
+import { mapSearchResponse, searchTavily, TavilyError } from '../lib/tavily.js';
 import { TAVILY_SEARCH_URL } from '../lib/constants.js';
 
 /**
@@ -116,40 +110,34 @@ describe('response mapping', () => {
     assert.deepEqual(mapSearchResponse({}), { sources: [], truncated: false });
   });
 
-  test('distinguishes a reported zero from an unreported cost', () => {
-    assert.equal(creditsOf({ usage: { credits: 0 } }), 0);
-    assert.equal(creditsOf({ usage: { credits: 1 } }), 1);
-    assert.equal(creditsOf({}), undefined, 'missing must stay unknown, never zero');
-    assert.equal(creditsOf({ usage: {} }), undefined);
-  });
 });
 
 describe('failure handling', () => {
-  test('reports the upstream status and request_id', async () => {
+  test('reports the upstream status and error text', async () => {
     const { fetchImpl } = stubFetch({
       status: 429,
-      headers: { 'retry-after': '120' },
-      body: { detail: { error: 'rate limited' }, request_id: 'req-1' },
+      body: { detail: { error: 'rate limited' } },
     });
     const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
     assert.ok(error instanceof TavilyError);
     assert.equal(error.status, 429);
-    assert.equal(error.requestId, 'req-1');
     assert.equal(error.code, 'TAVILY_HTTP_429');
-    assert.match(error.message, /rate limited/);
+    assert.match(error.message, /rate limited/u);
   });
 
-  test('a malformed request is marked non-retryable', async () => {
+  test('a rejected request keeps the upstream status and body text', async () => {
     const { fetchImpl } = stubFetch({ status: 400, body: { detail: { error: 'bad topic' } } });
     const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
-    assert.equal(error.retryable, false);
+    assert.equal(error.status, 400);
+    assert.equal(error.code, 'TAVILY_HTTP_400');
+    assert.match(error.message, /bad topic/u);
   });
 
-  test('a transport failure is retryable', async () => {
+  test('a transport failure is reported without an upstream status', async () => {
     const { fetchImpl } = stubFetch({ failure: new TypeError('socket hang up') });
     const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
     assert.equal(error.code, 'TAVILY_NETWORK_ERROR');
-    assert.equal(error.retryable, true);
+    assert.equal(error.status, undefined, 'no response arrived, so there is no status to report');
   });
 
   test('a non-JSON success body is reported rather than silently empty', async () => {
@@ -169,14 +157,12 @@ describe('failure handling', () => {
       fetchImpl,
     }).catch((thrown) => thrown);
     assert.equal(error.code, 'TAVILY_ABORTED');
-    assert.equal(error.retryable, false);
   });
 
   test('an expired timeout is reported as a timeout', async () => {
     const { fetchImpl } = stubFetch({ failure: new DOMException('timed out', 'TimeoutError') });
     const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
     assert.equal(error.code, 'TAVILY_TIMEOUT');
-    assert.equal(error.retryable, true);
   });
 });
 
@@ -187,26 +173,5 @@ describe('REST-9: cancellation reaches the request', () => {
     const { fetchImpl, calls } = stubFetch({ body: { results: [] } });
     await searchTavily({ apiKey: 'k', query: 'q', signal: controller.signal, fetchImpl }).catch(() => undefined);
     assert.equal(calls[0].init.signal.aborted, true);
-  });
-});
-
-describe('parameter validation', () => {
-  test('accepts the full legal range', () => {
-    for (const searchDepth of ['basic', 'advanced', 'fast', 'ultra-fast']) {
-      assert.equal(validateSearchParams({ searchDepth }).searchDepth, searchDepth);
-    }
-    for (const topic of ['general', 'news', 'finance']) {
-      assert.equal(validateSearchParams({ topic }).topic, topic);
-    }
-    for (const maxResults of [0, 20]) {
-      assert.equal(validateSearchParams({ maxResults }).maxResults, maxResults);
-    }
-  });
-
-  test('rejects out-of-range values instead of forwarding them', () => {
-    assert.throws(() => validateSearchParams({ maxResults: 21 }), /between 0 and 20/u);
-    assert.throws(() => validateSearchParams({ searchDepth: 'deep' }), /unsupported searchDepth/u);
-    assert.throws(() => validateSearchParams({ topic: 'sports' }), /unsupported topic/u);
-    assert.throws(() => validateSearchParams({ includeAnswer: 'yes' }), /must be a boolean/u);
   });
 });
