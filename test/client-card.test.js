@@ -430,7 +430,58 @@ describe('PANEL-2：零构建产物可被加载', () => {
     assert.match(source, /typeof document !== 'undefined'/u);
     assert.match(source, /tag\.dataset\.pluginCss = 'dsh-tavily-pool\/card'/u);
   });
+
+  test('CSS 里没有重复的选择器：重名会让后一条悄悄改掉前一条的样式', async () => {
+    // `19` 的第一版把弹层类名写成了 `.dtp-mask`——那已经是密钥行里掩码文本的类名
+    // （`.dtp-mask{font-family:ui-monospace…}`）。于是 `position:fixed;inset:0` 也被套到每把
+    // 密钥的掩码上：真机上每把密钥都变成一层全屏黑遮罩，页面被压暗、点击被吞，弹框关掉之后
+    // 依然卡着。本文件看不见渲染，但「同一个选择器写了两遍」这件事在这里就能被抓住。
+    const { source } = await loadBundle();
+    const selectors = cssSelectors(source);
+    const seen = new Set();
+    const duplicates = selectors.filter((selector) => {
+      if (seen.has(selector)) return true;
+      seen.add(selector);
+      return false;
+    });
+
+    assert.deepEqual(duplicates, [], `这些选择器写了两遍：${duplicates.join('、')}`);
+  });
+
+  test('JS 里用到的每一个 dtp- 类名都在 CSS 里有定义', async () => {
+    // 反过来守一遍：改了类名却漏改另一边时，元素会静默地退回无样式（`19` 修重名时就要求
+    // 两边一起改）。模板字符串拼出来的类名扫不到，因此这条只覆盖字面量——漏检是安全的，
+    // 误报才不是。
+    const { source } = await loadBundle();
+    const defined = new Set(
+      cssSelectors(source)
+        .flatMap((selector) => selector.split(/[\s>+~]+/u))
+        .map((part) => part.replace(/^\./u, '').split(':')[0])
+        .filter((name) => name.startsWith('dtp-')),
+    );
+    const used = new Set();
+    for (const match of source.matchAll(/className: '([^']*)'/gu)) {
+      for (const name of match[1].split(' ')) if (name.startsWith('dtp-')) used.add(name);
+    }
+    assert.notEqual(used.size, 0, '一个类名都没扫到，说明扫描规则已经与源码脱节');
+
+    const missing = [...used].filter((name) => !defined.has(name));
+    assert.deepEqual(missing, [], `这些类名没有对应的 CSS：${missing.join('、')}`);
+  });
 });
+
+/**
+ * 从 bundle 源码里取出 `CSS` 常量里的全部选择器（已去掉注释、拆开选择器组）。
+ *
+ * @param source - `lib/client.js` 的源码。
+ * @returns 选择器字符串数组。
+ */
+function cssSelectors(source) {
+  const css = /const CSS = `([\s\S]*?)`\.trim\(\);/u.exec(source)[1];
+  return [...css.replaceAll(/\/\*[\s\S]*?\*\//gu, '').matchAll(/([^{}]+)\{/gu)]
+    .flatMap((match) => match[1].split(',').map((part) => part.trim()))
+    .filter((selector) => selector.length > 0);
+}
 
 describe('PANEL-1：卡片注册进 settings.plugin.item', () => {
   test('slot 名、key、locale 三者配对，key 与 settings 命名空间逐字相同', async () => {
@@ -690,14 +741,14 @@ describe('POOL-8：批量添加', () => {
       globals: { document: documentStub() },
       hooks: { ui: openUi(), draft: readyDraft() },
     });
-    const mask = flatten(component({ t })).find((element) => element.props?.className === 'dtp-mask');
-    assert.notEqual(mask, undefined);
+    const overlay = flatten(component({ t })).find((element) => element.props?.className === 'dtp-overlay');
+    assert.notEqual(overlay, undefined);
 
     const inside = {};
-    mask.props.onClick({ target: inside, currentTarget: {} });
+    overlay.props.onClick({ target: inside, currentTarget: {} });
     assert.equal(uiAfter(updates, openUi()).batchOpen, true, '面板内部的点击会冒泡到遮罩，不能因此关掉弹框');
 
-    mask.props.onClick({ target: inside, currentTarget: inside });
+    overlay.props.onClick({ target: inside, currentTarget: inside });
     assert.equal(uiAfter(updates, openUi()).batchOpen, false);
   });
 
