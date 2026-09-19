@@ -51,10 +51,17 @@ const SEED_MODULES = Object.freeze([
   '@deepseek-ai/dsh-client-ui-dockkit',
 ]);
 
-/** 卡片用到的 `Switch` 替身：把收到的属性原样记进元素树。 */
-function switchStub(props) {
-  return { type: 'Switch', props };
+/**
+ * 宿主原语的替身：把收到的属性与子节点原样记进元素树。
+ *
+ * 三个都要有——缺了 `Tag` 或那个箭头，`h(undefined, ...)` 会造出一个 `type` 为 undefined
+ * 的元素，于是「未保存标记」这类断言会因为替身不全而失败，而不是因为卡片没渲染它。
+ */
+function primitiveStub(name) {
+  return (props, ...children) => ({ type: name, props: props ?? {}, children: children.flat(Infinity) });
 }
+
+const switchStub = primitiveStub('Switch');
 
 /**
  * 一个够用的 React 替身。
@@ -126,7 +133,11 @@ function instantiate(registration, options = {}) {
   const { react, effects } = reactStub(options.hooks);
   const modules = {
     react,
-    '@deepseek-ai/dsh-client-ui-primitives': { Switch: switchStub },
+    '@deepseek-ai/dsh-client-ui-primitives': {
+      Switch: switchStub,
+      Tag: primitiveStub('Tag'),
+      IconChevronDownOutline14: primitiveStub('IconChevronDownOutline14'),
+    },
   };
   const require = (specifier) => {
     requested.push(specifier);
@@ -239,7 +250,14 @@ function readyUi(stateOverrides = {}) {
     renameText: '',
     newKey: '',
     newLabel: '',
+    // 渲染用例一律以**展开**态断言主体内容；收起态另有专门的用例。
+    expanded: true,
   };
+}
+
+/** 与 {@link readyUi} 相同，但卡片处于收起态（即首次渲染时的默认态）。 */
+function collapsedUi(stateOverrides = {}) {
+  return { ...readyUi(stateOverrides), expanded: false };
 }
 
 /** 与 `sampleState().settings` 一致的草稿。 */
@@ -400,13 +418,23 @@ describe('PANEL-2、PANEL-3：卡片自绘控件，只复用已核实的基础�
     assert.deepEqual(switches.map((element) => element.props.checked), [true, false]);
   });
 
-  test('表单字段与列表控件都是自绘的（input / select / button / ul / section）', async () => {
-    const { component, t } = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
+  test('表单字段与列表控件都是自绘的（input / select / button / ul / li）', async () => {
+    const { component, t } = await mountedCard({
+      hooks: { ui: readyUi({ keys: [keyRecord()] }), draft: readyDraft() },
+    });
     const types = new Set(flatten(component({ t })).map((element) => element.type));
 
-    for (const tag of ['section', 'input', 'select', 'button', 'ul']) {
+    for (const tag of ['li', 'input', 'select', 'button', 'ul']) {
       assert.equal(types.has(tag), true, `卡片应当自绘 <${tag}>`);
     }
+  });
+
+  test('卡片外壳是 li：这一页把卡片渲染进 ul，内置卡片返回的也是 li', async () => {
+    const { component, t } = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
+
+    const shell = flatten(component({ t }))[0];
+    assert.equal(shell.type, 'li');
+    assert.match(shell.props.className, /dtp-card/u);
   });
 
   test('池里有密钥时渲染成列表项', async () => {
@@ -414,7 +442,11 @@ describe('PANEL-2、PANEL-3：卡片自绘控件，只复用已核实的基础�
       hooks: { ui: readyUi({ keys: [keyRecord()] }), draft: readyDraft() },
     });
 
-    assert.equal(flatten(component({ t })).filter((element) => element.type === 'li').length, 1);
+    // 卡片外壳本身也是一个 `li`，因此按类名断言**密钥行**，而不是数 `li` 的个数。
+    assert.equal(
+      flatten(component({ t })).filter((element) => element.props?.className === 'dtp-key').length,
+      1,
+    );
   });
 
   test('不引用宿主未导出的表单原语', async () => {
@@ -430,15 +462,79 @@ describe('PANEL-2、PANEL-3：卡片自绘控件，只复用已核实的基础�
     }
   });
 
-  test('只从 primitives 取用已核实的组件', async () => {
+  test('只从 primitives 取用已核实的那三个组件', async () => {
+    // `PANEL-3` 明文点名的三个：`Switch`（开关）、`Tag`（未保存标记）、
+    // `IconChevronDownOutline14`（卡片的展开箭头，宿主自己的卡片用的就是它）。
+    // 换成别的宿主原语必须先确认它在种子表里，因此这条清单是白名单而不是随口一列。
     const source = await readFile(CLIENT_FILE, 'utf8');
     const used = new Set();
     for (const match of source.matchAll(/primitives\.([A-Za-z][A-Za-z0-9]*)/gu)) used.add(match[1]);
-    assert.deepEqual([...used], ['Switch'], '除 Switch 之外不要引入更多宿主原语');
+    assert.deepEqual([...used].sort(), ['IconChevronDownOutline14', 'Switch', 'Tag']);
   });
 });
 
 describe('PANEL-5：卡片渲染出中英双语文案', () => {
+  test('默认收起：收起时只有标题行，主体控件一个都不渲染', async () => {
+    // 设置页里内置的每一张卡片都是收起的；一张常开的卡片既突兀又占地方。收起态仍要说清
+    // 「接管开没开、池里有几把密钥」，因此摘要行是必需的，而不是装饰。
+    const { component, t } = await mountedCard({
+      hooks: { ui: collapsedUi({ keys: [keyRecord()] }), draft: readyDraft() },
+    });
+
+    const tree = component({ t });
+    const types = new Set(flatten(tree).map((element) => element.type));
+
+    assert.equal(types.has('input'), false, '收起时不该渲染输入框');
+    assert.equal(types.has('select'), false, '收起时不该渲染下拉');
+    assert.equal(types.has('ul'), false, '收起时不该渲染密钥列表');
+
+    const texts = textsOf(tree);
+    assert.equal(texts.includes('Tavily 密钥池'), true, '标题始终可见');
+    assert.equal(texts.includes('已接管搜索 · 1 把密钥'), true, '摘要行要说清当前状态');
+  });
+
+  test('标题行是一个 aria-expanded 的按钮，点一下才展开', async () => {
+    const { component, t } = await mountedCard({ hooks: { ui: collapsedUi(), draft: readyDraft() } });
+
+    const header = flatten(component({ t })).find((element) => element.props?.className === 'dtp-header');
+    assert.notEqual(header, undefined);
+    assert.equal(header.type, 'button');
+    assert.equal(header.props['aria-expanded'], false);
+    assert.match(String(header.props['aria-label']), /展开/u);
+  });
+
+  test('摘要行跟着开关与密钥数走，而不是一句固定文案', async () => {
+    const off = await mountedCard({
+      hooks: { ui: collapsedUi(), draft: { ...readyDraft(), searchEnabled: false } },
+    });
+    assert.equal(textsOf(off.component({ t: off.t })).includes('搜索已关闭 · 尚无密钥'), true);
+
+    const many = await mountedCard({
+      hooks: { ui: collapsedUi({ keys: [keyRecord(), keyRecord({ id: 'key-2' })] }), draft: readyDraft() },
+    });
+    assert.equal(textsOf(many.component({ t: many.t })).includes('已接管搜索 · 2 把密钥'), true);
+  });
+
+  test('诊断块**始终可见**，收起也藏不住', async () => {
+    // 收起状态藏掉一条「密钥池文件坏了」比不显示它更糟。
+    const { component, t } = await mountedCard({
+      hooks: {
+        ui: collapsedUi({ poolError: { message: 'not valid JSON', path: '/tmp/keys.json', reason: 'malformed' } }),
+        draft: readyDraft(),
+      },
+    });
+
+    assert.equal(textsOf(component({ t })).some((text) => text.includes('not valid JSON')), true);
+  });
+
+  test('有未保存改动时标题行带标记，且标题行是唯一的入口', async () => {
+    const { component, t } = await mountedCard({
+      hooks: { ui: collapsedUi(), draft: { ...readyDraft(), searchDepth: 'advanced' } },
+    });
+
+    assert.equal(textsOf(component({ t })).includes('有未保存的改动'), true);
+  });
+
   test('初始渲染显示加载中', async () => {
     const { component, t } = await mountedCard();
 
