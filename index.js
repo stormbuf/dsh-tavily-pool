@@ -41,6 +41,7 @@ import { TavilyFetchProvider } from './lib/dsh/fetch-provider.js';
 import { resolveStateDir } from './lib/dsh/home-path.js';
 import { bindHostServices, hostView } from './lib/dsh/host-services.js';
 import { registerPanelRoutes } from './lib/dsh/panel-routes.js';
+import { ensurePoolLoaded } from './lib/dsh/pool-load.js';
 import { registerFetchProvider, registerSearchProvider } from './lib/dsh/register.js';
 import { TavilySearchProvider } from './lib/dsh/search-provider.js';
 import { readPluginSettings, registerSettings } from './lib/dsh/settings.js';
@@ -334,7 +335,7 @@ async function search(state, request, signal) {
     return fallbackToOfficial(state, request, signal, `the Tavily search toggle is off (${SETTINGS_NAMESPACE})`);
   }
 
-  await ensureLoaded(state);
+  await ensurePoolLoaded(state);
 
   // 密钥池文件存在但不可信（`POOL-7`）：按空池继续，因此直接落进下面的「没有候选」
   // 分支去回落。**这条线索只报告一次**——文件坏掉是个持续状态，每一次搜索都刷同一条
@@ -438,7 +439,7 @@ async function fetchUrl(state, request, signal) {
     return fallbackToOfficialFetch(state, request, signal, `the Tavily fetch toggle is off (${SETTINGS_NAMESPACE})`);
   }
 
-  await ensureLoaded(state);
+  await ensurePoolLoaded(state);
 
   // 与搜索同一条线索、同一份去重：坏掉的密钥池文件每次都重读，因此按**消息文本**而不是
   // 错误对象去重；两个开关各自看到它时也只留一条日志。
@@ -698,29 +699,9 @@ function attemptTimeoutMs(deadlineMs) {
 }
 
 /**
- * 加载密钥池；失败与「读到一份不可信的文件」两种情况都会在下次搜索时重试。
+ * 加载密钥池；失败与「读到一份不可信的文件」两种情况都会在下次调用时重试。
  *
- * 记忆化是必要的（每个请求都读一次盘毫无意义），但有两种结果**不能**被记住：
- *
- * 1. **拒绝**（读盘本身失败）：一次临时性的文件系统故障不该让该进程此后每一次搜索都
- *    注定失败。
- * 2. **`loadError`**（文件读到了，但内容是坏的）：`load()` 对这种情况**不抛错**——它
- *    按 `POOL-7` 以空池继续，把问题挂在 `loadError` 上。于是「成功兑现」这个事实会
- *    把记忆化钉死，用户手工修好 `keys.json` 之后插件仍会一直用那份空池，直到重启。
- *    提交 `05`/`06` 之前这不成为症状（坏文件每次都抛错，用户看得见），现在它表现为
- *    「我修好了文件，搜索却还是不走 Tavily」，因此必须在这里放开。
- *
- * @param state - 插件运行时状态。
- * @returns 加载完成的 promise。
+ * 实现在 `lib/dsh/pool-load.js`，因为**面板路径也要用它**：面板此前从不触发加载，于是进程
+ * 重启后只要还没搜索过，面板读到的就是空的内存池，而它写的时候用的也是那份空池——一次
+ * 「添加密钥」会把磁盘上原有的密钥全部抹掉（ticket `21`）。
  */
-async function ensureLoaded(state) {
-  state.poolLoad ??= state.pool.load().then((pool) => {
-    if (pool.loadError !== undefined) state.poolLoad = undefined;
-    return pool;
-  }, (error) => {
-    // 丢掉失败的 promise，让下一次搜索重新读取。
-    state.poolLoad = undefined;
-    throw error;
-  });
-  await state.poolLoad;
-}

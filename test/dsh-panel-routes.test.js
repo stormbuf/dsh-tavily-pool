@@ -34,6 +34,9 @@ import { settingsSchema } from '../lib/settings.js';
 /** 用例里用到的那把明文密钥。任何响应里出现它，都是 `POOL-3` 的失败。 */
 const SECRET = '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';
 
+/** 第二把，用于「磁盘上本来就有多把」的用例。 */
+const OTHER_SECRET = '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';
+
 /**
  * 一个内存后端的**真实** settings provider。
  *
@@ -568,6 +571,52 @@ describe('index.js 真的把接口接上了', () => {
 
     assert.equal(body.keys.length, 1);
     assert.equal(JSON.stringify(body).includes(SECRET), false);
+  });
+
+  test('重启之后先开面板也读得到密钥（ticket 21）', async () => {
+    // 「重启 dsh 后密钥不见了」：加载是惰性的、且只有搜索与抓取路径会触发它，于是进程重启后
+    // 只要还没搜索过，面板读到的就是空的内存池——而数据一直在文件里。
+    //
+    // 这条用例之所以此前不存在，是因为 `hostWithRoutes()` 每次都从**空 home** 开始：池本来就是
+    // 空的，读不读得到都看不出区别。要抓住它，必须先在磁盘上放一份**非空**的池。
+    const host = await hostWithRoutes();
+    const stateDir = join(host.home, STATE_DIR_NAME);
+    const seeded = await new PoolStore({ dir: stateDir, fileName: KEYS_FILE_NAME }).load();
+    await seeded.addKey({ key: SECRET, label: 'on-disk' });
+    await seeded.addKey({ key: OTHER_SECRET });
+
+    apply(host.ctx, {});
+
+    const { body } = await callJson(host.connection, PANEL_ROUTE_PATHS.state);
+    assert.equal(body.keys.length, 2, '面板必须看到磁盘上已有的密钥');
+    assert.equal(body.keys[0].label, 'on-disk');
+  });
+
+  test('重启之后第一次写入不会抹掉磁盘上已有的密钥（ticket 21）', async () => {
+    // 同一个根因的另一半，而且是会造成**数据丢失**的那一半：内存池为空时写盘，写出去的是
+    // 「空池 + 这次加的那把」。在隔离实例上实测过：磁盘 3 把 → 面板加一把之后只剩 1 把。
+    const host = await hostWithRoutes();
+    const stateDir = join(host.home, STATE_DIR_NAME);
+    const seeded = await new PoolStore({ dir: stateDir, fileName: KEYS_FILE_NAME }).load();
+    await seeded.addKey({ key: SECRET });
+    await seeded.addKey({ key: OTHER_SECRET });
+
+    apply(host.ctx, {});
+
+    const third = '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';
+    const { body } = await callJson(host.connection, PANEL_ROUTE_PATHS.keys, {
+      method: 'POST',
+      body: { action: 'add', key: third },
+    });
+
+    assert.equal(body.keys.length, 3, '面板上应当是 2 + 1');
+    const onDisk = JSON.parse(await readFile(join(stateDir, KEYS_FILE_NAME), 'utf8'));
+    assert.equal(onDisk.keys.length, 3, '磁盘上原有的两把不得被抹掉');
+    assert.deepEqual(
+      onDisk.keys.map((entry) => entry.key).slice(0, 2),
+      [SECRET, OTHER_SECRET],
+      '原有的两把还要保持原来的顺序',
+    );
   });
 
   test('一次请求就能批量添加，行解析与去重都在服务端（POOL-8）', async () => {
