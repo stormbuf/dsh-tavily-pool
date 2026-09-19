@@ -33,7 +33,23 @@ describe('POOL-6：写入是原子的', () => {
     assert.equal(written.order.length, 1);
   });
 
-  test('POOL-2：添加的密钥立即落盘，并发添加也全部留存', async () => {
+  test('POOL-2：添加的密钥立即落盘，重启后仍在', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
+    const store = await new PoolStore({ dir, fileName: 'keys.json' }).load();
+    const secret = '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';
+    await store.addKey({ key: secret, label: 'primary' });
+
+    // 用同一目录新建一个存储，等价于 DSH 重启后重新读盘。
+    const reloaded = await new PoolStore({ dir, fileName: 'keys.json' }).load();
+
+    assert.equal(reloaded.loadError, undefined);
+    assert.equal(reloaded.keysInOrder().length, 1, '重启后密钥仍应存在');
+    assert.equal(reloaded.keysInOrder()[0].key, secret, '明文落盘（POOL-2 允许，POOL-3 只约束出口）');
+    assert.equal(reloaded.maskedList()[0].label, 'primary');
+    assert.equal(JSON.stringify(reloaded.maskedList()).includes(secret), false, '而列表里只有脱敏形式');
+  });
+
+  test('POOL-2：并发添加全部留存，且不互相覆盖', async () => {
     const store = await temporaryStore();
     await store.load();
 

@@ -13,7 +13,7 @@ import test, { describe } from 'node:test';
 
 import { KeyHealth } from '../lib/health.js';
 import { PoolStore } from '../lib/pool.js';
-import { balanceRank, Mutex, Scheduler } from '../lib/scheduler.js';
+import { balanceRank, Mutex, Scheduler, sleep } from '../lib/scheduler.js';
 
 /**
  * 一个带若干密钥的池、挂在它上面的健康状态与调度器。
@@ -203,12 +203,58 @@ describe('SCHED-6：并发不重复选中', () => {
     assert.equal(reloaded.statsOf(second.id).useSeq, 2);
   });
 
+  test('Mutex 真的串行执行：并发进入的任务不交错', async () => {
+    // 这条单独压 `Mutex` 本身，而不是「并发不重复选中」——后者靠的是 `#decide` 同步，
+    // 把 `runExclusive` 换成不串行的实现后它照样通过。互斥是**第二道**保障（防将来有
+    // 人给决策加上 `await`），因此它需要自己的断言；否则那道保障只是注释里的一句话。
+    const mutex = new Mutex();
+    const events = [];
+    const task = (name) => mutex.runExclusive(async () => {
+      events.push(`${name}:enter`);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 5);
+      });
+      events.push(`${name}:exit`);
+    });
+
+    await Promise.all([task('a'), task('b')]);
+
+    assert.deepEqual(
+      events,
+      ['a:enter', 'a:exit', 'b:enter', 'b:exit'],
+      '前一个任务结束之前，后一个不得开始',
+    );
+  });
+
   test('互斥区内的抛错不会毒害后续调用', async () => {
     const mutex = new Mutex();
     await assert.rejects(() => mutex.runExclusive(() => {
       throw new Error('the critical section failed');
     }), /critical section failed/u);
     assert.equal(await mutex.runExclusive(() => 'still works'), 'still works');
+  });
+
+  test('sleep 到点即兑现，且不把信号误报成已中止', async () => {
+    const controller = new AbortController();
+    await sleep(5, controller.signal);
+    assert.equal(controller.signal.aborted, false, '到点兑现不等于被中止');
+  });
+
+  test('sleep 在信号中止时立即兑现，不等满时长', async () => {
+    // 取消必须立刻打断等待：模型取消一次搜索时，插件不能还抱着一个 30 秒的定时器不放。
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const waiting = sleep(30_000, controller.signal);
+    controller.abort();
+    await waiting;
+
+    assert.ok(Date.now() - startedAt < 1_000, '取消必须立刻生效');
+  });
+
+  test('sleep 在信号已经中止时不挂起', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await sleep(30_000, controller.signal);
   });
 
   test('决策本身是同步的，因此并发不可能读到同一份旧快照', async () => {
@@ -275,6 +321,29 @@ describe('SCHED-9：全部冷却时的有界等待', () => {
     const outcome = await scheduler.select({ waitDeadlineMs: now + 60_000 });
     assert.equal(outcome.key.id, record.id, '冷却结束时它重新成为候选');
     assert.equal(now, start + 30_000, '等满了整整 30 秒');
+  });
+
+  test('时钟不前进时最多等一次就返回，不会空转', async () => {
+    // 正常路径靠 sleep 走完墙钟来让冷却到期，因此循环不需要上界。但 `now` 是可注入
+    // 依赖：一旦它不前进，冷却就永远「还没到期」，一个没有上界的循环会一直 sleep 下去。
+    // 等过一次就不再等，把循环上界钉死；代价是时钟异常时退回「不等待」这个保守行为。
+    const frozen = Date.parse('2026-09-19T00:00:00Z');
+    let sleeps = 0;
+    const { health, scheduler, ids } = await harness([{ label: 'cooling' }], {
+      now: () => frozen,
+      sleep: async () => {
+        sleeps += 1;
+      },
+    });
+    await health.recordFailure(ids.cooling, {
+      failure: { status: 429, retryAfter: '60' },
+      nowMs: frozen,
+    });
+
+    const outcome = await scheduler.select({ waitDeadlineMs: frozen + 120_000 });
+
+    assert.equal(outcome.blocked, 'cooling');
+    assert.equal(sleeps, 1, '恰好等一次；再等下去不会有任何新信息');
   });
 
   test('等待期间取消会立即返回', async () => {

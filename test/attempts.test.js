@@ -100,7 +100,13 @@ describe('SCHED-4：失败自动切换', () => {
     assert.deepEqual(calls, [ids.flaky, ids.ok]);
     assert.equal(outcome.keyId, ids.ok);
     assert.equal(health.snapshotOf(ids.flaky).cooling, true, '5xx 归入冷却（REST-11）');
-    assert.equal(health.snapshotOf(ids.flaky).cooldownUntilMs - Date.now() > 30_000, true);
+    // 冷却时长取本地默认值 60 秒。断言写成「落在默认值附近」而不是与真实墙钟做差：
+    // 这个用例没有注入时钟，差值形式会同时依赖 `Date.now()` 与被测代码的取时点。
+    const untilMs = health.snapshotOf(ids.flaky).cooldownUntilMs;
+    assert.ok(
+      untilMs - Date.now() > 30_000 && untilMs - Date.now() <= 60_000,
+      `5xx 用默认退避（60 秒，clamp 到 30–300），实际剩 ${String(untilMs - Date.now())}ms`,
+    );
   });
 
   test('429 的冷却时长取自 Retry-After', async () => {
@@ -390,5 +396,50 @@ describe('SCHED-9：等待预算的折算', () => {
   test('先前的尝试吃掉大半预算之后，等待不再吃掉剩下的全部', async () => {
     const now = 1_000_000;
     assert.equal(waitAllowance(now + 1_000, now), now + 500, '只剩 1 秒时等 0.5 秒');
+  });
+
+  test('等待上限按每次尝试重算，而不是只算一次', async () => {
+    // 先前的尝试会吃掉时间。若上限只算一次，后面的等待就不再满足「留出至少一半剩余
+    // 预算给真正的请求」——而那条约束的理由是「等到了也来不及发出去的等待没有意义」。
+    // 这里用替身调度器直接观察契约：它收到的 `waitDeadlineMs` 必须在每次调用时重新折算。
+    const start = 1_000_000;
+    let now = start;
+    const seen = [];
+    const scheduler = {
+      async select({ waitDeadlineMs }) {
+        // 记下**剩余**允许等待时长，而不是绝对时刻：时间在前进，绝对时刻本来就会变大。
+        seen.push(waitDeadlineMs - now);
+        // 每次选择都「耗时」5 秒，然后返回一个必定失败的候选。
+        now += 5_000;
+        return { key: { id: `k${String(seen.length)}`, key: 'x' } };
+      },
+    };
+    const health = {
+      recordFailure: () => ({ classification: { action: 'cooldown' }, persisted: Promise.resolve() }),
+      recordSuccess: () => Promise.resolve(),
+      snapshotOf: () => ({}),
+    };
+    const invoke = async () => {
+      throw new TavilyError('boom', { code: 'TAVILY_HTTP_500', status: 500 });
+    };
+
+    await runWithFailover({
+      scheduler,
+      health,
+      invoke,
+      deadlineMs: start + 60_000,
+      now: () => now,
+    }).catch(() => undefined);
+
+    assert.equal(seen.length, 3, '三次尝试各要一次上限');
+    assert.ok(
+      seen[0] > seen[1] && seen[1] > seen[2],
+      `剩余允许等待时长必须随预算消耗而收缩：${JSON.stringify(seen)}`,
+    );
+    // 首次：固定 30 秒上限与剩余预算的一半（30 秒）取小 → 30 秒。
+    assert.equal(seen[0], 30_000);
+    // 之后：剩余预算的一半（27.5 秒、25 秒）比固定上限更小，于是由它说了算。
+    assert.equal(seen[1], 27_500);
+    assert.equal(seen[2], 25_000);
   });
 });

@@ -21,6 +21,7 @@ import {
   KeyHealth,
   MAX_COOLDOWN_SECONDS,
   MIN_COOLDOWN_SECONDS,
+  QUOTA_ADVICE,
   parseRetryAfter,
 } from '../lib/health.js';
 import { PoolStore } from '../lib/pool.js';
@@ -111,14 +112,21 @@ describe('状态码分类', () => {
     assert.equal(classifyFailure({ status: 429, retryAfter: 'oops' }).cooldownSeconds, DEFAULT_COOLDOWN_SECONDS);
   });
 
-  test('432 与 433 同等处理，且都给出官方自愈路径', () => {
+  test('432 与 433 同等处理，都不区分账号级与密钥级', () => {
     for (const status of [432, 433]) {
       const classification = classifyFailure({ status, detail: 'limit exceeded' });
       assert.equal(classification.action, FAILURE_ACTIONS.EXHAUSTED, `HTTP ${String(status)}`);
-      assert.match(classification.advice, /Tavily dashboard/u);
-      assert.match(classification.advice, /1st of each month/u);
-      assert.doesNotMatch(classification.advice, /another key/u, '官方指引不是「换一把密钥」');
+      assert.equal(classification.status, status);
     }
+  });
+
+  test('REST-7：自愈文案由 QUOTA_ADVICE 单点给出，指向官方 dashboard 而非换密钥', () => {
+    // 文案是导出常量而不是分类结果里的字段：分类回答「这把密钥怎样了」，而「该做什么」
+    // 由编排层在判定全部候选耗尽后取用。断言压在常量上，因此它一旦漂移就会被发现——
+    // 这也正是它保持唯一副本的意义。
+    assert.match(QUOTA_ADVICE, /Tavily dashboard/u);
+    assert.match(QUOTA_ADVICE, /1st of each month/u);
+    assert.doesNotMatch(QUOTA_ADVICE, /another key|new key/u, '官方指引不是「换一把密钥」');
   });
 
   test('5xx 归入冷却并取本地默认值', () => {

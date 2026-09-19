@@ -65,6 +65,42 @@ describe('失败以宿主自己的错误类型穿过 seam', () => {
     })();
     assert.equal(thrown, original, '只有我们自己的失败会被改写');
   });
+
+  test('REST-10：上游状态码与 request_id 挂在实例上穿过边界', () => {
+    // `WebError` 的构造签名只接 `(message, code, options)`，没有承载上游状态码的形参，
+    // 因此结构化保留只能靠自有属性。少了这一步，`REST-10` 的「保留 request_id」就只剩
+    // 消息文本里那一份，而消费方读的是字段。
+    const thrown = (() => {
+      try {
+        rethrowAsWebError(new TavilyError('Tavily returned HTTP 401: nope', {
+          code: 'TAVILY_HTTP_401',
+          status: 401,
+          requestId: 'req-abc-123',
+        }));
+        return undefined;
+      } catch (error) {
+        return error;
+      }
+    })();
+
+    assert.equal(thrown.status, 401, '上游状态码必须结构化保留');
+    assert.equal(thrown.requestId, 'req-abc-123', 'request_id 必须结构化保留');
+    assert.equal(thrown.code, 'TAVILY_HTTP_401', '机器码不得被改写');
+  });
+
+  test('没有这些事实时不凭空造字段', () => {
+    const thrown = (() => {
+      try {
+        rethrowAsWebError(new TavilyError('timed out', { code: 'TAVILY_TIMEOUT' }));
+        return undefined;
+      } catch (error) {
+        return error;
+      }
+    })();
+
+    assert.equal(thrown.status, undefined, '传输层失败没有上游状态码可报');
+    assert.equal(thrown.requestId, undefined);
+  });
 });
 
 describe('seam 据以解析的提供方契约', () => {
