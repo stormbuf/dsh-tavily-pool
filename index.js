@@ -85,35 +85,48 @@ export function apply(ctx, _config) {
 
   // Everything below is non-critical: if it throws, search still works with
   // whatever state exists, and the failure is recorded for the panel.
+  //
+  // The probe is deliberately outside this `try`: it cannot throw (it reads
+  // through `ctx.get`, which returns `undefined` rather than raising), and
+  // folding it in would let an unrelated initialization fault masquerade as a
+  // capability finding. Only real initialization is guarded here.
+  state.capabilityReport = probeCapabilities({ ctx });
   try {
-    state.capabilityReport = probeCapabilities({ ctx });
-    // Reported whenever anything is missing, not only when a required
-    // capability is: an optional loss is exactly the kind of quiet degradation
-    // that is otherwise discovered much later, from the symptom.
-    reportWarning(ctx, describeMissingCapabilities(state.capabilityReport));
     state.pool = new PoolStore({ dir: resolveStateDir(ctx), fileName: KEYS_FILE_NAME });
   } catch (error) {
     state.initError = error;
-    reportWarning(ctx, `dsh-tavily-pool: initialization failed, continuing with search registered: ${String(error)}`);
+    report(ctx, 'warn', `dsh-tavily-pool: initialization failed, continuing with search registered: ${String(error)}`);
   }
+
+  // Reported whenever anything is missing, not only when a required capability
+  // is: an optional loss is exactly the kind of quiet degradation that is
+  // otherwise discovered much later, from the symptom. Emitted after the pool
+  // is built so one log line reports the whole state.
+  report(ctx, 'warn', describeMissingCapabilities(state.capabilityReport));
 }
 
 /**
- * Log a warning without depending on the logger being injectable here.
+ * Log through the host's logger service, tolerating its absence.
  *
- * `ctx.logger` is a service name, so the context proxy throws on it unless the
- * reading fiber injected it — which would turn "report a degraded capability"
- * into "crash while reporting". The harness collects these findings for the
- * panel anyway, so a missing logger is a reason to stay quiet, not to fail.
+ * `ctx.logger` is an own property of every context (`LoggerService` is
+ * constructed onto it), *not* a provided service — so the reflective
+ * `ctx.get('logger')` returns `undefined` and would silently discard every
+ * message. Reading the property is safe: the context proxy only raises for
+ * names it cannot resolve at all, and this one is always present.
+ *
+ * A missing or hostile logger must never be the reason the plugin fails to
+ * load, so the whole call stays inside a `try` that cannot propagate.
  *
  * @param ctx - plugin context.
- * @param message - the warning text.
+ * @param level - logger method to call.
+ * @param message - the message; an empty string is not logged.
  */
-function reportWarning(ctx, message) {
-  if (message.length === 0) return;
+function report(ctx, level, message) {
+  if (typeof message !== 'string' || message.length === 0) return;
   try {
-    const logger = typeof ctx.get === 'function' ? ctx.get('logger') : undefined;
-    logger?.warn?.(message);
+    const logger = ctx.logger;
+    const write = logger?.[level];
+    if (typeof write === 'function') write.call(logger, message);
   } catch {
     // Logging is best-effort by definition; never let it break initialization.
   }

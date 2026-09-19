@@ -97,15 +97,28 @@ check('first source', result.sources[0].url);
 if (result.content !== undefined) check('provider answer present', `${String(result.content.length)} chars`);
 
 // `available()` is the one contract whose violation is a hard throw rather than
-// a fallback, so assert it explicitly after a live call.
-const provider = ctx.web.searchProviders?.get?.(PROVIDER_ID);
-if (provider !== undefined) {
-  assert.equal(provider.available(), true, 'a pinned provider must always report available');
-  check('available() is still true after a live call');
-}
+// a fallback, so it must be verified without reading the registry — that is
+// private state this plugin is forbidden to touch (COMPAT-6). Registering the
+// same id twice is the public surface that proves ours is in there: the seam
+// refuses duplicates. `registerSearchProvider` throws synchronously.
+const probeCtx = new Context();
+new WebRuntime(probeCtx, { searchProvider: PROVIDER_ID });
+apply(probeCtx, {});
+assert.throws(
+  () => probeCtx.web.registerSearchProvider({ id: PROVIDER_ID, available: () => true, search: async () => ({}) }),
+  (error) => error.code === 'WEB_DUPLICATE_PROVIDER',
+  'registering the same id twice must fail, which proves ours is registered',
+);
+check('the provider id is registered (duplicate registration is refused)');
 
-// And prove the seam would have thrown had it not been pinned, so the check
-// above is not vacuous.
+// The pin resolves our provider through `available()`, so a second live search
+// completing proves it is still `true` after real use.
+const second = await ctx.web.search({ query: 'DeepSeek Harness release notes', maxResults: 1 });
+assert.ok(second.sources.length >= 1, 'a second search through the pin must still resolve');
+check('available() is still true on a second live call');
+
+// And prove the seam would have thrown had the pin pointed at nothing, so the
+// checks above are not vacuous.
 const unpinned = new Context();
 new WebRuntime(unpinned, { searchProvider: 'definitely-not-registered' });
 await assert.rejects(
@@ -113,7 +126,7 @@ await assert.rejects(
   (error) => error.code === 'WEB_PROVIDER_CONFIGURED_MISSING',
   'an unregistered pin must throw WEB_PROVIDER_CONFIGURED_MISSING',
 );
-check('PIN-6 control: an unregistered pin throws WEB_PROVIDER_CONFIGURED_MISSING');
+check('control: an unregistered pin throws WEB_PROVIDER_CONFIGURED_MISSING');
 
 process.stdout.write('seam-check: all live checks passed\n');
 process.exit(0);

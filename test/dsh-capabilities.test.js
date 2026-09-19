@@ -92,6 +92,7 @@ describe('COMPAT-2: the probe names what is missing', () => {
   test('every required capability is genuinely required', () => {
     for (const id of REQUIRED_CAPABILITIES) {
       const host = completeHost();
+      if (id === 'ctx.reflectiveRead') delete host.ctx.get;
       if (id === 'web.registerSearchProvider') delete host.ctx.services.web.registerSearchProvider;
       if (id === 'settings.register') delete host.ctx.services.settings;
       if (id === 'clientModules') delete host.ctx.services.clientModules;
@@ -114,12 +115,20 @@ describe('COMPAT-2: the probe names what is missing', () => {
   test('the probe tolerates a context with no services at all', () => {
     const report = probeCapabilities({ ctx: fakeContext({}) });
     assert.equal(report.ok, false);
-    assert.deepEqual(report.missingRequired, [...REQUIRED_CAPABILITIES]);
+    // The reflective read is present here, so it is the one required capability
+    // that is NOT reported missing.
+    assert.deepEqual(
+      report.missingRequired,
+      REQUIRED_CAPABILITIES.filter((id) => id !== 'ctx.reflectiveRead'),
+    );
   });
 
-  test('the probe tolerates a context with no reflective read at all', () => {
+  test('a host with no reflective read is reported rather than misread as healthy', () => {
+    // Without `ctx.get` nothing else can be read, so the probe must not claim
+    // the rest are present and then let registration fail right after an
+    // "all capabilities present" report.
     const report = probeCapabilities({ ctx: {} });
     assert.equal(report.ok, false);
-    assert.deepEqual(report.missingRequired, [...REQUIRED_CAPABILITIES]);
+    assert.ok(report.missingRequired.includes('ctx.reflectiveRead'));
   });
 });

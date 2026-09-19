@@ -35,6 +35,67 @@ describe('POOL-6: writes are atomic', () => {
     assert.equal(written.order.length, 1);
   });
 
+  test('concurrent writes serialize instead of clobbering each other', async () => {
+    const store = await temporaryStore();
+    await store.load();
+
+    // Five writers entering at once. If the store did not chain them, each
+    // would snapshot the same empty document and the last rename would win,
+    // leaving one key where five were added.
+    await Promise.all(
+      ['a', 'b', 'c', 'd', 'e'].map((suffix) => store.addKey({ key: `tvly-dev-key-${suffix}-000000000000` })),
+    );
+
+    assert.equal(store.keysInOrder().length, 5, 'every add must survive');
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    assert.equal(onDisk.keys.length, 5, 'and every add must be on disk');
+    assert.deepEqual(
+      onDisk.order.slice().sort(),
+      onDisk.keys.map((entry) => entry.id).sort(),
+      'the order list must still name exactly the stored keys',
+    );
+  });
+
+  test('a failed write does not poison later writes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
+    let fail = true;
+    const real = await import('node:fs/promises');
+    const store = new PoolStore({
+      dir,
+      fileName: 'keys.json',
+      fs: {
+        ...real,
+        writeFile: async (...args) => {
+          if (fail) throw new Error('simulated disk failure');
+          return real.writeFile(...args);
+        },
+      },
+    });
+
+    await store.load();
+    await assert.rejects(() => store.addKey({ key: 'tvly-dev-doomed-aaaaaaaaaaaa' }));
+
+    fail = false;
+    await store.addKey({ key: 'tvly-dev-working-bbbbbbbbbbbb' });
+    assert.equal(store.firstUsableKey(), 'tvly-dev-working-bbbbbbbbbbbb');
+  });
+
+  test('a rejected mutation leaves neither the file nor memory changed', async () => {
+    const store = await temporaryStore();
+    await store.load();
+    await store.addKey({ key: 'tvly-dev-original-aaaaaaaaaaaa' });
+    const before = await readFile(store.filePath, 'utf8');
+
+    await assert.rejects(async () => {
+      await store.update(() => {
+        throw new Error('the caller changed its mind');
+      });
+    }, /changed its mind/u);
+
+    assert.equal(await readFile(store.filePath, 'utf8'), before, 'the file must be untouched');
+    assert.equal(store.keysInOrder().length, 1, 'and so must the in-memory document');
+  });
+
   test('an interrupted write leaves the previous file intact', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
     let writes = 0;

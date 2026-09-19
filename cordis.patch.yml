@@ -1,14 +1,23 @@
-# dsh-tavily-pool bundle patch: mount the plugin and pin BOTH web providers to it.
+# dsh-tavily-pool bundle patch: mount the plugin and pin the search provider.
 #
 # ⚠️ `config` on an id-targeted patch REPLACES the whole config object
-# (`cordis-plugin-include` does `target[key] = value`), it does not merge. Both
-# provider fields must therefore be written out together: omitting one leaves it
-# "unconfigured", which silently falls back to auto-selection instead of
-# erroring. This is the exact mistake `dsh-tavily@0.3.1` shipped.
+# (`cordis-plugin-include`'s `applyEntryPatches` does `target[key] = value` for
+# every key of the patch, so assigning `config` discards the previous one
+# entirely). Both provider fields must therefore be written out together:
+# omitting one drops it from the composed row, silently reverting that
+# capability to auto-selection instead of erroring. This is the exact mistake
+# `dsh-tavily@0.3.1` shipped. Verified by running the host's own
+# `applyEntryPatches` against the base row, and by `dsh --profile <p>
+# --dump-config`: a patch writing only `searchProvider` loses `fetchProvider`.
 #
-# To roll back by hand, point both values back at the official providers:
+# `fetchProvider` currently stays on the official HTTP fetcher. Ticket 01 takes
+# over search only; page fetching is ticket 10. Pinning fetch to `tavily` before
+# that provider exists would make every `web_fetch` throw
+# `WEB_PROVIDER_CONFIGURED_MISSING`, which is a regression, not a takeover.
+# Ticket 10 flips this line to `tavily`.
+#
+# To roll back by hand, point the pinned field back at the official provider:
 #   searchProvider: deepseek-official
-#   fetchProvider: http
 # See docs/usage.md ("Manual rollback").
 
 - insert:
@@ -18,4 +27,4 @@
 - id: web
   config:
     searchProvider: tavily
-    fetchProvider: tavily
+    fetchProvider: http

@@ -25,9 +25,11 @@ with the upgrade:
 | `lib/tavily.js` | Tavily REST request/response shapes |
 | `lib/pool.js` | key-pool file, atomic writes, masking |
 
-Later tickets add `lib/scheduler.js`, `lib/health.js`, and `lib/usage.js` on the same
-terms. `test/compat-core.test.js` enforces the rule mechanically — it fails if any of
-these files grows a host import.
+`lib/scheduler.js`, `lib/health.js`, and `lib/usage.js` join this layer as the scheduling,
+failure-classification, and balance-refresh work lands. `test/compat-core.test.js`
+enforces the rule mechanically — it fails if any listed file grows a host import, and it
+asserts the list itself, so creating one of those modules without adding it here fails
+the suite rather than passing silently.
 
 ## Checklist
 
@@ -68,9 +70,16 @@ state. Until then it must keep returning `true`, and every decision must stay in
 **Where:** `cordis-plugin-include/lib/index.js`, function `applyEntryPatches`
 **Then edit:** `cordis.patch.yml`
 
-A patch's `config` is assigned wholesale (`target[key] = value`), not merged. Confirm that
-is still true; if it became a merge, the comment in `cordis.patch.yml` is now wrong (the
-two-field rule would no longer be load-bearing, though writing both is still correct).
+The patch walker assigns each key it finds in the patch (`target[key] = value`), so
+assigning `config` **replaces the whole object**: an omitted field is gone from the
+composed row, not retained from the base layer. Confirm that is still true — verified by
+running the host's own `applyEntryPatches` against the base `web` row and by
+`dsh --profile <p> --dump-config`. If it became a deep merge, the comment in
+`cordis.patch.yml` is now wrong; writing both fields stays correct either way.
+
+> That distinction is what makes omitting a field dangerous: losing an explicit pin lets
+> the seam fall back to auto-selection, where a second usable provider is
+> `WEB_PROVIDER_AMBIGUOUS` rather than the provider the user configured.
 
 ### 4. Context service access — the trap that broke this plugin once
 
@@ -91,7 +100,7 @@ the direct form again.
 ### 5. The fallback targets this plugin constructs directly
 
 **Where:** `dsh-web-search-deepseek` and `dsh-web-fetch-http` — their public exports.
-**Then edit:** `lib/dsh/fallback.js` (added by the toggle/fallback ticket)
+**Then edit:** the adapter module the toggle/fallback ticket adds under `lib/dsh/`
 
 Later tickets construct `DeepSeekSearchProvider` and `HttpFetchProvider` directly, because
 the fallback path is what a user gets when they switch this plugin off. Check:
@@ -108,7 +117,7 @@ the fallback path is what a user gets when they switch this plugin off. Check:
 ### 6. Settings registration
 
 **Where:** `dsh-settings` — `register(ns, schema, options)`.
-**Then edit:** `index.js`, `lib/dsh/settings.js` (added by the settings ticket)
+**Then edit:** `index.js` and whatever settings adapter module the settings ticket adds
 
 Confirm the signature and that duplicate namespace registration still throws. The plugin
 must **not** re-register `web-search-deepseek`: that namespace belongs to the official

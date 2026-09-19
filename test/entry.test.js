@@ -21,8 +21,11 @@ import { MissingHostCapabilityError } from '../lib/dsh/register.js';
  *
  * It mimics the two things the real context does that the plugin depends on:
  * services are read through `get(name)` (the reflective read, which returns
- * `undefined` for an absent service), and `ctx.dshHomePath` is a *service*, not
- * a method on the context object.
+ * `undefined` for an absent service), and `ctx.logger` is an **own property**
+ * of the context rather than a provided service — the real host constructs a
+ * `LoggerService` onto every context, so `ctx.get('logger')` is `undefined`
+ * while `ctx.logger.warn` exists. Getting that wrong is how probe output ends
+ * up silently discarded.
  *
  * `harnessHome` is what the host reports as the harness home; the plugin
  * appends its own state directory name to it, exactly as the real resolver
@@ -31,10 +34,9 @@ import { MissingHostCapabilityError } from '../lib/dsh/register.js';
  * @param options - host shape overrides.
  * @param options.harnessHome - harness home reported by `ctx.dshHomePath`.
  * @param options.omitRegistration - remove the seam's registration function.
- * @param options.omitLogger - remove the logger service.
  * @returns `{ ctx, registered, warnings, registerCalls }`.
  */
-function fakeHost({ harnessHome, omitRegistration = false, omitLogger = false } = {}) {
+function fakeHost({ harnessHome, omitRegistration = false } = {}) {
   const registered = [];
   const warnings = [];
   let registerCalls = 0;
@@ -55,10 +57,14 @@ function fakeHost({ harnessHome, omitRegistration = false, omitLogger = false } 
     connection: { fetch: { register: () => async () => {} } },
     dshHomePath: (...segments) => join(harnessHome ?? '/nonexistent-home/.dsh', ...segments),
   };
-  if (!omitLogger) services.logger = { warn: (message) => warnings.push(String(message)) };
-
-  const ctx = { get: (name) => services[name], services };
   if (omitRegistration) delete services.web.registerSearchProvider;
+
+  const ctx = {
+    get: (name) => services[name],
+    services,
+    // Own property, not a service — deliberately absent from `services`.
+    logger: { warn: (message) => warnings.push(String(message)) },
+  };
 
   return { ctx, registered, warnings, registerCalls: () => registerCalls };
 }
@@ -97,22 +103,36 @@ describe('PIN-5 / hard constraint 5: registration happens first', () => {
   });
 
   test('a failure after registration still leaves the provider registered', () => {
-    const host = fakeHost({ omitLogger: true });
-    // Break a later initialization step the plugin cannot work around. The seam
-    // itself stays intact, which is the case COMPAT-3 is about.
-    const realGet = host.ctx.get;
-    host.ctx.get = (name) => {
-      if (name === 'dshHomePath') throw new Error('simulated host failure');
-      return realGet(name);
+    const host = fakeHost();
+    // Break a later initialization step in a way the plugin cannot swallow:
+    // the state directory cannot be resolved, so `apply()` takes its catch.
+    host.ctx.services.dshHomePath = () => {
+      throw new Error('simulated host failure');
     };
-    apply(host.ctx, {});
+    delete process.env.DSH_HOME;
+    const previousHome = process.env.HOME;
+    process.env.HOME = '';
+
+    try {
+      apply(host.ctx, {});
+    } finally {
+      process.env.HOME = previousHome;
+    }
 
     assert.equal(host.registered.length, 1, 'the provider must survive a broken initialization');
     assert.equal(host.registered[0].available(), true);
+    assert.match(host.warnings.join('\n'), /initialization failed/u, 'and the failure must be reported');
   });
 
   test('a broken logger never becomes the reason search fails', () => {
-    const host = fakeHost({ omitLogger: true });
+    const host = fakeHost();
+    // A logger whose methods throw must not propagate out of apply(): logging is
+    // best-effort, and this runs after the provider is already registered.
+    host.ctx.logger = {
+      warn() {
+        throw new Error('simulated logger failure');
+      },
+    };
     assert.doesNotThrow(() => {
       apply(host.ctx, {});
     });
