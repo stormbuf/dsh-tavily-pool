@@ -97,8 +97,8 @@ describe('COMPAT-2: the probe names what is missing', () => {
       if (id === 'settings.register') delete host.ctx.services.settings;
       if (id === 'clientModules') delete host.ctx.services.clientModules;
       const report = probeCapabilities(host);
-      assert.equal(report.ok, false, `removing ${id} should fail the probe`);
-      assert.ok(report.missingRequired.includes(id), `${id} should be reported missing`);
+      assert.equal(report.ok, false, `移除 ${id} 应当使探测失败`);
+      assert.ok(report.missingRequired.includes(id), `${id} 应当被报告为缺失`);
     }
   });
 
@@ -107,7 +107,7 @@ describe('COMPAT-2: the probe names what is missing', () => {
     delete host.ctx.services.dshHomePath;
     delete host.ctx.services.connection;
     const report = probeCapabilities(host);
-    assert.equal(report.ok, true, 'optional capabilities must not block loading');
+    assert.equal(report.ok, true, '可选能力不得阻碍加载');
     assert.deepEqual(report.missingOptional, ['dshHomePath', 'connection.fetch.register']);
     assert.match(describeMissingCapabilities(report), /\[optional\] dshHomePath/);
   });
