@@ -74,7 +74,7 @@ describe('POOL-6：写入是原子的', () => {
 
     fail = false;
     await store.addKey({ key: 'tvly-dev-working-bbbbbbbbbbbb' });
-    assert.equal(store.firstUsableKey(), 'tvly-dev-working-bbbbbbbbbbbb');
+    assert.deepEqual(store.keysInOrder().map((entry) => entry.key), ['tvly-dev-working-bbbbbbbbbbbb']);
   });
 
   test('被拒绝的变更既不改变文件，也不改变内存', async () => {
@@ -219,25 +219,165 @@ describe('POOL-3：脱敏', () => {
   });
 });
 
+describe('POOL-4：增删改启停排序即时落盘', () => {
+  test('停用一把密钥会立即写入文件，并保留它的统计', async () => {
+    const store = await temporaryStore();
+    await store.load();
+    const first = await store.addKey({ key: 'tvly-dev-first-aaaaaaaaaaaa', label: 'primary' });
+    await store.addKey({ key: 'tvly-dev-second-bbbbbbbbbbbb' });
+
+    await store.update((document) => {
+      document.stats[first.id] = { calls: 3, successes: 2, failures: 1 };
+      return document;
+    });
+    await store.setDisabled(first.id, true);
+
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    const stored = onDisk.keys.find((entry) => entry.id === first.id);
+    assert.equal(stored.disabled, true, '停用必须立即落盘');
+    assert.equal(onDisk.stats[first.id].calls, 3, '停用不丢统计（POOL-5）');
+    assert.equal(stored.label, 'primary');
+  });
+
+  test('改备注会立即落盘，清空备注则删掉该字段', async () => {
+    const store = await temporaryStore();
+    await store.load();
+    const record = await store.addKey({ key: 'tvly-dev-aaaaaaaaaaaaaaaa' });
+
+    await store.rename(record.id, 'backup');
+    assert.equal(store.keysInOrder()[0].label, 'backup');
+
+    await store.rename(record.id, '');
+    assert.equal('label' in store.keysInOrder()[0], false, '空备注表示没有备注');
+  });
+
+  test('删除一把密钥会连同它的统计与余额缓存一起移除', async () => {
+    const store = await temporaryStore();
+    await store.load();
+    const doomed = await store.addKey({ key: 'tvly-dev-doomed-aaaaaaaaaaaa' });
+    await store.addKey({ key: 'tvly-dev-kept-bbbbbbbbbbbb' });
+    await store.update((document) => {
+      document.stats[doomed.id] = { calls: 1 };
+      document.usageCache[doomed.id] = { key: { limit: 10, usage: 1 } };
+      return document;
+    });
+
+    const removed = await store.removeKey(doomed.id);
+
+    assert.equal(removed.id, doomed.id);
+    assert.equal(removed.masked.includes('doomed'), false, '返回的也是脱敏记录');
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    assert.deepEqual(onDisk.keys.map((entry) => entry.id), [store.keysInOrder()[0].id]);
+    assert.equal(onDisk.order.includes(doomed.id), false, 'order 里不得留下幽灵条目');
+    assert.equal(doomed.id in onDisk.stats, false, '统计随密钥一起删除');
+    assert.equal(doomed.id in onDisk.usageCache, false, '余额缓存随密钥一起删除');
+  });
+
+  test('重排按给定顺序落盘，未提到的密钥保持相对次序排在后面', async () => {
+    const store = await temporaryStore();
+    await store.load();
+    const first = await store.addKey({ key: 'tvly-dev-first-aaaaaaaaaaaa' });
+    const second = await store.addKey({ key: 'tvly-dev-second-bbbbbbbbbbbb' });
+    const third = await store.addKey({ key: 'tvly-dev-third-cccccccccccc' });
+
+    const order = await store.reorder([third.id, 'ghost-id', first.id]);
+
+    assert.deepEqual(order, [third.id, first.id, second.id], '未知 id 丢弃，未提到的追加');
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    assert.deepEqual(onDisk.order, order);
+  });
+
+  test('编辑不存在的密钥会被拒绝，且不改动文件', async () => {
+    const store = await temporaryStore();
+    await store.load();
+    await store.addKey({ key: 'tvly-dev-only-aaaaaaaaaaaa' });
+    const before = await readFile(store.filePath, 'utf8');
+
+    await assert.rejects(() => store.setDisabled('no-such-id', true), RangeError);
+    await assert.rejects(() => store.rename('no-such-id', 'x'), RangeError);
+    await assert.rejects(() => store.removeKey('no-such-id'), RangeError);
+
+    assert.equal(await readFile(store.filePath, 'utf8'), before);
+  });
+
+  test('统计写入失败只在记录里报错，不弄坏存储也不抛给调用方', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
+    const real = await import('node:fs/promises');
+    let fail = true;
+    const store = new PoolStore({
+      dir,
+      fileName: 'keys.json',
+      fs: {
+        ...real,
+        writeFile: async (...args) => {
+          if (fail) throw new Error('simulated disk failure');
+          return real.writeFile(...args);
+        },
+      },
+    });
+    await store.load();
+
+    const written = await store.writeStats('key-id', () => ({ calls: 1 }));
+
+    assert.equal(written, false, '失败以上报的形式返回，而不是抛给搜索路径');
+    assert.ok(store.lastWriteError instanceof Error);
+    assert.deepEqual(store.statsOf('key-id'), { calls: 1 }, '内存状态仍然更新：调度决策读的是它');
+  });
+
+  test('编辑与统计写入并发时不丢更新，内存与磁盘最终一致', async () => {
+    // 面板的编辑（`update`）与搜索的记账（`writeStats`）写的是同一份文档。两条路径若
+    // 一条同步、一条等落盘之后才改内存，慢的那条就会把快的那条的成果覆盖掉——症状是
+    // 「用户改了顺序，磁盘上却没改」，而且此后内存与磁盘长期不一致。
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-test-'));
+    const real = await import('node:fs/promises');
+    const store = new PoolStore({
+      dir,
+      fileName: 'keys.json',
+      // 放慢落盘，制造出「编辑正在写盘」的那个窗口。
+      fs: {
+        ...real,
+        writeFile: async (...args) => {
+          await new Promise((resolve) => {
+            setTimeout(resolve, 20);
+          });
+          return real.writeFile(...args);
+        },
+      },
+    });
+    await store.load();
+    const record = await store.addKey({ key: 'tvly-dev-race-aaaaaaaaaaaa' });
+
+    const editing = store.setDisabled(record.id, true);
+    await store.writeStats(record.id, () => ({ calls: 7 }));
+    await editing;
+
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    assert.equal(onDisk.keys[0].disabled, true, '用户的编辑必须落盘');
+    assert.equal(onDisk.stats[record.id].calls, 7, '统计也必须落盘');
+    assert.equal(store.maskedList()[0].disabled, true, '内存与磁盘一致');
+    assert.equal(store.statsOf(record.id).calls, 7);
+  });
+});
+
 describe('issue 01 的密钥选择', () => {
-  test('按用户顺序使用第一把启用的密钥', async () => {
+  test('按用户顺序给出密钥，停用者仍在列表里但状态为停用', async () => {
     const store = await temporaryStore();
     await store.load();
     const first = await store.addKey({ key: 'tvly-dev-first-aaaaaaaaaaaa' });
     await store.addKey({ key: 'tvly-dev-second-bbbbbbbbbbbb' });
-    assert.equal(store.firstUsableKey(), 'tvly-dev-first-aaaaaaaaaaaa');
+    assert.deepEqual(
+      store.maskedList().map((entry) => entry.disabled),
+      [false, false],
+    );
 
-    await store.update((document) => {
-      const entry = document.keys.find((candidate) => candidate.id === first.id);
-      entry.disabled = true;
-      return document;
-    });
-    assert.equal(store.firstUsableKey(), 'tvly-dev-second-bbbbbbbbbbbb');
+    await store.setDisabled(first.id, true);
+    assert.equal(store.maskedList()[0].disabled, true);
+    assert.equal(store.keysInOrder().length, 2, '停用不删除记录：统计与配置都保留（POOL-5）');
   });
 
-  test('池为空时报告没有密钥', async () => {
+  test('池为空时列表为空', async () => {
     const store = await temporaryStore();
     await store.load();
-    assert.equal(store.firstUsableKey(), undefined);
+    assert.deepEqual(store.maskedList(), []);
   });
 });

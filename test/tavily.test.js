@@ -145,6 +145,37 @@ describe('失败处理', () => {
     assert.equal(error.code, 'TAVILY_UNPROCESSABLE_RESPONSE');
   });
 
+  test('REST-10：失败时保留上游的 request_id', async () => {
+    const { fetchImpl } = stubFetch({
+      status: 432,
+      body: { detail: { error: 'Key limit or Plan Limit exceeded.' }, request_id: 'req-abc-123' },
+    });
+
+    const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
+
+    assert.equal(error.requestId, 'req-abc-123', '排障时要能直接把它交给 Tavily 支持');
+    assert.match(error.message, /req-abc-123/u, '消息里也要带上，否则用户看不到');
+  });
+
+  test('上游没给 request_id 时不编造一个', async () => {
+    const { fetchImpl } = stubFetch({ status: 500, body: { detail: { error: 'boom' } } });
+
+    const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
+
+    assert.equal(error.requestId, undefined);
+    assert.doesNotMatch(error.message, /request_id/u);
+  });
+
+  test('REST-3：成功时回传 credits，缺失则为 undefined 而不是 0', async () => {
+    const withUsage = stubFetch({ body: { results: [], usage: { credits: 2 } } });
+    const counted = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl: withUsage.fetchImpl });
+    assert.equal(counted.credits, 2);
+
+    const withoutUsage = stubFetch({ body: { results: [] } });
+    const unknown = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl: withoutUsage.fetchImpl });
+    assert.equal(unknown.credits, undefined, '「不知道消耗了多少」不是「没消耗」');
+  });
+
   test('调用方中止可与超时区分开', async () => {
     const controller = new AbortController();
     controller.abort();

@@ -4,10 +4,9 @@
  * 这些模块是升级时**绝不该**需要改动的部分，因此最要紧的测试是那条结构性断言：
  * 它们必须能在完全看不到 harness 的情况下导入与测试。
  *
- * 下面的清单是 COMPAT-1 点名的五个模块中**已实现**的子集。`lib/scheduler.js`、
- * `lib/health.js`、`lib/usage.js` 尚不存在——它们随调度、失败分类、余额刷新三项
- * 工作落地——并且必须在创建它们的同一个提交里加进这里，这条规则才会持续被机械
- * 执行，而不是靠人记得。
+ * 下面的清单是 COMPAT-1 点名的五个模块中**已实现**的子集。`lib/usage.js` 尚不
+ * 存在——它随余额刷新（`06`）落地——并且必须在创建它的同一个提交里加进这里，这条
+ * 规则才会持续被机械执行，而不是靠人记得。
  */
 
 import assert from 'node:assert/strict';
@@ -26,13 +25,15 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const HOST_FREE_MODULES = [
   'lib/tavily.js',
   'lib/pool.js',
+  'lib/scheduler.js',
+  'lib/health.js',
+  'lib/attempts.js',
+  'lib/settings.js',
 ];
 
 /** COMPAT-1 点名的完整集合，使缺口显而易见而不是靠推断。 */
 const CONTRACTED_MODULES = [
   ...HOST_FREE_MODULES,
-  'lib/scheduler.js',
-  'lib/health.js',
   'lib/usage.js',
 ];
 
@@ -58,7 +59,7 @@ describe('COMPAT-1：逻辑内核不依赖宿主', () => {
     const missing = CONTRACTED_MODULES.filter((relativePath) => !HOST_FREE_MODULES.includes(relativePath));
     assert.deepEqual(
       missing,
-      ['lib/scheduler.js', 'lib/health.js', 'lib/usage.js'],
+      ['lib/usage.js'],
       '契约模块有增删——请同步更新 HOST_FREE_MODULES',
     );
   });

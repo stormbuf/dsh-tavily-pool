@@ -11,9 +11,8 @@ Tavily-backed web search **and** page fetching for DeepSeek Harness: multi-key p
 - **Multi-key pool** — add, label, enable/disable, reorder, remove; the UI only ever shows masked keys
 - **Balance-aware rotation** — highest remaining balance first; three-state balance (`limit === null` → unlimited first, unknown → last)
 - **Automatic failover** — a failing key hands the request to the next one
-- **Cooldown** — honors upstream `Retry-After`; cooled keys are excluded until it expires, and when every key is cooling the request briefly waits for the earliest one
-- **Manual order** — optionally schedule by your own key order instead of by balance
-- **Status-aware errors** — separates temporary failures, permanent key death (body-inspected, never status-code-only), key quota exhaustion (432), and account-level PayGo exhaustion (433, fails fast instead of pointlessly rotating keys)
+- **Cooldown** — honors upstream `Retry-After`; cooled keys are hard-excluded until it expires, and when every key is cooling the request waits for the earliest one within a bounded budget
+- **Status-aware errors** — separates temporary failures, permanent key death (body-inspected, never status-code-only), and quota exhaustion (`432` / `433` treated alike: the key stays out of rotation until `/usage` confirms a positive balance)
 - **Usage accounting** — reads real `usage.credits` from responses; unknown is recorded as unknown, never as zero
 - **Balance refresh** — pulls official `/usage` with per-key sliding-window quota reservation, so it never trips the 10-per-10-minutes limit
 - **Fetch takeover** — maps `web_fetch` to Tavily `/extract`; billing follows successful-URL tiers

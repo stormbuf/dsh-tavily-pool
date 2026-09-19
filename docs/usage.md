@@ -52,7 +52,9 @@ The key pool schedules by **balance first**:
 
 When a key fails temporarily (rate limiting `429`, server error `5xx`) it is **cooled down**, and during the cooldown it **does not participate** in key selection (it will not be used even if every other key is unavailable). It recovers automatically when the cooldown ends.
 
-If **every** key is cooling down, the plugin **briefly waits** for the earliest one to expire rather than failing immediately; the wait is bounded, and once exceeded the upstream error is returned.
+If **every** key is cooling down, the plugin **waits** for the earliest one to expire rather than failing immediately — but only when that moment falls inside the wait budget. It will not wait pointlessly past the budget: waiting for an expiry it cannot reach only defers the failure, so it returns the upstream error at once, preserving the original `request_id`.
+
+A failing key triggers **failover**: the plugin switches to another key automatically. No key is tried twice within one request.
 
 **Quota exhaustion** (`432` / `433`) is different from a cooldown: it is not a matter of "wait a moment", but of the key having no credits left in the current billing cycle. Such a key stays **unselected** until it is confirmed to have recovered.
 

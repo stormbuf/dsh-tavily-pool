@@ -25,13 +25,16 @@ with the upgrade:
 |---|---|
 | `lib/constants.js` | ids, endpoints, timeouts, defaults |
 | `lib/tavily.js` | Tavily REST request/response shapes |
-| `lib/pool.js` | key-pool file, atomic writes, masking |
+| `lib/pool.js` | key-pool file, atomic writes, masking, key edits |
+| `lib/scheduler.js` | balance ordering, hard exclusion, bounded wait |
+| `lib/health.js` | failure classification, cooldown, quota/invalid state |
+| `lib/attempts.js` | failover across keys within one request |
+| `lib/settings.js` | setting shapes and defaults (the schema itself is host-agnostic) |
 
-`lib/scheduler.js`, `lib/health.js`, and `lib/usage.js` join this layer as the scheduling,
-failure-classification, and balance-refresh work lands. `test/compat-core.test.js`
-enforces the rule mechanically — it fails if any listed file grows a host import, and it
-asserts the list itself, so creating one of those modules without adding it here fails
-the suite rather than passing silently.
+`lib/usage.js` joins this layer as the balance-refresh work (`06`) lands.
+`test/compat-core.test.js` enforces the rule mechanically — it fails if any listed file
+grows a host import, and it asserts the list itself, so creating one of those modules
+without adding it here fails the suite rather than passing silently.
 
 ## Checklist
 
@@ -118,12 +121,18 @@ the fallback path is what a user gets when they switch this plugin off. Check:
 
 ### 6. Settings registration
 
-**Where:** `dsh-settings` — `register(ns, schema, options)`.
-**Then edit:** `index.js` and whatever settings adapter module the settings ticket adds
+**Where:** `dsh-settings` — `register(ns, schema, options)` on the service, and `get(ns)` on
+the service for reading a registered namespace back.
+**Then edit:** `lib/dsh/settings.js`
 
-Confirm the signature and that duplicate namespace registration still throws. The plugin
-must **not** re-register `web-search-deepseek`: that namespace belongs to the official
-plugin, which must stay enabled, and re-registering it throws.
+Confirm both halves of the shape: `register` returns an owner scope, and the **service**
+carries `get(ns)`. Reading through the scope returned by `register` looks equivalent but is
+not — a service without `get` is one more host shape to notice, and the plugin reads through
+the service so that a re-registration failure does not also break reading.
+
+Confirm too that duplicate namespace registration still throws. The plugin must **not**
+re-register `web-search-deepseek`: that namespace belongs to the official plugin, which
+must stay enabled, and re-registering it throws.
 
 ### 7. Manifest fields
 

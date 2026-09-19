@@ -22,11 +22,15 @@ DeepSeek Harness 处于预览期，其插件接口会随版本变动。本插件
 |---|---|
 | `lib/constants.js` | id、端点、超时、默认值 |
 | `lib/tavily.js` | Tavily REST 请求/响应形状 |
-| `lib/pool.js` | 密钥池文件、原子写、脱敏 |
+| `lib/pool.js` | 密钥池文件、原子写、脱敏、密钥编辑 |
+| `lib/scheduler.js` | 余额排序、硬排除、有界等待 |
+| `lib/health.js` | 失败分类、冷却、额度耗尽/永久失效状态 |
+| `lib/attempts.js` | 一次请求内的跨密钥故障切换 |
+| `lib/settings.js` | 设置形状与默认值（schema 本身与宿主无关） |
 
-`lib/scheduler.js`、`lib/health.js`、`lib/usage.js` 会随调度、失败分类、余额刷新三项工作
-加入这一层。`test/compat-core.test.js` 机械执行该规则——任一所列文件长出宿主 import 即失败；
-它同时断言这份清单本身，因此创建上述模块却没加进清单会**直接让测试失败**，而不是静默通过。
+`lib/usage.js` 会随余额刷新（`06`）加入这一层。`test/compat-core.test.js` 机械执行该规则
+——任一所列文件长出宿主 import 即失败；它同时断言这份清单本身，因此创建上述模块却没加进
+清单会**直接让测试失败**，而不是静默通过。
 
 ## 作业清单
 
@@ -107,11 +111,16 @@ context proxy 有两种语义不同的读取方式：
 
 ### 6. 设置注册
 
-**看哪里：** `dsh-settings` —— `register(ns, schema, options)`。
-**改哪个模块：** `index.js`，以及设置那个 ticket 新增的设置适配模块
+**看哪里：** `dsh-settings` —— 服务上的 `register(ns, schema, options)`，以及读回某个已注册
+命名空间的 `get(ns)`。
+**改哪个模块：** `lib/dsh/settings.js`
 
-确认签名，并确认重复注册命名空间仍然抛错。本插件**不得**重新注册 `web-search-deepseek`：
-那个命名空间属于官方插件，而官方插件必须保持启用，重新注册会抛错。
+确认这个形状的两半都在：`register` 返回所有者句柄，**服务自身**带有 `get(ns)`。经 `register`
+返回的句柄读取看起来等价，其实不是——服务少了 `get` 就是一处需要察觉的宿主形状变化，而本插件
+经服务读取，正是为了不让一次重复注册的失败同时弄坏读取。
+
+同时确认重复注册命名空间仍然抛错。本插件**不得**重新注册 `web-search-deepseek`：那个命名空间
+属于官方插件，而官方插件必须保持启用，重新注册会抛错。
 
 ### 7. 清单字段
 
