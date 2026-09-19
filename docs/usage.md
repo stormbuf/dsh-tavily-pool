@@ -133,9 +133,9 @@ The plugin **does not infer the billing cycle** — balances always come from th
 - **Search**: `basic` / `fast` / `ultra-fast` cost 1 credit, `advanced` costs 2
 - **Fetch**: every **5 successful** URL extractions cost 1 credit (`basic`) or 2 (`advanced`); failed URLs are **not charged**
 
-A single fetch therefore often costs 0 credits, because credits are charged per five successful URLs rather than per request. The plugin computes what a fetch was worth from the number of URLs that actually succeeded — it does not read back Tavily's own per-response `usage.credits`, which is rounded against Tavily's own running total and is therefore frequently `0` on a response that did cost credit.
+A single fetch therefore usually costs **0 credits**: the five-URL counter is **cumulative across calls**, and a DSH fetch call carries one URL, so only every fifth successful fetch crosses a tier.
 
-Since one DSH fetch call carries one URL, the running total is what reaches each five-URL tier.
+The plugin counts successful URLs per key and turns that running total into credits itself — it does not read back Tavily's per-response `usage.credits`, which is rounded against Tavily's own running total and is therefore frequently `0` on a response that did cost credit. Counting locally also keeps the balance estimate honest: charging 1 credit per call would drain it five times faster than Tavily does, and that estimate is what decides which key goes first.
 
 ## Call history
 

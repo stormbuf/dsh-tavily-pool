@@ -10,7 +10,7 @@ import test, { describe } from 'node:test';
 
 import {
   TavilyError,
-  extractCredits,
+  extractCreditDelta,
   extractTavily,
   mapSearchResponse,
   searchTavily,
@@ -328,41 +328,56 @@ describe('FETCH-1：抓取返回纯文本', () => {
 });
 
 describe('USAGE-6：抓取按成功 URL 数计费', () => {
-  test('5 个成功 URL（basic）记 1 积分', async () => {
-    const urls = Array.from({ length: 5 }, (unused, index) => `https://example.com/${String(index)}`);
-    const { fetchImpl } = stubFetch({
-      body: { results: urls.map((url) => ({ url, raw_content: 'x' })), failed_results: [] },
-    });
+  test('累计跨过第 5 个成功 URL 时才记 1 积分（basic）', () => {
+    // 官方口径是「Every 5 successful URL extractions cost 1 API credit」——5 是**跨请求累计**
+    // 的。因此前四次各记 0，第五次记 1，第六到九次又是 0，第十次再记 1。
+    const billed = [];
+    for (let call = 1; call <= 10; call += 1) {
+      billed.push(extractCreditDelta({ successfulUrls: call - 1, added: 1, depth: 'basic' }));
+    }
 
-    // 单次 `/extract` 只发一个 URL，因此「5 个成功 URL」这一幕要靠内核函数直接覆盖：
-    // 计费口径是「每 5 个成功 URL」而不是「每个请求」，与发几次请求无关。
-    assert.equal(extractCredits({ successfulUrls: 5, depth: 'basic' }), 1);
+    assert.deepEqual(billed, [0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    assert.equal(billed.reduce((total, value) => total + value, 0), 2, '十次各一个 URL = 2 积分');
+  });
 
-    // 顺带确认真实调用路径算出来的也是同一套数。
-    const outcome = await extractTavily({ apiKey: 'k', url: urls[0], fetchImpl });
-    assert.equal(outcome.credits, 1);
+  test('一次成功 5 个 URL 记 1 积分（basic）——Gherkin 那条场景', () => {
+    assert.equal(extractCreditDelta({ successfulUrls: 0, added: 5, depth: 'basic' }), 1);
+    assert.equal(extractCreditDelta({ successfulUrls: 5, added: 5, depth: 'basic' }), 1);
   });
 
   test('advanced 档每 5 个成功 URL 记 2 积分', () => {
-    assert.equal(extractCredits({ successfulUrls: 5, depth: 'advanced' }), 2);
-    assert.equal(extractCredits({ successfulUrls: 10, depth: 'advanced' }), 4);
+    assert.equal(extractCreditDelta({ successfulUrls: 0, added: 5, depth: 'advanced' }), 2);
+    assert.equal(extractCreditDelta({ successfulUrls: 5, added: 5, depth: 'advanced' }), 2);
+  });
+
+  test('一次抓取 1 个 URL 记 0 积分——按请求取整会让余额以五倍速度下降', () => {
+    // 这条是本票最要紧的一条断言：余额是 `balance` 策略的排序输入，按请求取整（每抓一次记 1）
+    // 会让本地读数比官方账单快五倍地掉。
+    assert.equal(extractCreditDelta({ successfulUrls: 0, added: 1, depth: 'basic' }), 0);
+    assert.equal(extractCreditDelta({ successfulUrls: 3, added: 1, depth: 'basic' }), 0);
   });
 
   test('抓取失败不计费', async () => {
-    assert.equal(extractCredits({ successfulUrls: 0, depth: 'basic' }), 0);
+    assert.equal(extractCreditDelta({ successfulUrls: 4, added: 0, depth: 'basic' }), 0);
 
     const { fetchImpl } = stubFetch({
       body: { results: [], failed_results: [{ url: 'https://bad.example', error: 'nope' }] },
     });
     const outcome = await extractTavily({ apiKey: 'k', url: 'https://bad.example', fetchImpl });
-    assert.equal(outcome.credits, 0);
+    assert.equal(outcome.successfulUrls, 0, '内核只如实回报成功数与失败数，积分由累计计数那一层算');
+    assert.equal(outcome.failedUrls, 1);
   });
 
-  test('单 URL 成功多半是 0 积分，而不是 1', () => {
-    // 官方原文：「The value may be 0 if the total successful URL extractions has not yet
-    // reached 5 calls」。把「1 次抓取」记成 1 积分会让本地余额读数长期偏低。
-    assert.equal(extractCredits({ successfulUrls: 1, depth: 'basic' }), 1);
-    assert.equal(extractCredits({ successfulUrls: 4, depth: 'basic' }), 1);
+  test('内核不自己算积分——它交回的是「这次成功了几个 URL」', async () => {
+    // 计费口径只有一个来源：`lib/health.js` 的 `recordSuccess`（它持有累计计数）。
+    // 内核若也算一遍，同一份知识就有两处，而两处迟早会分叉。
+    const { fetchImpl } = stubFetch({
+      body: { results: [{ url: 'https://example.com', raw_content: 'x' }], failed_results: [] },
+    });
+    const outcome = await extractTavily({ apiKey: 'k', url: 'https://example.com', fetchImpl });
+
+    assert.equal('credits' in outcome, false);
+    assert.equal(outcome.successfulUrls, 1);
   });
 });
 

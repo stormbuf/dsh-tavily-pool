@@ -910,16 +910,36 @@ describe('10：抓取接管经入口真实生效', () => {
     assert.equal(result.calls[0].body.format, 'text');
   });
 
-  test('USAGE-6：抓取按成功 URL 数记账，而不是按请求计费', async () => {
+  test('USAGE-6：抓取按成功 URL 数**累计**记账，而不是按请求计费', async () => {
+    // 官方口径是「每 5 个成功 URL 计 1 积分」，而 5 是跨请求累计的。因此单 URL 的前四次抓取
+    // 各记 0，直到第五次才记 1。按请求计费（每次记 1）会让本地余额比官方账单快五倍地掉，
+    // 而余额正是 `balance` 策略的排序输入——这条用例因此是那个口径在**入口**上的守卫。
     const host = await hostWithKeys([{ label: 'only' }]);
-    await fetchVia(host, 'https://example.com');
 
-    // 计费口径的**值**由内核用例逐个钉住（`extractCredits`）；这里要证明的是入口真的把它
-    // 记进了密钥统计——一条「算得对但没记」的路径在单测里是看不见的。
+    for (let call = 1; call <= 4; call += 1) {
+      await fetchVia(host, 'https://example.com');
+      const midway = JSON.parse(await readFile(host.keyPoolPath, 'utf8'));
+      const midwayStats = Object.values(midway.stats)[0];
+      assert.equal(
+        midwayStats.credits,
+        0,
+        `第 ${String(call)} 次抓取还没跨过第 5 个成功 URL，记 0 而不是 1`,
+      );
+      assert.equal(
+        midwayStats.creditsUnknown,
+        undefined,
+        '抓取的「0」是已知的零（按档位算出来的），不该落进「未知」那一档（REST-3）',
+      );
+      assert.equal(midwayStats.extractUrls, call, '累计计数每次都要落盘');
+    }
+
+    await fetchVia(host, 'https://example.com');
     const onDisk = JSON.parse(await readFile(host.keyPoolPath, 'utf8'));
     const [stats] = Object.values(onDisk.stats);
-    assert.equal(stats.successes, 1, '抓取成功同样记一次成功');
-    assert.equal(stats.credits, 1, '单 URL 成功（basic）= 1 积分');
+
+    assert.equal(stats.successes, 5, '五次抓取各算一次成功');
+    assert.equal(stats.extractUrls, 5, '累计的成功 URL 数要落盘——它才是下一条计费判据的来源');
+    assert.equal(stats.credits, 1, '第 5 个成功 URL 跨过档位，记 1 积分');
     assert.equal(stats.creditsUnknown, undefined, '这一次的消耗是已知的，不该落进「未知」那一档');
   });
 
@@ -1144,7 +1164,7 @@ describe('14：调用历史经入口真的落盘', () => {
     assert.ok(entries[0].durationMs >= 0);
   });
 
-  test('抓取记成 extract，且消耗按成功 URL 数走', async () => {
+  test('抓取记成 extract，消耗按累计档位走，并带上是这一次成功几个 URL', async () => {
     const host = await hostWithKeys([{ label: 'only' }]);
     await withStubbedFetch(
       () => ({ status: 200, body: { results: [{ url: 'https://example.com', raw_content: '# 正文' }], failed_results: [] } }),
@@ -1159,7 +1179,8 @@ describe('14：调用历史经入口真的落盘', () => {
 
     assert.equal(entries.length, 1);
     assert.equal(entries[0].endpoint, 'extract');
-    assert.equal(entries[0].credits, 1);
+    assert.equal(entries[0].credits, 0, '第 1 个成功 URL 还没跨过 5 个那一档');
+    assert.equal(entries[0].successfulUrls, 1, '这一次成功几个 URL 要留下，它才是计费的原始事实');
   });
 
   test('每次尝试各记一条——换过密钥的那次搜索留下两条', async () => {

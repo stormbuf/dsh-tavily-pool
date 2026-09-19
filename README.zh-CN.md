@@ -17,7 +17,7 @@
 - **余额刷新** —— 拉取官方 `/usage`，按密钥做滑动窗口配额预占，不会触发 10 次 / 10 分钟的限流
 - **搜索参数可配** —— 搜索深度、结果数上限、主题、是否生成答案，改动即时生效
 - **抓取接管** —— 把 `web_fetch` 映射到 Tavily `/extract`，返回纯文本（绝不标成 HTML——那会让 DSH 再转换一次）；抽取深度与返回格式可配
-- **抓取按成功 URL 计费** —— 每 5 个成功抽取的 URL 计一档，因此单次抓取常见消耗为 0
+- **抓取按成功 URL 计费** —— 每 5 个成功抽取的 URL 计一档、跨调用累计，因此单次抓取通常消耗 0
 - **调用历史与图表** —— 每次调用都留下记录（密钥、端点、结果、积分、耗时、`request_id`），并画成 14 天的积分曲线；文件同时受条数上限与 30 天窗口约束
 - **两个独立开关** —— 搜索与抓取可分别切回官方提供方
 - **零运行时依赖** —— 纯 ESM，无构建步骤
@@ -33,7 +33,7 @@ dsh plugin add dsh-tavily-pool
 
 然后打开 **设置 → 插件 → dsh-tavily-pool**，粘贴你的 Tavily API key。密钥只能通过面板录入——本插件不读取环境变量，也不读取 DSH 的 credentials 服务。
 
-配置、调度行为、计费说明与手动回退步骤见 [`docs/usage.zh-CN.md`](./usage.zh-CN.md)。
+配置、调度行为、计费说明与手动回退步骤见 [`docs/usage.zh-CN.md`](./docs/usage.zh-CN.md)。
 
 ## 兼容性
 
@@ -44,7 +44,7 @@ DeepSeek Harness 处于预览期，其架构与插件接口可能随版本变动
 经 `dsh plugin add` 安装后，本包会成为目标 profile 的一个 **bundle 层**（进入该 profile 的
 `dsh.profile.bundles`，排在 DSH 各 bundle 之后），它的 `cordis.patch.yml` 因此能 pin 住提供方。
 你自己的 profile patch 在**所有 bundle 层之后**应用，因此随时可以覆盖或停用本插件的行为——
-见[手动回退](./usage.zh-CN.md#手动回退)。
+见[手动回退](./docs/usage.zh-CN.md#手动回退)。
 
 ## 许可
 

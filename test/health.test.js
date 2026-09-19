@@ -280,3 +280,58 @@ describe('USAGE-7：统计落在密钥池文件里', () => {
     assert.equal(reloaded.snapshotOf(record.id, now + 1000).cooling, true);
   });
 });
+
+describe('FETCH-5：/extract 的错误表与 /search 不同', () => {
+  test('/search 上 403 加失效措辞 → 永久失效；/extract 上没有 403 这一档', () => {
+    // 官方 OpenAPI 机器核验：`/extract` 的状态码全集是 400/401/429/432/433/500——**没有 403**。
+    // 抓取路径上的一个 403（多半来自代理或 WAF，而不是 Tavily）套用 `/search` 的「措辞命中即
+    // 永久失效」，会把一把好密钥白扔掉。这正是 spec 的 Gherkin 点名禁止的事。
+    const detail = 'Unauthorized: invalid API key.';
+
+    assert.deepEqual(
+      classifyFailure({ status: 403, detail, endpoint: 'search' }),
+      { action: 'invalid', status: 403, detail },
+    );
+    assert.deepEqual(
+      classifyFailure({ status: 403, detail, endpoint: 'extract' }),
+      { action: 'fatal', status: 403 },
+      '/extract 的表里没有 403，因此走通用分支',
+    );
+  });
+
+  test('/extract 上的 422 也走通用分支（那张表里没有它）', () => {
+    assert.deepEqual(classifyFailure({ status: 422, endpoint: 'search' }), { action: 'fatal', status: 422 });
+    assert.deepEqual(
+      classifyFailure({ status: 422, endpoint: 'extract' }),
+      { action: 'fatal', status: 422 },
+      '两条路径最终都归入 FATAL，但判据不同：一个是「表里的 422」，一个是「表外的 4xx」',
+    );
+  });
+
+  test('两个端点共有的那些码，语义完全一致', () => {
+    // 401/429/432/433/500/400 在两张表里同名同义，分流不该把它们也改掉。
+    const shared = [
+      { status: 400 },
+      { status: 401 },
+      { status: 429, retryAfter: '60' },
+      { status: 432 },
+      { status: 433 },
+      { status: 500 },
+    ];
+
+    for (const failure of shared) {
+      assert.deepEqual(
+        classifyFailure({ ...failure, endpoint: 'extract' }),
+        classifyFailure({ ...failure, endpoint: 'search' }),
+        `HTTP ${String(failure.status)} 在两个端点上的分类必须一致`,
+      );
+    }
+  });
+
+  test('端点缺席时按 search 处理——那是既有的默认，不是新行为', () => {
+    assert.deepEqual(
+      classifyFailure({ status: 403, detail: 'invalid api key' }),
+      classifyFailure({ status: 403, detail: 'invalid api key', endpoint: 'search' }),
+    );
+  });
+});

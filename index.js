@@ -22,8 +22,9 @@ import { runWithFailover } from './lib/attempts.js';
 import {
   HISTORY_FILE_NAME,
   KEYS_FILE_NAME,
+  FETCH_TOTAL_BUDGET_MS,
   MIN_ATTEMPT_TIMEOUT_MS,
-  REQUEST_TOTAL_BUDGET_MS,
+  SEARCH_TOTAL_BUDGET_MS,
   SETTINGS_NAMESPACE,
   TAVILY_TIMEOUT_MS,
 } from './lib/constants.js';
@@ -356,7 +357,7 @@ async function search(state, request, signal) {
   }
 
   const startedAt = Date.now();
-  const deadlineMs = startedAt + REQUEST_TOTAL_BUDGET_MS;
+  const deadlineMs = startedAt + SEARCH_TOTAL_BUDGET_MS;
   let result;
   try {
     ({ result } = await runWithFailover({
@@ -456,7 +457,8 @@ async function fetchUrl(state, request, signal) {
   }
 
   const startedAt = Date.now();
-  const deadlineMs = startedAt + REQUEST_TOTAL_BUDGET_MS;
+  // 抓取用**它自己的**预算：宿主给 web_fetch 的只有 30 秒，而给 web_search 的是 60 秒。
+  const deadlineMs = startedAt + FETCH_TOTAL_BUDGET_MS;
   let outcome;
   try {
     outcome = await runWithFailover({
@@ -464,7 +466,10 @@ async function fetchUrl(state, request, signal) {
       health: state.health,
       signal,
       deadlineMs,
-      operation: 'fetch',
+      endpoint: 'extract',
+      // 计费档位由深度决定，而深度只有设置里知道——因此把它交下去，由持有累计计数的那一层
+      // 算出这次该记多少积分（`USAGE-6` 的「每 5 个成功 URL」是跨请求累计的）。
+      extractDepth: settings.fetchDepth,
       onAttempt: (attempt) => recordCall(state, 'extract', attempt),
       invoke: ({ key }) => extractTavily({
         apiKey: key,
@@ -514,6 +519,7 @@ function recordCall(state, endpoint, attempt) {
     outcome: attempt.outcome,
     durationMs: attempt.durationMs,
     credits: attempt.credits,
+    successfulUrls: attempt.successfulUrls,
     status: attempt.status,
     code: attempt.code,
     requestId: attempt.requestId,

@@ -17,7 +17,7 @@ Tavily-backed web search **and** page fetching for DeepSeek Harness: multi-key p
 - **Balance refresh** — pulls official `/usage` with per-key sliding-window quota reservation, so it never trips the 10-per-10-minutes limit
 - **Configurable search parameters** — search depth, result cap, topic, and generated-answer toggle, all taking effect immediately
 - **Fetch takeover** — maps `web_fetch` to Tavily `/extract`, returning plain text (never HTML, which DSH would convert a second time); extraction depth and output format are configurable
-- **Fetch billing by successful URLs** — charged per five successful extractions, so a single fetch usually costs 0
+- **Fetch billing by successful URLs** — one credit per five successful extractions, counted cumulatively, so a single fetch usually costs 0
 - **Call history and chart** — every call is recorded (key, endpoint, outcome, credits, duration, `request_id`) and drawn as a 14-day credit chart; the file is bounded by both an entry cap and a 30-day window
 - **Independent toggles** — search and fetch can be switched back to the official providers separately
 - **Zero runtime dependencies** — plain ESM, no build step

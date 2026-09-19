@@ -429,8 +429,16 @@ describe('SCHED-7：手动顺序策略', () => {
       failure: { status: 401, detail: 'invalid api key' },
       message: 'invalid api key',
     });
-    const blocked = await scheduler.select().catch((error) => error);
-    assert.equal(blocked?.blocked ?? 'all-unusable', 'all-unusable');
+    // 两把都进不了候选时 `select()` 返回 `{ blocked }`。这里断言的是那个字段**本身**，
+    // 而不是 `blocked?.blocked ?? 'all-unusable'` 这种兜底：兜底会让「错选了一把永久失效的
+    // 密钥」同样通过——那种情况返回的是 `{ key }`，`blocked` 是 `undefined`，兜底值照样等于
+    // `'all-unusable'`。判据是「两把都被硬排除」，而 `snapshotOf` 是它的直接证据。
+    assert.equal(health.snapshotOf(ids.first).quotaExhausted, true, '第一把按额度耗尽排除');
+    assert.equal(health.snapshotOf(ids.second).permanentlyInvalid, true, '第二把按永久失效排除');
+
+    const selection = await scheduler.select();
+    assert.equal(selection.key, undefined, '两把都不可用时不得选出任何一把');
+    assert.equal(selection.blocked, 'all-unusable');
   });
 
   test('策略可以是一个函数，于是改动即时生效', async () => {

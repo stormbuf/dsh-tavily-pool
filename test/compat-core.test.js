@@ -156,7 +156,11 @@ describe('DOC-1：包清单完整，且发布出去的内容是完整的', () =>
     assert.equal(published.has('lib'), true);
 
     // 中英双语文档必须成对发布：用户被告知的可选语言不该只有一半。
-    for (const pair of [['README.md', 'README.zh-CN.md'], ['docs/usage.md', 'docs/usage.zh-CN.md']]) {
+    for (const pair of [
+      ['README.md', 'README.zh-CN.md'],
+      ['docs/usage.md', 'docs/usage.zh-CN.md'],
+      ['docs/dsh-upgrade.md', 'docs/dsh-upgrade.zh-CN.md'],
+    ]) {
       for (const name of pair) assert.equal(published.has(name), true, `files 白名单缺少 ${name}`);
     }
   });

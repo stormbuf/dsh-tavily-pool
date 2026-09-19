@@ -270,8 +270,8 @@ describe('取消与记账', () => {
     assert.equal(health.statsOf(ids.a).cooldownUntil, undefined);
   });
 
-  test('中止的文案跟着 operation 走', async () => {
-    // 抓取也走这条编排（`operation: 'fetch'`）。文案里说 search 而实际做的是抓取，会把读日志
+  test('中止的文案与错误表都跟着 endpoint 走', async () => {
+    // 抓取也走这条编排（`endpoint: 'extract'`）。文案里说 search 而实际做的是抓取，会把读日志
     // 的人带偏——与 `lib/tavily.js` 的 `postJson` 同一个用意。
     const { scheduler, health } = await harness([{ label: 'a' }]);
     const invoke = async () => {
@@ -288,9 +288,9 @@ describe('取消与记账', () => {
       health,
       invoke,
       signal: controller.signal,
-      operation: 'fetch',
+      endpoint: 'extract',
     }).catch((thrown) => thrown);
-    assert.match(fetch.message, /Tavily fetch aborted/u);
+    assert.match(fetch.message, /Tavily extract aborted/u);
   });
 
   test('onAttempt 在成功与失败两条路径上都被调用，且不参与决策', async () => {
