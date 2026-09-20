@@ -20,7 +20,7 @@
 
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -121,6 +121,38 @@ await assert.rejects(
   '未注册的 pin 必须抛 WEB_PROVIDER_CONFIGURED_MISSING',
 );
 check('对照项：未注册的 pin 抛 WEB_PROVIDER_CONFIGURED_MISSING');
+
+// ── ticket 22 C2：调用历史在一个**全新的**状态目录上也要写得进去 ──────────────
+//
+// 这条是 2026-09-20 真机实测抓到的：抢锁发生在建目录之前，于是全新状态目录上的第一次追加
+// 以 `ENOENT` 失败，而那次 `mkdir` 从来没机会跑到。真机症状是「一次真实搜索之后历史是空的」
+// ——面板上少一段曲线，且没有任何解释。它只在**目录还不存在**时现形，因此这里刻意用一个
+// 没建过的目录，而不是 `harnessHome` 里那个已经被密钥池建好的。
+{
+  const { CallHistory } = await import('../../lib/history.js');
+  const { HISTORY_FILE_NAME } = await import('../../lib/constants.js');
+  const freshDir = join(harnessHome, 'history-only', STATE_DIR_NAME);
+  const history = new CallHistory({ dir: freshDir, fileName: HISTORY_FILE_NAME });
+
+  const appended = await history.append({
+    endpoint: 'search',
+    keyId: 'seam-check-key',
+    keyMasked: 'tvly-dev-…seam',
+    outcome: 'ok',
+    durationMs: 42,
+    credits: 1,
+    requestId: 'seam-check-request',
+  });
+  assert.equal(appended, true, `全新目录上的第一次追加必须成功：${String(history.lastWriteError)}`);
+
+  const written = JSON.parse(await readFile(join(freshDir, HISTORY_FILE_NAME), 'utf8'));
+  assert.equal(written.entries.length, 1, '历史必须真的落盘');
+  assert.equal(written.entries[0].requestId, 'seam-check-request', 'request_id 必须被留下');
+
+  const leftovers = (await readdir(freshDir)).filter((name) => name.endsWith('.lock'));
+  assert.deepEqual(leftovers, [], '写完之后不得残留锁文件');
+  check('第 22 项 C2：全新状态目录上第一次追加成功，且锁文件已释放', join(freshDir, HISTORY_FILE_NAME));
+}
 
 process.stdout.write('seam-check: 全部真机检查通过\n');
 process.exit(0);

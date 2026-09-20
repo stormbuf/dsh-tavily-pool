@@ -14,7 +14,9 @@
  * 2. 弹层与对话框真的在视口里，且屏幕中心点落在对话框内部（而不是被什么盖住）；
  * 3. 关掉之后弹层从 DOM 里消失，页面上不多出任何全屏固定元素；
  * 4. 全程没有 console 异常——bundle 里一个语法错误就会在这里现形（单测用 `vm` 解析源码，
- *    但真机上「宿主投递的是哪一份」是另一回事）。
+ *    但真机上「宿主投递的是哪一份」是另一回事）；
+ * 5. 批量删除弹框（ticket `22` D2）同样成立：它的复选框真的画得出来、勾选之后确认按钮可用
+ *    （勾了**不提交**——那会删掉验证用的密钥）。
  *
  * 它需要一台跑着的 `dsh web` 与一个本机 Chrome，因此不属于 `npm test`：
  *
@@ -139,13 +141,31 @@ const SNAPSHOT = `
   const overlay = document.querySelector('.dtp-overlay');
   const dialog = document.querySelector('.dtp-dialog');
   const rect = (element) => element.getBoundingClientRect();
+  const checkboxes = [...document.querySelectorAll('.dtp-check')];
+  // 「弹框里有几行」只能从**弹框内部**数：dtp-key 这个类在池列表的密钥行上也用着，
+  // 两个都打开的瞬间数出来的是两份之和（本脚本第一条检查因此留在弹框打开**之前**跑）。
+  const dialogKeyRows = dialog === null ? 0 : dialog.querySelectorAll('.dtp-key').length;
   return {
     keyRows: document.querySelectorAll('.dtp-key').length,
+    dialogKeyRows,
+    // 批量删除（ticket 22 D2）的复选框：与前两次一样，「元素树对而 CSS 错」是单测的盲区。
+    checkboxCount: checkboxes.length,
+    checkboxesLaidOut: checkboxes.every((element) => {
+      const r = rect(element);
+      return r.width > 0 && r.height > 0 && getComputedStyle(element).position !== 'fixed';
+    }),
     maskCount: masks.length,
     masksAllStatic: masks.every((element) => getComputedStyle(element).position !== 'fixed'),
     overlayExists: overlay !== null,
     overlayIsFullScreen: overlay !== null && rect(overlay).width >= innerWidth - 1 && rect(overlay).height >= innerHeight - 1,
     dialogExists: dialog !== null,
+    dialogCount: document.querySelectorAll('.dtp-dialog').length,
+    dialogLabel: dialog === null ? null : dialog.getAttribute('aria-label'),
+    dialogGeometry: dialog === null ? null : (() => {
+      const r = rect(dialog);
+      const hit = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
+      return { innerW: innerWidth, innerH: innerHeight, top: r.top, left: r.left, bottom: r.bottom, right: r.right, w: r.width, h: r.height, hit: String(hit?.className ?? hit?.tagName ?? 'null').slice(0, 40) };
+    })(),
     dialogInViewport: dialog !== null && (() => { const r = rect(dialog); return r.width > 200 && r.height > 120 && r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight && r.right <= innerWidth; })(),
     centerHitsDialog: dialog !== null && dialog.contains(document.elementFromPoint(innerWidth / 2, innerHeight / 2)),
     strayFullScreenFixed: [...document.querySelectorAll('body *')].filter((element) => {
@@ -183,6 +203,7 @@ try {
 
   const closed = await client.evaluate(SNAPSHOT);
   if (closed.dialogExists) throw new Error('弹框在没点开时就渲染了');
+  // 这一条在弹框打开**之前**跑，因此 `keyRows` 数到的就是池列表本身。
   check('弹框未打开时页面上没有它', `密钥 ${String(closed.keyRows)} 把、掩码 ${String(closed.maskCount)} 个`);
 
   if (!await client.evaluate(clickText('批量添加'))) throw new Error('找不到「批量添加」按钮');
@@ -226,6 +247,53 @@ try {
   const again = await client.evaluate(SNAPSHOT);
   if (!again.dialogInViewport || !again.centerHitsDialog) throw new Error('第二次打开时对话框不可见');
   check('再次打开弹框同样正常');
+
+  // 6. 批量删除弹框（ticket `22` D2）：复用同一套 `.dtp-overlay` / `.dtp-dialog`，因此上面那些
+  //    判据对它同样成立；这里额外确认复选框真的画出来了（它们的 CSS 是本批新增的）。
+  //    **不点确认**：这台实例的池就是验证用的那几把，删掉会让后面的检查没有密钥可用。
+  //
+  //    先把上一个弹框关掉：卡片把两个弹框各挂一份 portal（`.dtp-dialog`），留着它会让
+  //    「当前打开的对话框是哪一个」这个判据有两个答案。
+  if (!await client.evaluate(clickText('取消'))) throw new Error('找不到批量添加弹框的「取消」按钮');
+  await sleep(600);
+  if (!await client.evaluate(clickText('批量删除'))) throw new Error('找不到「批量删除」按钮');
+  await sleep(800);
+  const removal = await client.evaluate(SNAPSHOT);
+  if (removal.dialogCount !== 1) throw new Error(`批量删除弹框的 dialog 数不是 1：${String(removal.dialogCount)}`);
+  if (removal.dialogLabel !== '批量删除密钥') {
+    throw new Error(`当前打开的不是批量删除弹框，而是 ${JSON.stringify(removal.dialogLabel)}`);
+  }
+  if (!removal.dialogInViewport || !removal.centerHitsDialog) {
+    throw new Error(`批量删除的对话框不可见或点不到：${JSON.stringify(removal.dialogGeometry)}`);
+  }
+  if (!removal.masksAllStatic) throw new Error('批量删除弹框打开时，密钥掩码变成了 fixed');
+  if (removal.dialogKeyRows > 0 && removal.checkboxCount !== removal.dialogKeyRows) {
+    throw new Error(`复选框数量与弹框里的行数不符：${String(removal.checkboxCount)} vs ${String(removal.dialogKeyRows)}`);
+  }
+  if (!removal.checkboxesLaidOut) throw new Error('有复选框没有布局尺寸——CSS 没生效');
+  check('批量删除弹框可点，且每把密钥一个复选框', `${String(removal.checkboxCount)} 个复选框`);
+
+  // 勾一把：确认按钮从「一把都没勾选」变成可点的「删除所选」——但**不提交**。
+  await client.evaluate(`(() => {
+    const box = document.querySelector('.dtp-check');
+    if (box === null) return false;
+    box.click();
+    return true;
+  })()`);
+  await sleep(400);
+  const confirmable = await client.evaluate(`(() => {
+    const button = [...document.querySelectorAll('.dtp-dialog button')].find((node) => (node.textContent ?? '').trim() === '删除所选');
+    return button !== undefined && button.disabled === false;
+  })()`);
+  if (removal.checkboxCount > 0 && confirmable !== true) {
+    throw new Error('勾了一把之后「删除所选」仍是灰的');
+  }
+  check('勾选之后确认按钮可用（未提交）');
+
+  if (!await client.evaluate(clickText('取消'))) throw new Error('删除弹框里找不到「取消」按钮');
+  await sleep(600);
+  const closedAgain = await client.evaluate(SNAPSHOT);
+  if (closedAgain.overlayExists) throw new Error('取消之后删除弹层还在 DOM 里');
 
   if (client.errors.length > 0) throw new Error(`页面报了异常：${client.errors.join(' | ')}`);
   check('全程没有 console 异常');

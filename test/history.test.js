@@ -7,12 +7,12 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
-import { HISTORY_MAX_ENTRIES, HISTORY_RETENTION_MS } from '../lib/constants.js';
+import { HISTORY_MAX_ENTRIES, HISTORY_RETENTION_MS, STATE_DIR_NAME } from '../lib/constants.js';
 import {
   CallHistory,
   HISTORY_SCHEMA_VERSION,
@@ -258,6 +258,25 @@ describe('14：裁剪与输入顺序无关', () => {
 
 describe('22 C2：跨实例的追加不能互相覆盖', () => {
   /** 一份已含一条记录的磁盘状态；两个实例的用例都从它开始。 */
+  test('状态目录还不存在时，第一次追加必须自己把目录建出来（真机实测发现）', async () => {
+    // 抢锁发生在 `#persist` 之前，而建目录原本是 `#persist` 的事——于是在一个**全新的**
+    // 状态目录上，第一次追加会以 `ENOENT` 失败，而那次 `mkdir` 从来没机会跑到。真机上的
+    // 症状是「一次真实搜索之后历史是空的」，面板上少一段曲线且没有任何解释。
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tavily-history-fresh-'));
+    const dir = join(root, 'nested', STATE_DIR_NAME);
+    const history = new CallHistory({ dir, fileName: 'history.json' });
+
+    const appended = await history.append({ endpoint: 'search', keyId: 'key-1', outcome: 'ok', durationMs: 5 });
+
+    assert.equal(appended, true, `追加必须成功，实际 lastWriteError=${String(history.lastWriteError)}`);
+    assert.equal((await history.recent(10)).length, 1);
+    assert.equal(
+      (await readdir(dir)).includes('history.json.lock'),
+      false,
+      '写完之后锁文件必须已经释放',
+    );
+  });
+
   async function seededHistory(overrides = {}) {
     const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-history-race-'));
     const filePath = join(dir, 'history.json');

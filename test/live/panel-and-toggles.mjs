@@ -198,6 +198,21 @@ const { ctx, settings } = bootHost(harnessHome);
 await waitForSettings(settings);
 check('插件已加载且设置命名空间已注册', `ns=${SETTINGS_NAMESPACE}`);
 
+// ── ticket 22 F2：总预算读的是宿主绑定的 tool timeoutMs ─────────────────────────
+//
+// 这一条只有在**真的有一套 `tools` 服务**时才谈得上验证，而真机的 `dsh web` 里 `tools`
+// 由 `dsh-tools` 在宿主平面提供、且没有任何 `isolate` 声明（见 `dsh-base/cordis.patch.yml`
+// 的 `id: tools` 与 `id: tool-web` 两行）——因此这里用一套形状相同的服务把那段接线证到底：
+// 给它一个 3000ms 的 `web_search`，然后跑一次**真实搜索**，看插件的预算是不是跟着它走。
+//
+// 判据只有一条：`/state` 里的 `hostBudget.search.source` 必须是 `host`、且折算出一个小于
+// 3000 的预算。落在 `constant` 上说明那段接线没有生效，而症状正是「宿主先掐断，模型看到
+// 的是宿主超时而不是上游的真实错误」。
+const toolsService = {
+  get: (name) => ({ web_search: { timeoutMs: 3000 }, web_fetch: { timeoutMs: 4000 } })[name],
+};
+ctx.provide('tools', toolsService);
+
 // ── 第 1、7 项：开关为开时走 Tavily ────────────────────────────────────────────
 const first = await trySearch(ctx, 'DeepSeek Harness plugin architecture');
 assert.equal(first.ok, true, `开关为开时搜索必须成功：${first.ok ? '' : String(first.error)}`);
@@ -379,12 +394,21 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
   };
   try {
     // ── 第 13 项：刷新余额之后缓存里真的有官方读数，进度条才有东西可画 ──
+    //
+    // 条数按**当场的池子**算，不写死：`--keys-dir` 会把用户池里的每一把都复制进来，
+    // 那时池里不止一把，而写死 1 只会让脚本在真机上无谓地失败（ticket `22` 的真机实测发现）。
+    const poolNow = await call(PANEL_ROUTE_PATHS.state);
     const refreshed = await call(PANEL_ROUTE_PATHS.refresh, {});
-    assert.equal(refreshed.results.length, 1, '池里此刻只有一把密钥');
+    assert.equal(
+      refreshed.results.length,
+      poolNow.keys.length,
+      `刷新必须覆盖池内每一把（池内 ${String(poolNow.keys.length)} 把）`,
+    );
     assert.equal(refreshed.results[0].ok, true, `真实 /usage 必须成功：${JSON.stringify(refreshed.results[0])}`);
 
     const afterRefresh = await call(PANEL_ROUTE_PATHS.state);
-    const real = afterRefresh.keys[0];
+    const real = afterRefresh.keys.find((entry) => refreshed.results.find((item) => item.id === entry.id)?.ok === true);
+    assert.notEqual(real, undefined, '至少有一把密钥的余额刷新成功了，否则下面的断言没有判据');
     assert.equal(typeof real.usage, 'object', '刷新成功后缓存里必须有读数');
     assert.equal(typeof real.usage.key, 'object', '/usage 的 key 段必须被整体覆盖进缓存');
     assert.equal(real.usage.stale, false, '刚刷新出来的读数不是陈旧的');
@@ -422,6 +446,23 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
       `默认路径只该打 /usage，实际 ${calls.join(', ')}`,
     );
     check('第 12 项：默认路径打的是 /usage，不消耗搜索积分', `${String(calls.length)} 次请求，全部为 /usage`);
+
+    // ── ticket 22 F2：预算真的按宿主绑定的 3000ms 折算过 ──
+    {
+      // 先跑一次真实搜索让预算被读一次（`budgetFor` 在每次调用的开头读，而不是加载期）。
+      const driven = await trySearch(ctx, 'Tavily credits pricing');
+      assert.equal(driven.ok, true, `这一次真实搜索必须成功：${driven.ok ? '' : String(driven.error)}`);
+      const budget = (await call(PANEL_ROUTE_PATHS.state)).hostBudget;
+      assert.equal(budget?.search?.source, 'host', `预算必须取自宿主绑定值，实际 ${JSON.stringify(budget?.search)}`);
+      assert.equal(budget.search.budgetMs, 1000, '3000ms 的宿主预算减去 2000ms 余量');
+      // 抓取那条路径前面已经跑过（第 10 项），因此它也该读到了宿主给 `web_fetch` 的 4000ms。
+      assert.equal(budget?.fetch?.source, 'host', `抓取预算同样取自宿主，实际 ${JSON.stringify(budget?.fetch)}`);
+      assert.equal(budget.fetch.budgetMs, 2000, '4000ms 的宿主预算减去 2000ms 余量');
+      check(
+        '第 22 项 F2：两条路径的总预算都按宿主绑定的 tool timeoutMs 折算',
+        `search=${String(budget.search.budgetMs)}ms fetch=${String(budget.fetch.budgetMs)}ms`,
+      );
+    }
 
     // ── 第 10 项：面板状态里同时投影两个开关与两项抓取参数 ──
     //
