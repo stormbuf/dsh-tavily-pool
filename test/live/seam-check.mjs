@@ -154,5 +154,32 @@ check('对照项：未注册的 pin 抛 WEB_PROVIDER_CONFIGURED_MISSING');
   check('第 22 项 C2：全新状态目录上第一次追加成功，且锁文件已释放', join(freshDir, HISTORY_FILE_NAME));
 }
 
+// ── ticket 22 F2：宿主平面的服务，另一个插件的 fiber 在**请求时**读得到 ──────────
+//
+// 真机复验 F2 需要一个带模型凭据的实例（要真的让 agent 跑一次 `web_search`），而本机没有
+// 可用的官方 key。这条因此压的是**语义**而不是那台实例：用同一份 cordis 复现「宿主平面的
+// 服务 vs 另一个插件」这一对角色，确认请求时读得到——这正是本插件读 `tools` 的时机
+// （`budgetFor` 在每次调用开头读，不在加载期读）。
+//
+// 顺带钉住一条容易踩的时序：`inject` 回调跑的那一刻，宿主平面的服务**可能还没挂上**
+// （实测两种挂载顺序下都为 `undefined`），因此「加载期读一次并缓存」的写法在真机上会静默
+// 退回常量。本插件的读法不受影响，但这条语义值得留个判据。
+{
+  const root = new Context();
+  root.provide('web', {});
+  let consumerCtx;
+  root.plugin({ name: 'seam-check-consumer', inject: ['web'], apply(ctx) { consumerCtx = ctx; } }, {});
+  await new Promise((resolve) => { setTimeout(resolve, 20); });
+
+  const atApplyTime = consumerCtx.get('tools');
+  root.plugin({ name: 'seam-check-host-plane', apply(ctx) { ctx.provide('tools', { marker: 'host-plane' }); } }, {});
+  await new Promise((resolve) => { setTimeout(resolve, 20); });
+  const atRequestTime = consumerCtx.get('tools');
+
+  assert.equal(atApplyTime, undefined, '注入回调那一刻还没挂上的服务，读不到是预期的');
+  assert.equal(atRequestTime?.marker, 'host-plane', '宿主平面 provide 的服务，请求时必须读得到');
+  check('第 22 项 F2：宿主平面的服务在请求时可读（cordis 语义判据）', 'tools → host-plane');
+}
+
 process.stdout.write('seam-check: 全部真机检查通过\n');
 process.exit(0);
