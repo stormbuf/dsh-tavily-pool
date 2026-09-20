@@ -255,3 +255,117 @@ describe('14：裁剪与输入顺序无关', () => {
     );
   });
 });
+
+describe('22 C2：跨实例的追加不能互相覆盖', () => {
+  /** 一份已含一条记录的磁盘状态；两个实例的用例都从它开始。 */
+  async function seededHistory(overrides = {}) {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-history-race-'));
+    const filePath = join(dir, 'history.json');
+    const document = { version: HISTORY_SCHEMA_VERSION, entries: [entry(0, { keyId: 'seed-0' })] };
+    await writeFile(filePath, `${JSON.stringify(document, null, 2)}\n`, 'utf8');
+    return { dir, filePath, ...overrides };
+  }
+
+  test('两个实例的窗口重叠时两条新记录都留存', async () => {
+    // 复现的是「读盘 ↔ rename 两个窗口重叠」：左实例读到盘之后、rename 之前，右实例走完
+    // 自己的一轮读改写。没有排他锁时后一次 rename 会盖掉前一次——审计实测 5/5 丢一条，
+    // 而两边都返回 true。
+    //
+    // 这里用注入的 fs 把那个窗口**固定**下来（不靠赛跑碰运气）：右实例的操作从左边 rename
+    // 的那一刻开始，且这里只等它「读到盘」为止——真的拿到锁时它根本读不到，于是等到退避
+    // 上限继续；左实例写完释放锁之后，它才读到含左实例记录的那份文件。
+    const { dir, filePath } = await seededHistory();
+    const real = await import('node:fs/promises');
+
+    let rightRead;
+    const rightReadHappened = new Promise((resolve) => {
+      rightRead = resolve;
+    });
+    let pendingRight;
+
+    const left = new CallHistory({
+      dir,
+      fileName: 'history.json',
+      fs: {
+        ...real,
+        rename: async (from, to) => {
+          if (to === filePath && pendingRight === undefined) {
+            pendingRight = right.append({ endpoint: 'extract', keyId: 'right-1', durationMs: 6 });
+            await Promise.race([
+              rightReadHappened,
+              new Promise((resolve) => {
+                setTimeout(resolve, 150);
+              }),
+            ]);
+          }
+          return real.rename(from, to);
+        },
+      },
+    });
+    const right = new CallHistory({
+      dir,
+      fileName: 'history.json',
+      fs: {
+        ...real,
+        readFile: async (...args) => {
+          const raw = await real.readFile(...args);
+          if (args[0] === filePath) rightRead();
+          return raw;
+        },
+      },
+    });
+
+    const leftWritten = await left.append({ endpoint: 'search', keyId: 'left-1', durationMs: 5 });
+    const rightWritten = await pendingRight;
+
+    const entries = await new CallHistory({ dir, fileName: 'history.json' }).read();
+    const appended = entries.map((item) => item.keyId).filter((id) => id === 'left-1' || id === 'right-1');
+    assert.deepEqual(appended.slice().sort(), ['left-1', 'right-1'], '两条新记录都必须留存');
+    assert.equal(leftWritten && rightWritten, true, '两边都真的写进去了：这一次谁都没有丢数据');
+    assert.deepEqual((await real.readdir(dir)).sort(), ['history.json'], '锁必须被释放，不留残余文件');
+  });
+
+  test('拿不到锁时如实返回 false，绝不谎报成功', async () => {
+    // 缺陷的判据就是「两边都报成功」。锁被一个活着的写者持有时，本次追加**没有发生**，
+    // 因此它必须返回 false 并把原因记在 lastWriteError 上。
+    const { dir, filePath } = await seededHistory();
+    const { readdir } = await import('node:fs/promises');
+    // 另一个实例正持着锁：时间戳是刚刚，因此它不陈旧、不该被抢走。
+    await writeFile(`${filePath}.lock`, `${JSON.stringify({ pid: 4242, at: new Date().toISOString() })}\n`, 'utf8');
+    const history = new CallHistory({ dir, fileName: 'history.json', lockTimeoutMs: 40 });
+
+    const startedAt = Date.now();
+    const written = await history.append({ endpoint: 'search', keyId: 'blocked-1', durationMs: 3 });
+
+    assert.equal(written, false, '一次没有写进去的追加绝不能报成功');
+    assert.equal(history.lastWriteError.code, 'ELOCKED');
+    assert.match(String(history.lastWriteError), /could not acquire/u);
+    assert.ok(Date.now() - startedAt < 1000, '等待必须有界：不能把调用方挂在这里');
+    assert.deepEqual(
+      JSON.parse(await readFile(filePath, 'utf8')).entries.map((item) => item.keyId),
+      ['seed-0'],
+      '文件必须原样未动',
+    );
+    assert.deepEqual((await readdir(dir)).sort(), ['history.json', 'history.json.lock'], '不许去删一个活着的锁');
+  });
+
+  test('崩溃留下的陈旧锁会被接管，而不是让此后每一次追加都永远失败', async () => {
+    const { dir, filePath } = await seededHistory();
+    const { readdir } = await import('node:fs/promises');
+    await writeFile(
+      `${filePath}.lock`,
+      `${JSON.stringify({ pid: 999_999, at: new Date(Date.now() - 60_000).toISOString() })}\n`,
+      'utf8',
+    );
+    const history = new CallHistory({ dir, fileName: 'history.json', lockTimeoutMs: 100 });
+
+    const written = await history.append({ endpoint: 'search', keyId: 'after-crash', durationMs: 3 });
+
+    assert.equal(written, true, '陈旧锁必须被接管，否则一次崩溃等于历史永久写不进去');
+    assert.deepEqual(
+      JSON.parse(await readFile(filePath, 'utf8')).entries.map((item) => item.keyId),
+      ['seed-0', 'after-crash'],
+    );
+    assert.deepEqual((await readdir(dir)).sort(), ['history.json'], '接管之后锁必须被释放');
+  });
+});

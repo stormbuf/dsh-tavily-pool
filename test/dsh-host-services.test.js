@@ -62,8 +62,14 @@ function realSettingsProvider() {
 /**
  * 一个照抄真实宿主可见性规则的 context。
  *
- * 两条规则都来自实测：`get` 只对**注入过**的服务返回值；`ctx.<name>` 对未注入的服务抛
- * `cannot get property "x" without inject`。`ctx.inject` 在依赖齐全时**同步**跑回调。
+ * 三条规则都来自实测：`get` 只对**注入过**的服务返回值；`ctx.<name>` 对未注入的服务抛
+ * `cannot get property "x" without inject`；`ctx.inject` 的回调**不在同步栈上**——真机上
+ * `apply()` 在 `@+817ms` 就结束，而 `inject:settings` 到 `@+3385ms` 才跑（它排在**整个
+ * profile 组合完成之后**，见 `lib/dsh/host-services.js` 的实测表）。
+ *
+ * 第三条是 ticket `22` 的 `test-blindspots-1` 补上的。它此前是同步的，于是「在注入回调里
+ * 才成立的前置条件」这类缺陷在 555 条用例里没有任何判据——bug #1 与 bug #4 都是这么来的。
+ * 要断言注入回调的后果，用 {@link settleInjections} 等一个宏任务。
  *
  * @param services - 该宿主提供的服务。
  * @param options - 覆盖项。
@@ -86,8 +92,11 @@ function strictHost(services, {
     inject(deps, callback) {
       if (!deps.every((name) => services[name] !== undefined)) return { dispose: () => undefined };
       for (const name of deps) injected.add(name);
-      // 真实宿主在依赖早已就绪时是同步跑的（探针实测）。
-      callback(ctx);
+      // 服务早已就绪，但回调**仍然不在同步栈上**——真实宿主就是这样（探针实测：即便依赖
+      // 从一开始就在，`callsImmediatelyAfterInjectReturn` 也是 0）。
+      setTimeout(() => {
+        callback(ctx);
+      }, 0);
       return { dispose: () => undefined };
     },
     logger: { warn: () => undefined },
@@ -106,33 +115,47 @@ function strictHost(services, {
   return ctx;
 }
 
+/**
+ * 等注入回调跑完。
+ *
+ * `strictHost.inject` 用 `setTimeout` 推迟回调，而本函数用的是**排在它之后**的另一个宏任务
+ * （定时器按到期时刻与入队顺序兑现），因此 `await` 一次就足以看到回调的全部后果。
+ *
+ * @returns 无。
+ */
+function settleInjections() {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
 describe('实测结论：三项服务必须经 inject 才可见', () => {
   test('INJECTED_SERVICES 与实测的三项一致', () => {
     assert.deepEqual([...INJECTED_SERVICES].sort(), [...ISOLATED_SERVICES].sort());
   });
 
-  test('未注入时 get 读不到，注入后读得到——替身自己先证明它压得住这个缺陷', () => {
+  test('未注入时 get 读不到，注入后读得到——替身自己先证明它压得住这个缺陷', async () => {
     const host = strictHost({ settings: 'a-settings-service' });
 
     assert.equal(host.get('settings'), undefined, '未注入时必须读不到，否则这组用例是空转');
 
-    let seen;
-    bindHostServices(host, { }, { settings: () => undefined });
-    // 用插件真正会走的那条路再绑一次。
+    // 用插件真正会走的那条路绑一次。回调**不在同步栈上**，因此要等一个宏任务才能读到。
     const services = {};
     bindHostServices(host, services);
-    seen = services.settings;
+    assert.equal(services.settings, undefined, '注入回调还没跑，服务不该已经绑上');
+    await settleInjections();
 
-    assert.equal(seen, 'a-settings-service');
+    assert.equal(services.settings, 'a-settings-service');
     assert.equal(hostView(host, services).get('settings'), 'a-settings-service');
   });
 
-  test('服务缺席时回调永不触发，也不会抛', () => {
+  test('服务缺席时回调永不触发，也不会抛', async () => {
     const host = strictHost({});
     const services = {};
     let called = false;
 
     assert.doesNotThrow(() => bindHostServices(host, services, { connection: () => { called = true; } }));
+    await settleInjections();
 
     assert.equal(called, false);
     assert.deepEqual(services, {});
@@ -189,7 +212,9 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
     const ctx = strictHost(services, { declaredInject: ['web'] });
     ctx.logger = { warn: (message) => warnings.push(String(message)) };
     apply(ctx, {});
-    return { ctx, routes, settings, warnings, home };
+    // 注入回调不在同步栈上（见 `strictHost` 的注释），因此加载完不等于接好了。
+    await settleInjections();
+    return { ctx, services, routes, settings, warnings, home };
   }
 
   test('settings 命名空间真的注册上了（CFG-1）', async () => {
@@ -274,21 +299,55 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
   });
 
   test('宿主缺少 connection 时面板缺席，但设置与搜索照常（PIN-5）', async () => {
+    // **这条用例名承诺两件事，此前一件都没断言**（ticket `22` 的 `test-blindspots-7`）：
+    // 正文只有 `assert.doesNotThrow` 与「命名空间注册上了」——把面板注册那一段改坏
+    // （例如忽略 `registerPanelRoutes` 的 `false` 返回值、或在缺 connection 时半注册），
+    // 这条用例照样全绿。因此这里把承诺的两件事都真的断言出来：面板**缺席**，且搜索
+    // **照常**（跑一次真的 `search`，而不是只看 `apply()` 不抛）。
     const settings = realSettingsProvider();
     const home = await mkdtemp(join(tmpdir(), 'dsh-tavily-host-services-'));
+    const registered = [];
+    const warnings = [];
     const services = {
-      web: { registerSearchProvider: () => () => undefined, registerFetchProvider: () => () => undefined },
+      web: {
+        registerSearchProvider(provider) {
+          registered.push(provider);
+          return () => undefined;
+        },
+        registerFetchProvider: () => () => undefined,
+      },
       settings,
       clientModules: {},
       launchEnvironment: { get: () => undefined },
       dshHomePath: (...segments) => join(home, ...segments),
     };
     const ctx = strictHost(services, { declaredInject: ['web'] });
-    const warnings = [];
     ctx.logger = { warn: (message) => warnings.push(String(message)) };
     assert.doesNotThrow(() => apply(ctx, {}), '缺一项可选能力不该让插件加载失败');
-    assert.notEqual(settings.get(SETTINGS_NAMESPACE), undefined, '其余能力照常接上');
+    await settleInjections();
+
+    assert.notEqual(settings.get(SETTINGS_NAMESPACE), undefined, '设置照常接上');
     assert.equal(warnings.some((message) => message.includes('settings namespace')), false);
+    // 面板**缺席**：缺的正是它唯一依赖的那个服务，因此必须留下那条点名的告警，且不能有
+    // 任何路由挂上（这里没有 connection 可挂，判据是「没有把它当成注册成功」）。
+    assert.equal(
+      warnings.some((message) => message.includes('ctx.connection.fetch.register')),
+      true,
+      '面板缺席必须留下一条点名缺了什么 capability 的告警',
+    );
+
+    // 搜索**照常**：走的是真实提供方 —— 池里没有密钥，且本替身没有 credentials 服务，
+    // 因此它必须落到官方回落、并因凭据未配置而失败。**失败的形状本身**就是判据：拿到的是
+    // 回落那条路径上的错误码，说明搜索没有被 connection 的缺席拖下水。
+    const provider = registered[0];
+    assert.notEqual(provider, undefined, '搜索提供方必须已经注册');
+    await assert.rejects(
+      () => provider.search({ query: 'connection 缺席时搜索照常' }, undefined),
+      (error) => {
+        assert.equal(error.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
+        return true;
+      },
+    );
   });
 
   test('密钥池落在宿主 home 解析器给出的目录里（POOL-1）', async () => {

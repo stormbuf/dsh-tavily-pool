@@ -20,9 +20,10 @@ import z from '@deepseek-ai/schemastery';
 
 import { runWithFailover } from './lib/attempts.js';
 import {
-  HISTORY_FILE_NAME,
-  KEYS_FILE_NAME,
   FETCH_TOTAL_BUDGET_MS,
+  HISTORY_FILE_NAME,
+  HOST_BUDGET_MARGIN_MS,
+  KEYS_FILE_NAME,
   MIN_ATTEMPT_TIMEOUT_MS,
   SEARCH_TOTAL_BUDGET_MS,
   SETTINGS_NAMESPACE,
@@ -39,6 +40,7 @@ import { probeCapabilities, describeMissingCapabilities } from './lib/dsh/capabi
 import { officialFetchProvider, searchWithOfficialProvider } from './lib/dsh/fallback.js';
 import { TavilyFetchProvider } from './lib/dsh/fetch-provider.js';
 import { resolveStateDir } from './lib/dsh/home-path.js';
+import { effectiveBudgetMs, readHostToolBudgetMs } from './lib/dsh/host-budget.js';
 import { bindHostServices, hostView } from './lib/dsh/host-services.js';
 import { registerPanelRoutes } from './lib/dsh/panel-routes.js';
 import { ensurePoolLoaded } from './lib/dsh/pool-load.js';
@@ -97,7 +99,13 @@ export const Config = z.object({});
  * @property {{code: string, at: string}|undefined} lastFallbackFailure - 最近一次回落
  *   **失败**的机器码与时刻。面板据它区分「官方凭据未配置」与「官方凭据已失效」
  *   （`CFG-5`）——那两者的区别只有一次真实失败才能提供，探测只能说「有值」。
+ *   它描述的是**此刻仍然成立**的结论：一次成功的回落会清掉它（那是官方反过来接受了
+ *   这把凭据的直接证据），`MISSING` 档同样不留痕。
  * @property {boolean|undefined} panelRegistered - 面板 HTTP 接口是否已注册。
+ * @property {{search?: {budgetMs: number, source: string, hostSource: string}, fetch?: {budgetMs: number, source: string, hostSource: string}}|undefined}
+ *   hostBudget - 最近一次为每条路径定下的总预算与它的来源（`host-contract-2`）：`source`
+ *   为 `'host'` 表示取自宿主绑定的 tool `timeoutMs`，`'constant'` 表示退回本插件的常量。
+ *   它只是**观测**，不参与决策——决策读的是那次调用的返回值。
  */
 
 /**
@@ -124,6 +132,7 @@ export function apply(ctx, _config) {
     lastFallbackFailure: undefined,
     panelRegistered: undefined,
     reportedCapabilities: undefined,
+    hostBudget: undefined,
   };
 
   // 刻意作为第一条效果语句（硬约束 5）：profile patch 把 searchProvider pin 到本插件，
@@ -358,7 +367,12 @@ async function search(state, request, signal) {
   }
 
   const startedAt = Date.now();
-  const deadlineMs = startedAt + SEARCH_TOTAL_BUDGET_MS;
+  // 总预算**先问宿主**（`host-contract-2`）：宿主把 `web_search` 的单次预算绑在工具定义上，
+  // 由 timeout-policy 武装成硬 deadline。按写死的常量排布时，宿主先到点就会用一句
+  // `tool call timed out after …ms` 顶掉上游的真实错误（`REST-10` 要求透穿的正是后者）。
+  // 读不到（退化宿主、或 `tools` 在本 fiber 不可见）才退回常量，`state.hostBudget.search.source`
+  // 如实说出走的是哪一档，面板可以据此显示。
+  const deadlineMs = startedAt + budgetFor(state, 'search').budgetMs;
   let result;
   try {
     ({ result } = await runWithFailover({
@@ -458,8 +472,10 @@ async function fetchUrl(state, request, signal) {
   }
 
   const startedAt = Date.now();
-  // 抓取用**它自己的**预算：宿主给 web_fetch 的只有 30 秒，而给 web_search 的是 60 秒。
-  const deadlineMs = startedAt + FETCH_TOTAL_BUDGET_MS;
+  // 抓取用**它自己的**预算，且同样先问宿主（`host-contract-2`）：宿主给 web_fetch 的默认
+  // 是 30 秒、给 web_search 的默认是 30 秒但 `dsh-base` 把它抬到 60——两个值都可能被
+  // 部署或 preset 覆盖，因此「哪个工具对应哪条预算」只能按工具名问，不能按常量猜。
+  const deadlineMs = startedAt + budgetFor(state, 'fetch').budgetMs;
   let outcome;
   try {
     outcome = await runWithFailover({
@@ -493,6 +509,35 @@ async function fetchUrl(state, request, signal) {
 
   reportWriteErrors(state);
   return outcome.result;
+}
+
+/**
+ * 本次调用该按多久的**总**预算排布（`host-contract-2`）。
+ *
+ * 宿主把每个工具的 `timeoutMs` 绑在工具定义上，`timeout-policy` 读它武装成硬 deadline；
+ * 因此正确的预算是**那个值减去余量**，而不是我们自己的常量。读不到时才退回常量，并由
+ * `source` 如实说出走的是哪一档——面板据它显示，用户与维护者因此不必猜。
+ *
+ * 每次调用都现读一次：`tools` 服务可能在插件加载之后才就位（注入回调的时序见
+ * `lib/dsh/host-services.js`），而宿主也可能在运行期重建工具注册表。
+ *
+ * `state.hostBudget` 只留**最近一次**读数，供面板展示；它不是调度依据——调度依据就是
+ * 本次返回值。
+ *
+ * @param state - 插件运行时状态。
+ * @param kind - `'search'` 或 `'fetch'`。
+ * @returns `{ budgetMs, source }`：本次可用的总预算与它的来源。
+ */
+function budgetFor(state, kind) {
+  const host = readHostToolBudgetMs(state.host, kind === 'search' ? 'web_search' : 'web_fetch');
+  const budget = effectiveBudgetMs({
+    hostMs: host.timeoutMs,
+    fallbackMs: kind === 'search' ? SEARCH_TOTAL_BUDGET_MS : FETCH_TOTAL_BUDGET_MS,
+    marginMs: HOST_BUDGET_MARGIN_MS,
+  });
+  const reading = { budgetMs: budget.budgetMs, source: budget.source, hostSource: host.source };
+  state.hostBudget = { ...state.hostBudget, [kind]: reading };
+  return reading;
 }
 
 /**
@@ -581,6 +626,10 @@ async function fallbackToOfficialFetch(state, request, signal, reason) {
 async function fallbackToOfficial(state, request, signal, reason) {
   try {
     const result = await searchWithOfficialProvider({ ctx: state.host, request, signal, reason });
+    // **成功即撤销上一次失败留下的凭据结论。** 「凭据已失效」这个判断的全部依据是
+    // 「官方拒了它」，而刚刚这一次官方接受了它——留下旧结论会让面板持续指引用户去换
+    // 一把其实可用的凭据，把真正的问题（网络、代理、WAF 的 403）盖住。
+    state.lastFallbackFailure = undefined;
     if (state.reportedFallbackReason !== reason) {
       state.reportedFallbackReason = reason;
       report(
@@ -597,7 +646,14 @@ async function fallbackToOfficial(state, request, signal, reason) {
     if (error?.code === 'TAVILY_FALLBACK_CREDENTIAL_MISSING' || error?.code === 'TAVILY_FALLBACK_CREDENTIAL_INVALID') {
       // 记下这次失败。面板要区分「未配置」与「已失效」（`CFG-5`），而那个区别只有一次
       // **真实发生**的回落才能提供——`available()` 只会说「有值」，不会说「值还能用」。
-      state.lastFallbackFailure = { code: error.code, at: new Date().toISOString() };
+      //
+      // 只有「已失效」值得留痕：`describeOfficialCredential` 对 `MISSING` **不做保留**
+      // （用户配好凭据之后，当场探测立刻会说 `configured`），留一条只会让面板的
+      // `lastFailureAt` 指着一件已经不存在的事。因此这一档按「清掉」处理，与探测那侧的
+      // 语义一致。
+      state.lastFallbackFailure = error.code === 'TAVILY_FALLBACK_CREDENTIAL_INVALID'
+        ? { code: error.code, at: new Date().toISOString() }
+        : undefined;
       throw new TavilyError(error.message, { code: error.code, cause: error });
     }
     if (error?.code === 'WEB_ABORTED') {
@@ -650,7 +706,7 @@ async function probeQuotaForReset(state, signal) {
 }
 
 /**
- * 把「状态没写进磁盘」上报一次，然后清掉标记。
+ * 把「状态没写进磁盘」与「密钥池在进程外被改过」各上报一次，然后清掉标记。
  *
  * 统计落盘失败不影响本次结果——它不是正确性前提——但绝不能是静默的：用户下次打开
  * 面板时会看到一份「这把密钥从没被用过」的记录，而没有任何线索说明为什么。
@@ -658,6 +714,12 @@ async function probeQuotaForReset(state, signal) {
  * 调用历史（`14`）走同一条路：它也是记录，也是「写不进去不影响本次调用」，而它的失败同样
  * 会让面板上少一段曲线而没有任何解释。两者一起上报，是因为它们对用户说的是同一件事——
  * 「这次调用没有被记住」。
+ *
+ * **外部改动（ticket `22` C1）是第三件事，但说的是同一类话。** 真源语义允许用户在进程运行
+ * 期间手工编辑 `keys.json`，而这条语义此前不存在：磁盘上的改动会被下一次落盘整份覆盖，
+ * 无声无息。现在它算数了，于是「你刚补的那把已经被读进来了」必须有地方说出来——否则用户
+ * 只能靠数面板上的行数去猜自己那次编辑到底生效没有。上报之后同样清掉：这条日志描述的是
+ * **一次**外部改动，留着它会让此后每一次搜索都重复同一句话。
  *
  * 报告后即清除：留着它会让一次瞬时故障在此后每一次搜索上都重复告警，而那条日志
  * 早已完成使命。下一次真的又失败时，它会再次被设上。
@@ -682,6 +744,17 @@ function reportWriteErrors(state) {
       + `${String(state.history.lastWriteError)}`,
     );
     state.history.lastWriteError = undefined;
+  }
+  if (state.pool.lastExternalChange !== undefined) {
+    const change = state.pool.lastExternalChange;
+    report(
+      state.host,
+      'warn',
+      `dsh-tavily-pool: ${state.pool.filePath} was changed outside this process `
+      + `(${String(change.added)} key(s) added, ${String(change.removed)} removed, `
+      + `${String(change.changed)} edited); the pool now follows the file.`,
+    );
+    state.pool.lastExternalChange = undefined;
   }
 }
 

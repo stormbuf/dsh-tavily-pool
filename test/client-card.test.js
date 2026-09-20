@@ -26,7 +26,23 @@ import { dirname, join } from 'node:path';
 import test, { describe } from 'node:test';
 import vm from 'node:vm';
 
-import { SETTINGS_NAMESPACE } from '../lib/constants.js';
+import {
+  ADVANCED_EXTRACT_CREDITS_PER_FIVE,
+  BASIC_EXTRACT_CREDITS_PER_FIVE,
+  EXTRACT_DEPTH_VALUES,
+  EXTRACT_FORMAT_VALUES,
+  EXTRACT_URLS_PER_CREDIT_TIER,
+  SETTINGS_NAMESPACE,
+  USAGE_QUOTA_MAX_CALLS,
+  USAGE_QUOTA_WINDOW_MS,
+} from '../lib/constants.js';
+import {
+  MAX_RESULTS_MAX,
+  MAX_RESULTS_MIN,
+  SCHEDULING_POLICY_VALUES,
+  SEARCH_DEPTH_VALUES,
+  TOPIC_VALUES,
+} from '../lib/settings.js';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLIENT_FILE = join(repoRoot, 'lib/client.js');
@@ -116,6 +132,31 @@ function reactStub({ ui, draft } = {}) {
  */
 function applied(update, base) {
   return typeof update.next === 'function' ? update.next(base) : update.next;
+}
+
+/**
+ * 把某一次动作里全部 hook 更新按序套到基准状态上。
+ *
+ * 一次动作会分几次 `patch`（开始、结果、收尾），只看最后一条会漏掉中间那条真正写进
+ * 提示的更新。
+ *
+ * @param updates - `reactStub` 记下的更新。
+ * @param base - 动作开始前的瞬时状态。
+ * @returns 动作结束后的瞬时状态。
+ */
+function uiAfter(updates, base) {
+  return updates
+    .filter((update) => update.slot === 0)
+    .reduce((state, update) => applied(update, state), base);
+}
+
+/** 让 vm 里那条 async 链跑完：它的每一个 `await` 都落在已兑现的 promise 上。 */
+async function flush() {
+  for (let index = 0; index < 4; index += 1) {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
 }
 
 /**
@@ -606,31 +647,6 @@ describe('POOL-8：批量添加', () => {
     };
   }
 
-  /** 让 vm 里那条 async 链跑完：它的每一个 `await` 都落在已兑现的 promise 上。 */
-  async function flush() {
-    for (let index = 0; index < 4; index += 1) {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 0);
-      });
-    }
-  }
-
-  /**
-   * 把某一次动作里全部 hook 更新按序套到基准状态上。
-   *
-   * 一次动作会分几次 `patch`（开始、结果、收尾），只看最后一条会漏掉中间那条真正写进
-   * 提示的更新。
-   *
-   * @param updates - `reactStub` 记下的更新。
-   * @param base - 动作开始前的瞬时状态。
-   * @returns 动作结束后的瞬时状态。
-   */
-  function uiAfter(updates, base) {
-    return updates
-      .filter((update) => update.slot === 0)
-      .reduce((state, update) => applied(update, state), base);
-  }
-
   /** 粘进框里的那段文本：首尾有换行、中间有缩进、还夹着一个重复行。 */
   const PASTED = '\ntvly-dev-a\n  tvly-dev-b  \n\ntvly-dev-a';
 
@@ -645,6 +661,183 @@ describe('POOL-8：批量添加', () => {
     assert.notEqual(dialog, undefined, '弹框没有渲染出来');
     return flatten(dialog).find((element) => element.type === 'button' && textsOf(element).includes(text));
   }
+
+  /**
+   * 批量删除弹框打开时的瞬时状态。
+   *
+   * 默认池里有两条记录：勾选框的数量与 `ui.state.keys` 一一对应，空池下这条断言没有判据。
+   *
+   * @param picked - 已勾选的 id。
+   * @param keys - 池内记录；默认两条。
+   * @returns 一份瞬时状态。
+   */
+  function removeUi(picked = [], keys = [keyRecord({ id: 'key-1' }), keyRecord({ id: 'key-2', masked: 'tvly-dev-…B' })]) {
+    return { ...readyUi({ keys }), removeOpen: true, removePicked: new Set(picked) };
+  }
+
+  /** 删除弹框里的按钮——按 `role=dialog` 先定位弹框，免得撞上别处的同名按钮。 */
+  function removeDialogButton(tree, text) {
+    const dialog = flatten(tree).find((element) => element.props?.['aria-label'] === '批量删除密钥');
+    assert.notEqual(dialog, undefined, '删除弹框没有渲染出来');
+    return flatten(dialog).find((element) => element.type === 'button' && textsOf(element).includes(text));
+  }
+
+  test('单把添加重复时说一句话：列表一行没变，否则看起来像加失败了（D1）', async () => {
+    // 服务端在 `add` 上也查重（`POOL-9`）：重复时回 200 + `added: 0`。前端若只看 HTTP 状态，
+    // 用户看到的是「输入框清了、列表没多一行」——那读起来像加失败，而不是「本来就有」。
+    const calls = [];
+    const addedAgain = async (path, options = {}) => {
+      calls.push({ path, body: options.body === undefined ? undefined : JSON.parse(options.body) });
+      const payload = path === '/api/tavily-pool.keys'
+        ? { keys: [keyRecord()], summary: { received: 1, added: 0, duplicates: 1 } }
+        : sampleState({ keys: [keyRecord()] });
+      return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+    };
+    const { component, t, updates } = await mountedCard({
+      globals: { fetch: addedAgain },
+      hooks: { ui: { ...readyUi({ keys: [keyRecord()] }), newKey: 'tvly-dev-dup' }, draft: readyDraft() },
+    });
+
+    await buttonWithText(component({ t }), '添加').props.onClick();
+    await flush();
+
+    const post = calls.find((call) => call.path === '/api/tavily-pool.keys');
+    assert.deepEqual(post.body, { action: 'add', key: 'tvly-dev-dup' });
+    assert.equal(uiAfter(updates, readyUi()).notice, '这一把已经在池中了，没有新增。');
+
+    // 对照：真的加进去时不留这句话（否则每次成功都会挂一句多余提示）。
+    const fresh = [];
+    const { component: okComponent, t: okT, updates: okUpdates } = await mountedCard({
+      globals: {
+        fetch: async (path, options = {}) => {
+          fresh.push({ path, body: options.body === undefined ? undefined : JSON.parse(options.body) });
+          const payload = path === '/api/tavily-pool.keys'
+            ? { keys: [keyRecord()], summary: { received: 1, added: 1, duplicates: 0 } }
+            : sampleState({ keys: [keyRecord()] });
+          return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+        },
+      },
+      hooks: { ui: { ...readyUi(), newKey: 'tvly-dev-new' }, draft: readyDraft() },
+    });
+    await buttonWithText(okComponent({ t: okT }), '添加').props.onClick();
+    await flush();
+    assert.equal(uiAfter(okUpdates, readyUi()).notice, null);
+  });
+
+  test('读不到宿主绑定预算时给出提示，读到时一个字都不多说（F2）', async () => {
+    // 「我们按哪个预算排布」在别处没有任何出口。读到了就不说——那是正常情况，说了只是噪音；
+    // 读不到才要有人知道：那意味着宿主收紧 timeout 时我们仍按旧常量排布，而症状是「用户等到
+    // 的是一条宿主超时，而不是上游的真实错误」。
+    const silent = await mountedCard({
+      hooks: {
+        ui: readyUi({ hostBudget: { search: { budgetMs: 58_000, source: 'host', hostSource: 'host' } } }),
+        draft: readyDraft(),
+      },
+    });
+    assert.equal(
+      textsOf(silent.component({ t: silent.t })).some((text) => text.includes('常量')),
+      false,
+      '读到宿主值时不该多说一句',
+    );
+
+    const warned = await mountedCard({
+      hooks: {
+        ui: readyUi({ hostBudget: { search: { budgetMs: 60_000, source: 'constant', hostSource: 'unavailable' } } }),
+        draft: readyDraft(),
+      },
+    });
+    assert.equal(
+      textsOf(warned.component({ t: warned.t })).some((text) => text.includes('60000ms')),
+      true,
+      '退回常量时必须说出来，并带上那个数',
+    );
+
+    const never = await mountedCard({ hooks: { ui: readyUi({ hostBudget: null }), draft: readyDraft() } });
+    assert.equal(
+      textsOf(never.component({ t: never.t })).some((text) => text.includes('常量')),
+      false,
+      '一次都没搜过时没有任何观测，不该断言任何事',
+    );
+  });
+
+  test('密钥池标题行给出批量删除入口，且一把密钥都没有时它是灰的', async () => {
+    // `panel-http-4` 的出口是服务端的一半，这里是另一半：**没有入口的上限等于没有清理的路**。
+    const { component, t } = await mountedCard({
+      hooks: { ui: readyUi({ keys: [keyRecord()] }), draft: readyDraft() },
+    });
+    const withKeys = component({ t });
+    const entry = buttonWithText(withKeys, '批量删除');
+    assert.notEqual(entry, undefined, '标题行要有批量删除的入口');
+    assert.equal(entry.props.disabled, false);
+
+    const emptyCard = await mountedCard({ hooks: { ui: readyUi({ keys: [] }), draft: readyDraft() } });
+    const empty = buttonWithText(emptyCard.component({ t: emptyCard.t }), '批量删除');
+    assert.equal(empty.props.disabled, true, '池子空着时这个按钮没有意义');
+  });
+
+  test('确认之前一个勾都没打时，主按钮不可用——空提交不该发一趟请求', async () => {
+    const { component, t } = await mountedCard({
+      globals: { document: documentStub() },
+      hooks: { ui: removeUi(), draft: readyDraft() },
+    });
+
+    assert.equal(removeDialogButton(component({ t }), '一把都没勾选').props.disabled, true);
+  });
+
+  test('确认把勾到的 id 发成 removeBatch：勾选集按 id 记，不按下标', async () => {
+    const calls = [];
+    const { component, t, updates } = await mountedCard({
+      globals: {
+        document: documentStub(),
+        fetch: async (path, options = {}) => {
+          calls.push({ path, body: options.body === undefined ? undefined : JSON.parse(options.body) });
+          const payload = path === '/api/tavily-pool.keys'
+            ? { keys: [], summary: { received: 2, removed: 2 } }
+            : sampleState();
+          return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+        },
+      },
+      hooks: { ui: removeUi(['key-1', 'key-2']), draft: readyDraft() },
+    });
+
+    await removeDialogButton(component({ t }), '删除所选').props.onClick();
+    await flush();
+
+    const post = calls.find((call) => call.path === '/api/tavily-pool.keys');
+    assert.notEqual(post, undefined, '确认要经面板接口提交');
+    assert.deepEqual(post.body, { action: 'removeBatch', ids: ['key-1', 'key-2'] });
+    const ui = uiAfter(updates, removeUi(['key-1', 'key-2']));
+    assert.equal(ui.removeOpen, false, '成功后弹框关闭');
+    assert.equal(ui.removePicked.size, 0, '勾选一并清空，免得下次打开还留着上一轮的 id');
+    assert.equal(ui.notice, '已删除 2 把密钥');
+  });
+
+  test('每一行是一个复选框，勾选状态来自 id 集合', async () => {
+    const keys = [keyRecord({ id: 'key-1' }), keyRecord({ id: 'key-2', masked: 'tvly-dev-…B' })];
+    const { component, t } = await mountedCard({
+      globals: { document: documentStub() },
+      hooks: { ui: removeUi(['key-2']), draft: readyDraft() },
+    });
+
+    const dialog = flatten(component({ t }))
+      .find((element) => element.props?.['aria-label'] === '批量删除密钥');
+    const boxes = flatten(dialog).filter((element) => element.type === 'input');
+    assert.equal(boxes.length, keys.length, '池里有几把就画几个复选框');
+    assert.deepEqual(boxes.map((box) => box.props.checked), [false, true]);
+  });
+
+  test('提交中整框禁用：删除不可撤销，不能在飞的时候改选', async () => {
+    const { component, t } = await mountedCard({
+      globals: { document: documentStub() },
+      hooks: { ui: { ...removeUi(['key-1']), busy: 'removeBatch' }, draft: readyDraft() },
+    });
+    const tree = component({ t });
+
+    assert.equal(removeDialogButton(tree, '删除中…').props.disabled, true);
+    const dialog = flatten(tree).find((element) => element.props?.['aria-label'] === '批量删除密钥');
+    const boxes = flatten(dialog).filter((element) => element.type === 'input');
+    assert.equal(boxes.every((box) => box.props.disabled === true), true);
+  });
 
   test('密钥池标题行给出入口，没点开时一个弹层都不渲染', async () => {
     const { component, t } = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
@@ -1034,9 +1227,10 @@ describe('PANEL-5：卡片渲染出中英双语文案', () => {
     assert.deepEqual(values, ['basic', 'general', 'balance', 'basic', 'markdown']);
 
     const options = selects.map((element) => element.children.map((child) => child.props.value));
-    assert.deepEqual(options[2], ['balance', 'manual'], '调度策略的词表要与 SCHEDULING_POLICY_VALUES 一致');
-    assert.deepEqual(options[3], ['basic', 'advanced'], '抽取深度的词表要与 EXTRACT_DEPTH_VALUES 一致');
-    assert.deepEqual(options[4], ['markdown', 'text'], '返回格式的词表要与 EXTRACT_FORMAT_VALUES 一致');
+    // 期望值来自权威导出，不是抄一份字面量：改了 schema 的词表而没改客户端副本时，这条会红。
+    assert.deepEqual(options[2], [...SCHEDULING_POLICY_VALUES], '调度策略的词表要与 SCHEDULING_POLICY_VALUES 一致');
+    assert.deepEqual(options[3], [...EXTRACT_DEPTH_VALUES], '抽取深度的词表要与 EXTRACT_DEPTH_VALUES 一致');
+    assert.deepEqual(options[4], [...EXTRACT_FORMAT_VALUES], '返回格式的词表要与 EXTRACT_FORMAT_VALUES 一致');
   });
 
   test('每把密钥的最近耗时也显示出来（USAGE-7）', async () => {
@@ -1411,12 +1605,14 @@ describe('面板状态里的诊断信息照样渲染出来', () => {
   });
 
   test('越界的 maxResults 让保存按钮不可用，并说明取值区间（CFG-4）', async () => {
+    const range = `${MAX_RESULTS_MIN}–${MAX_RESULTS_MAX}`;
     const { component, t } = await mountedCard({
-      hooks: { ui: readyUi(), draft: { ...readyDraft(), maxResults: '21' } },
+      hooks: { ui: readyUi(), draft: { ...readyDraft(), maxResults: String(MAX_RESULTS_MAX + 1) } },
     });
 
     const tree = component({ t });
-    assert.equal(textsOf(tree).some((text) => text.includes('1–20')), true);
+    // 区间由权威常量算出：schema 放宽上界而卡片还停在旧区间时，这里给的就是两个不同的串。
+    assert.equal(textsOf(tree).some((text) => text.includes(range)), true);
     assert.equal(buttonWithText(tree, '保存').props.disabled, true, '本地就不该放一个必然被 schema 拒绝的值出去');
   });
 
@@ -1605,5 +1801,418 @@ describe('14：调用历史与图表', () => {
     });
 
     assert.doesNotThrow(() => component({ t }));
+  });
+});
+
+/**
+ * 渲染一把密钥，返回屏幕上出现的文字与进度条宽度。
+ *
+ * 余额用例的判据一律是**渲染出来的东西**：`balanceOf` 在工厂体内，抠不出来也不该为测试
+ * 开一个口子。
+ *
+ * @param usage - 密钥记录里的 `usage`。
+ * @returns `{ texts, width }`；`width` 为 `undefined` 表示没有画进度条。
+ */
+async function renderKeyUsage(usage) {
+  const { component, t } = await mountedCard({
+    hooks: { ui: readyUi({ keys: [keyRecord({ usage })] }), draft: readyDraft() },
+  });
+  const tree = component({ t });
+  const fill = flatten(tree).find((element) => element.props?.className === 'dtp-bar-fill');
+  return { texts: textsOf(tree), width: fill?.props.style.width };
+}
+
+describe('22-E1：「测试连通性」之后要重读状态', () => {
+  /** 一个记录请求的 fetch 替身：`test` 路由回一条成功结论，其余当状态读。 */
+  function fetchStub(calls) {
+    return async (path, options = {}) => {
+      calls.push(`${options.method ?? 'GET'} ${path}`);
+      const payload = path === '/api/tavily-pool.test'
+        ? { id: 'key-1', ok: true, classification: 'ok', error: null }
+        : sampleState({ keys: [keyRecord()] });
+      return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+    };
+  }
+
+  test('成功之后重新读 /state：额度耗尽标记与余额不会停在旧快照上（client-artifact-1）', async () => {
+    const calls = [];
+    const base = readyUi({ keys: [keyRecord()] });
+    const { component, t, updates } = await mountedCard({
+      globals: { fetch: fetchStub(calls) },
+      hooks: { ui: base, draft: readyDraft() },
+    });
+
+    await buttonWithText(component({ t }), '测试连通性').props.onClick();
+    await flush();
+
+    // 这条路由走的是同一次 `/usage` 刷新：它会写余额缓存，并在余额为正时清掉额度耗尽
+    // 标记（`SCHED-8`）。只把结论记进 `ui.tests` 的话，同一行会同时显示「额度耗尽」与
+    // 「可用」，而余额停在旧读数上——这个按钮存在的意义正是让用户看到它是不是真恢复了。
+    assert.deepEqual(calls, ['POST /api/tavily-pool.test', 'GET /api/tavily-pool.state']);
+
+    const ui = uiAfter(updates, base);
+    assert.equal(ui.tests['key-1'].classification, 'ok', '测试结论要留在状态里');
+    assert.equal(ui.state.keys[0].masked, 'tvly-dev-…iJWq', '重读回来的状态也要留下');
+  });
+});
+
+describe('22-E2：客户端内联的余额判定与 lib/balance.js 等价', () => {
+  test('逐条比对：判定层给什么结论，面板就说同一件事（boundaries-drift-1）', async () => {
+    const { readBalance } = await import('../lib/balance.js');
+
+    // 前四条是「上限不大于 0」那一类：判定层对上限没有下限约束，客户端副本曾经多判一条
+    // 「不大于 0 就算未知」，于是同一把密钥在面板上是「未知」、在调度器里却是 rank 0
+    // （`SCHED-2`）并被优先使用——用户看到「未知」，却解释不了调度为什么先用它。
+    const entries = [
+      { key: { limit: 0, usage: 0 } },
+      { key: { limit: 0, usage: 5 } },
+      { key: { limit: null, usage: 5 }, account: { plan_limit: 0 } },
+      { key: { limit: -5, usage: 0 } },
+      { key: { limit: 1000, usage: 250 } },
+      { key: { limit: 1000, usage: 1200 } },
+      { key: { limit: null, usage: 12 }, account: { plan_limit: 1000 } },
+      { key: { limit: null, usage: 12 }, account: { plan_limit: null } },
+      { key: { limit: null, usage: 12 } },
+      { key: { limit: 1000 } },
+      {},
+    ];
+
+    for (const entry of entries) {
+      const expected = readBalance(entry);
+      const { texts, width } = await renderKeyUsage(entry);
+      const label = `usage = ${JSON.stringify(entry)}`;
+
+      if (expected.kind === 'known') {
+        // 显示层的除法保护：上限为 0 时进度条画 0%，而不是把 `NaN` 写进 `width`。
+        const percent = expected.limit > 0 ? Math.round((expected.remaining / expected.limit) * 100) : 0;
+        assert.equal(
+          texts.includes(`剩余 ${expected.remaining} / ${expected.limit} 积分`),
+          true,
+          `${label}：判定层给了 known，面板就该给出同一组数字`,
+        );
+        assert.equal(width, `${percent}%`, `${label}：进度条宽度`);
+      } else if (expected.kind === 'unlimited') {
+        assert.equal(texts.includes('无限'), true, `${label}：判定层给了 unlimited`);
+        assert.equal(width, undefined, `${label}：没有分母就不画进度条`);
+      } else {
+        assert.equal(texts.includes('未知'), true, `${label}：判定层给了 unknown`);
+        assert.equal(width, undefined, `${label}：未知不该画成 0%`);
+      }
+    }
+  });
+});
+
+describe('22-E4：读数的陈旧度要看得见', () => {
+  /**
+   * 一份带读数时刻的 `usage`。
+   *
+   * @param agoMs - 官方读数距现在多久。
+   * @param overrides - 额外覆盖。
+   * @returns `usage` 缓存项。
+   */
+  function usageReadAgo(agoMs, overrides = {}) {
+    return {
+      key: { limit: 1000, usage: 250 },
+      stale: false,
+      fetchedAt: new Date(Date.now() - agoMs).toISOString(),
+      ...overrides,
+    };
+  }
+
+  test('本地前推过的读数与刚刷新出来的读数渲染不同（client-artifact-8）', async () => {
+    // `lib/pool.js` 的 `advanceUsage` 只前推 `usage`、**不动 `fetchedAt`**：于是「本地前推
+    // 过」与「刚跟官方对过」在服务端只差读数时刻有多旧。这里用同一份 usage 值渲染两次，
+    // 差异因此只可能来自那一行读数时刻。
+    const fresh = await renderKeyUsage(usageReadAgo(0));
+    const aged = await renderKeyUsage(usageReadAgo(2 * 3600 * 1000));
+
+    assert.notDeepEqual(aged.texts, fresh.texts, '读数是不是刚拿到的，必须看得出来');
+
+    const difference = aged.texts.filter((text) => !fresh.texts.includes(text));
+    assert.equal(difference.length, 1, `差别只该是读数时刻那一行，实际：${JSON.stringify(difference)}`);
+    assert.match(difference[0], /上次官方读数/u, '说的是事实（读数时刻），不是「这是估计值」这类无从验证的结论');
+    assert.equal(aged.width, fresh.width, '陈旧度是读数的事，不改动余额本身');
+  });
+
+  test('读数还很新时一个字都不多说', async () => {
+    const fresh = await renderKeyUsage(usageReadAgo(0));
+    const justNow = await renderKeyUsage(usageReadAgo(60 * 1000));
+
+    assert.deepEqual(justNow.texts, fresh.texts, '一分钟前的读数与刚刚读到的是同一件事，多一行只是噪音');
+  });
+
+  test('读数时刻读不出来时什么都不说，也不渲染 Invalid Date', async () => {
+    const fresh = await renderKeyUsage(usageReadAgo(0));
+
+    for (const fetchedAt of [undefined, 'not-a-date', 42]) {
+      const broken = await renderKeyUsage({ key: { limit: 1000, usage: 250 }, stale: false, fetchedAt });
+      assert.deepEqual(broken.texts, fresh.texts, `fetchedAt = ${String(fetchedAt)} 时不该编造读数时刻`);
+    }
+  });
+
+  test('陈旧标记与读数时刻是两件事，同时成立时两行都在', async () => {
+    const { texts } = await renderKeyUsage(usageReadAgo(2 * 3600 * 1000, { stale: true }));
+
+    assert.equal(texts.some((text) => text.includes('上次刷新失败')), true, '陈旧标记说的是「上次刷新失败」');
+    assert.equal(texts.some((text) => text.includes('上次官方读数')), true, '读数时刻说的是「这个数字有多旧」');
+  });
+});
+
+/**
+ * 从 `dtp-field` 里按标签取出那个下拉的选项值。
+ *
+ * 按**标签**而不是按出现次序定位：次序是布局的副产品，谁把字段挪一下就会让对账比错对象，
+ * 而那种失败看起来像「词表漂移」，会把排查引到错的地方。
+ *
+ * @param tree - 渲染出来的元素树。
+ * @param label - 字段标签（已翻译）。
+ * @returns 选项值数组。
+ */
+function optionsOfField(tree, label) {
+  const field = flatten(tree).find(
+    (element) => element.props?.className === 'dtp-field' && textsOf(element).includes(label),
+  );
+  assert.notEqual(field, undefined, `没有找到「${label}」这个字段`);
+  const select = flatten(field).find((element) => element.type === 'select');
+  assert.notEqual(select, undefined, `「${label}」应当是一个下拉`);
+  return select.children.map((child) => child.props.value);
+}
+
+/**
+ * 从一份文案里抽出「每个窗口允许发多少次 `/usage`」。
+ *
+ * 五处文案的语序各不相同（`10 calls per 600s`、`每 600 秒 10 次`、`10 次 / 10 分钟`、
+ * `10 requests / 10 minutes`、`10-per-10-minutes`），因此每种写法一条正则。正则只规定
+ * **语序与单位词**，数字一个都不写死——期望值由常量算出，于是「改了常量、文案停在旧数字」
+ * 这条漂移必然被抓住。
+ *
+ * @param text - 文件全文。
+ * @returns `{ calls, windowMs, text }[]`，按扫描顺序。
+ */
+function quotaNumbersIn(text) {
+  const patterns = [
+    { re: /(\d+) calls per (\d+)s/gu, unitMs: 1_000, callsFirst: true },
+    { re: /每 (\d+) 秒 (\d+) 次/gu, unitMs: 1_000, callsFirst: false },
+    { re: /(\d+) 次 \/ (\d+) 分钟/gu, unitMs: 60_000, callsFirst: true },
+    { re: /(\d+) requests \/ (\d+) minutes/gu, unitMs: 60_000, callsFirst: true },
+    { re: /(\d+)-per-(\d+)-minutes/gu, unitMs: 60_000, callsFirst: true },
+  ];
+  const found = [];
+  for (const { re, unitMs, callsFirst } of patterns) {
+    for (const match of text.matchAll(re)) {
+      const first = Number(match[1]);
+      const second = Number(match[2]);
+      found.push({
+        calls: callsFirst ? first : second,
+        windowMs: (callsFirst ? second : first) * unitMs,
+        text: match[0],
+      });
+    }
+  }
+  return found;
+}
+
+/**
+ * 数词到数字。计费文案里两种写法都有：正文用阿拉伯数字（`每 5 个`），而 `five-URL`、
+ * `every fifth`、`每第五次` 用的是词。守卫两种都要认，否则改常量时那几处会静默留在旧数字上。
+ */
+const NUMBER_WORDS = Object.freeze({
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  first: 1,
+  second: 2,
+  third: 3,
+  fourth: 4,
+  fifth: 5,
+  sixth: 6,
+  seventh: 7,
+  eighth: 8,
+  ninth: 9,
+  tenth: 10,
+  一: 1,
+  二: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+  十: 10,
+});
+
+/**
+ * 把文案里捕获到的「数字或数词」解析成数字。
+ *
+ * 解析不出来时断言失败而不是跳过：那说明文案被改写成了守卫不认识的写法，而静默跳过等于
+ * 把这条对账悄悄关掉。
+ *
+ * @param token - 捕获到的片段。
+ * @returns 数字。
+ */
+function numberOf(token) {
+  if (/^\d+$/u.test(token)) return Number(token);
+  const value = NUMBER_WORDS[token.toLowerCase()];
+  assert.notEqual(value, undefined, `不认识这个数词：${token}`);
+  return value;
+}
+
+/**
+ * 计费文案的副本清单：每条给出「数字出现的语序」与「每个捕获组扮演的角色」。
+ *
+ * 角色到期望值的映射在用例里由 `lib/constants.js` 算出。没列入的只有两类，都不在这张表里：
+ * 派生出来的修辞句（`drain it five times faster`、`快五倍地掉`），以及 `account.plan_limit`
+ * 那个官方实测值（`1000`）——前者不是规则陈述，后者根本不是本仓库的常量。
+ */
+const BILLING_COPY = Object.freeze([
+  {
+    file: 'lib/client.js',
+    label: '中文抓取提示',
+    pattern: /每 (\S+) 个成功抽取的 URL 计 (\S+) 积分（advanced 计 (\S+)）/gu,
+    roles: ['tierUrls', 'basicCredits', 'advancedCredits'],
+  },
+  {
+    file: 'lib/client.js',
+    label: '英文抓取提示',
+    pattern: /Every (\S+) successful URLs cost (\S+) credit \(advanced costs (\S+)\)/gu,
+    roles: ['tierUrls', 'basicCredits', 'advancedCredits'],
+  },
+  {
+    file: 'lib/settings.js',
+    label: '抓取深度描述',
+    pattern: /每 (\S+) 个成功 URL 分别计 (\S+) \/ (\S+) 积分/gu,
+    roles: ['tierUrls', 'basicCredits', 'advancedCredits'],
+  },
+  {
+    file: 'docs/usage.md',
+    label: '抓取计费行',
+    pattern: /every \*\*(\S+) successful\*\* URL extractions cost (\S+) credit \(`basic`\) or (\S+)/gu,
+    roles: ['tierUrls', 'basicCredits', 'advancedCredits'],
+  },
+  { file: 'docs/usage.md', label: 'five-URL 计数器', pattern: /the (\S+)-URL counter/gu, roles: ['tierUrls'] },
+  {
+    file: 'docs/usage.md',
+    label: 'every fifth 那句',
+    pattern: /every (\S+) successful fetch crosses a tier/gu,
+    roles: ['tierUrls'],
+  },
+  {
+    file: 'docs/usage.zh-CN.md',
+    label: '抓取计费行',
+    pattern: /每 \*\*(\S+) 个成功抓取\*\*的 URL 计 (\S+) 积分（`basic`）或 (\S+) 积分/gu,
+    roles: ['tierUrls', 'basicCredits', 'advancedCredits'],
+  },
+  {
+    file: 'docs/usage.zh-CN.md',
+    label: '「每 N 个成功 URL」的 N',
+    pattern: /「每 (\S+) 个成功 URL」的 (\S+)/gu,
+    roles: ['tierUrls', 'tierUrls'],
+  },
+  {
+    file: 'docs/usage.zh-CN.md',
+    label: '每第 N 次那句',
+    pattern: /每第(\S+)次成功抓取/gu,
+    roles: ['tierUrls'],
+  },
+  {
+    file: 'README.md',
+    label: '英文计费行',
+    pattern: /(\S+) credit per (\S+) successful extractions/gu,
+    roles: ['basicCredits', 'tierUrls'],
+  },
+  {
+    file: 'README.zh-CN.md',
+    label: '中文计费行',
+    pattern: /每 (\S+) 个成功抽取的 URL 计一档/gu,
+    roles: ['tierUrls'],
+  },
+]);
+
+describe('22-E3：客户端副本与权威常量对账', () => {
+  test('五份词表逐项等于权威导出（client-artifact-5）', async () => {
+    const { component, t } = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
+    const tree = component({ t });
+
+    // 判据是权威模块的导出，不是另一份手抄副本：`lib/settings.js` 的 `schema.union([...])`
+    // 取的就是这几个数组，`lib/constants.js` 那两个同理。
+    const vocabulary = [
+      ['searchDepth', SEARCH_DEPTH_VALUES],
+      ['topic', TOPIC_VALUES],
+      ['schedulingPolicy', SCHEDULING_POLICY_VALUES],
+      ['fetchDepth', EXTRACT_DEPTH_VALUES],
+      ['fetchFormat', EXTRACT_FORMAT_VALUES],
+    ];
+
+    for (const [field, values] of vocabulary) {
+      // 服务端多一个合法取值时，副本少一项的那个 select 会静默显示成列表第一项：draft 仍持
+      // 真实值、dirty 为 false、保存按钮是灰的，用户既看不出不对也改不回来。
+      assert.deepEqual(optionsOfField(tree, t(field)), [...values], `${field} 的词表副本与权威不一致`);
+    }
+  });
+
+  test('maxResults 的区间与 schema 的上下界一致（client-artifact-5）', async () => {
+    const range = `${MAX_RESULTS_MIN}–${MAX_RESULTS_MAX}`;
+    const { component, t } = await mountedCard({ hooks: { ui: readyUi(), draft: readyDraft() } });
+    const tree = component({ t });
+    const input = flatten(tree).find((element) => element.props?.type === 'number');
+
+    assert.notEqual(input, undefined, '结果条数应当是一个数字输入框');
+    assert.equal(input.props.min, String(MAX_RESULTS_MIN));
+    assert.equal(input.props.max, String(MAX_RESULTS_MAX));
+    assert.equal(textsOf(tree).some((text) => text.includes(`取值 ${range}。`)), true, '合法时显示区间');
+
+    // 放宽区间时相反的后果：副本把 schema 允许的新取值判为非法，保存按钮变灰，并显示一句
+    // 已经不正确的话。取一个必然越界的值，那句提示里的区间同样得由常量算出来。
+    const invalid = await mountedCard({
+      hooks: { ui: readyUi(), draft: { ...readyDraft(), maxResults: String(MAX_RESULTS_MAX + 1) } },
+    });
+    assert.equal(
+      textsOf(invalid.component({ t: invalid.t })).some((text) => text.includes(`结果条数必须是 ${range} 之间的整数。`)),
+      true,
+      '非法时的提示也要说同一个区间',
+    );
+  });
+
+  test('配额数字的每一处文案副本都与 USAGE_QUOTA_* 一致（boundaries-drift-5）', async () => {
+    const files = ['lib/panel.js', 'lib/client.js', 'README.md', 'README.zh-CN.md', 'docs/usage.md', 'docs/usage.zh-CN.md'];
+
+    for (const file of files) {
+      const found = quotaNumbersIn(await readFile(join(repoRoot, file), 'utf8'));
+      assert.notEqual(found.length, 0, `${file} 里一句配额文案都没扫到，说明守卫的正则已经与文案脱节`);
+
+      for (const entry of found) {
+        assert.equal(entry.calls, USAGE_QUOTA_MAX_CALLS, `${file} 的「${entry.text}」与 USAGE_QUOTA_MAX_CALLS 不一致`);
+        assert.equal(entry.windowMs, USAGE_QUOTA_WINDOW_MS, `${file} 的「${entry.text}」与 USAGE_QUOTA_WINDOW_MS 不一致`);
+      }
+    }
+  });
+
+  test('计费数字的每一处文案副本都与计费常量一致（boundaries-drift-5）', async () => {
+    const expected = {
+      tierUrls: EXTRACT_URLS_PER_CREDIT_TIER,
+      basicCredits: BASIC_EXTRACT_CREDITS_PER_FIVE,
+      advancedCredits: ADVANCED_EXTRACT_CREDITS_PER_FIVE,
+    };
+
+    for (const { file, label, pattern, roles } of BILLING_COPY) {
+      const matches = [...(await readFile(join(repoRoot, file), 'utf8')).matchAll(pattern)];
+      assert.notEqual(matches.length, 0, `${file} 的${label}没扫到，说明守卫的正则已经与文案脱节`);
+
+      for (const match of matches) {
+        assert.equal(match.length - 1, roles.length, `${file} 的${label}捕获组数与角色数对不上`);
+        match.slice(1).forEach((token, index) => {
+          const role = roles[index];
+          assert.equal(numberOf(token), expected[role], `${file} 的${label}里「${token}」与 ${role} 不一致`);
+        });
+      }
+    }
   });
 });

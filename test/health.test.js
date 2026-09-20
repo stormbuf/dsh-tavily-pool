@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
+import { runWithFailover } from '../lib/attempts.js';
 import {
   clampCooldownSeconds,
   classifyFailure,
@@ -25,6 +26,8 @@ import {
   parseRetryAfter,
 } from '../lib/health.js';
 import { PoolStore } from '../lib/pool.js';
+import { Scheduler } from '../lib/scheduler.js';
+import { TavilyError, extractTavily, searchTavily } from '../lib/tavily.js';
 
 /** 一个以全新临时目录为后端的密钥池。 */
 async function temporaryPool() {
@@ -139,6 +142,35 @@ describe('状态码分类', () => {
     assert.equal(classifyFailure({ status: 400, detail: 'bad topic' }).action, FAILURE_ACTIONS.FATAL);
   });
 
+  test('408 与 425 是中间层的瞬时失败，归入冷却而不是致命', () => {
+    // 408 常由出口代理/负载均衡在等源站超时之后**自己**发出（上游可能根本没收到这次
+    // 请求），425（RFC 8470）的语义就是「稍后重试」。判 FATAL 会让整次请求在**第一把**
+    // 密钥上终结，池内其余健康密钥一次都不被尝试，而该密钥还不进冷却——同一个 4xx 却比
+    // 5xx 更狠，这是判据放错了地方。
+    for (const endpoint of ['search', 'extract']) {
+      for (const status of [408, 425]) {
+        const classification = classifyFailure({ status, endpoint });
+        assert.equal(classification.action, FAILURE_ACTIONS.COOLDOWN, `HTTP ${String(status)} on ${endpoint}`);
+        assert.equal(classification.cooldownSeconds, DEFAULT_COOLDOWN_SECONDS);
+      }
+    }
+  });
+
+  test('408 / 425 的冷却时长同样取自 Retry-After', () => {
+    assert.equal(classifyFailure({ status: 425, retryAfter: '120' }).cooldownSeconds, 120);
+    assert.equal(classifyFailure({ status: 408, retryAfter: 'oops' }).cooldownSeconds, DEFAULT_COOLDOWN_SECONDS);
+  });
+
+  test('表外其余 4xx 仍然致命：换一把密钥不会让这个请求变得可接受', () => {
+    for (const status of [404, 405, 409, 410, 411, 413, 414, 415, 416, 417, 418, 426, 451]) {
+      assert.equal(
+        classifyFailure({ status }).action,
+        FAILURE_ACTIONS.FATAL,
+        `HTTP ${String(status)} 不在官方错误表里，但它也不是瞬时失败`,
+      );
+    }
+  });
+
   test('没有状态码的失败（超时、传输错误）归入冷却', () => {
     assert.equal(classifyFailure({ code: 'TAVILY_TIMEOUT' }).action, FAILURE_ACTIONS.COOLDOWN);
     assert.equal(classifyFailure({ code: 'TAVILY_NETWORK_ERROR' }).action, FAILURE_ACTIONS.COOLDOWN);
@@ -146,6 +178,61 @@ describe('状态码分类', () => {
 
   test('取消不是失败', () => {
     assert.equal(classifyFailure({ code: 'TAVILY_ABORTED' }).action, FAILURE_ACTIONS.ABORTED);
+  });
+});
+
+describe('failure-paths-2：408 / 425 不再在第一把密钥上终结整个请求', () => {
+  /**
+   * 让池内每把密钥都返回同一个状态码，看编排层试了几把、留下了什么状态。
+   *
+   * @param status - 每次尝试收到的 HTTP 状态码。
+   * @returns `{ caught, invoked, pool, records }`。
+   */
+  async function failoverWithStatus(status) {
+    const pool = await temporaryPool();
+    const records = [];
+    for (const label of ['A', 'B', 'C']) {
+      records.push(await pool.addKey({ key: `tvly-${label.repeat(20)}`, label }));
+    }
+    const health = new KeyHealth({ pool });
+    const scheduler = new Scheduler({ pool, health });
+    const invoked = [];
+    let caught;
+    try {
+      await runWithFailover({
+        scheduler,
+        health,
+        invoke: async () => {
+          invoked.push(1);
+          throw new TavilyError(`Tavily returned HTTP ${String(status)}: proxy gave up on the origin`, {
+            code: `TAVILY_HTTP_${String(status)}`,
+            status,
+          });
+        },
+        deadlineMs: Date.now() + 60_000,
+        maxAttempts: 3,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    return { caught, invoked, pool, records };
+  }
+
+  test('池内每一把都被试过，各自进冷却，透穿的仍是上游状态', async () => {
+    for (const status of [408, 425]) {
+      const { caught, invoked, pool, records } = await failoverWithStatus(status);
+
+      assert.equal(invoked.length, 3, `HTTP ${String(status)} 必须换密钥，而不是在第一把上终结`);
+      assert.equal(caught.status, status, '最后一次的真实失败仍要如实透穿');
+      for (const record of records) {
+        assert.notEqual(pool.statsOf(record.id).cooldownUntil, undefined, '瞬时失败要进冷却');
+      }
+    }
+  });
+
+  test('对照：表内 400 仍然在第一把上终结（换密钥不修复请求本身）', async () => {
+    const { invoked } = await failoverWithStatus(400);
+    assert.equal(invoked.length, 1, '400 是请求本身有误，重试与换密钥都不会改变结果');
   });
 });
 
@@ -333,5 +420,105 @@ describe('FETCH-5：/extract 的错误表与 /search 不同', () => {
       classifyFailure({ status: 403, detail: 'invalid api key' }),
       classifyFailure({ status: 403, detail: 'invalid api key', endpoint: 'search' }),
     );
+  });
+});
+
+describe('failure-paths-3：永久失效只认上游信封里的措辞', () => {
+  /**
+   * 一个返回固定状态码与正文的 `fetch` 桩件。
+   *
+   * @param options - 固定响应。
+   * @returns `fetch` 实现。
+   */
+  function respondWith({ status, body, contentType }) {
+    return async () => new Response(body, {
+      status,
+      headers: contentType === undefined ? {} : { 'content-type': contentType },
+    });
+  }
+
+  /** 三段中间层（代理/WAF/CDN）自己生成的 403 HTML，各含一个失效措辞。 */
+  const PROXY_HTML_403 = [
+    '<!doctype html><html><head><title>403 Forbidden</title></head>'
+      + '<body><h1>Access denied</h1><p>your session has expired</p></body></html>',
+    '<html><body><h1>403</h1><p>access to this resource has been disabled</p></body></html>',
+    '<html><body><h1>403</h1><p>the requested resource was deleted</p></body></html>',
+  ];
+
+  test('中间层 HTML 里的 expired / disabled / deleted 都不判成永久失效，但至少冷却', async () => {
+    // 这段文本曾经冒充 `detail`，于是**一次中间层 403 就能把一把健康密钥永久移出池子**
+    // ——而那个标记在代码里没有任何清除路径，唯一的复位是删掉密钥再加回来。
+    for (const html of PROXY_HTML_403) {
+      const error = await searchTavily({
+        apiKey: 'k',
+        query: 'q',
+        fetchImpl: respondWith({ status: 403, contentType: 'text/html', body: html }),
+      }).catch((thrown) => thrown);
+
+      assert.equal(error.detail, undefined, '代理自己生成的 HTML 不是上游给的，不能冒充 detail');
+      assert.equal(error.bodyExcerpt, html.slice(0, 300), '原始片段走在 bodyExcerpt 上，与 detail 各归各位');
+      assert.match(error.message, /403/u, '排障线索不能丢：它仍要出现在消息里');
+      assert.equal(
+        classifyFailure({ status: 403, detail: error.detail }).action,
+        FAILURE_ACTIONS.COOLDOWN,
+        '一次中间层 403 至少要冷却该密钥，而不是把它隔离',
+      );
+    }
+  });
+
+  test('上游信封里的措辞仍然判定永久失效', async () => {
+    const error = await searchTavily({
+      apiKey: 'k',
+      query: 'q',
+      fetchImpl: respondWith({
+        status: 401,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: { error: 'Unauthorized: invalid API key.' } }),
+      }),
+    }).catch((thrown) => thrown);
+
+    assert.equal(error.detail, 'Unauthorized: invalid API key.');
+    assert.deepEqual(classifyFailure({ status: 401, detail: error.detail }), {
+      action: FAILURE_ACTIONS.INVALID,
+      status: 401,
+      detail: 'Unauthorized: invalid API key.',
+    });
+  });
+
+  test('JSON 体里读不出错误文本时同样不冒充 detail', async () => {
+    // 判据的方向是「只有我们认得的信封字段才算上游的话」：一张没见过的 JSON 结构
+    // 与一段 HTML 一样，都不足以把一把密钥永久移出池子。
+    const error = await searchTavily({
+      apiKey: 'k',
+      query: 'q',
+      fetchImpl: respondWith({
+        status: 403,
+        contentType: 'application/json',
+        body: JSON.stringify({ message: 'this api key has been revoked' }),
+      }),
+    }).catch((thrown) => thrown);
+
+    assert.equal(error.detail, undefined);
+    assert.equal(classifyFailure({ status: 403, detail: error.detail }).action, FAILURE_ACTIONS.COOLDOWN);
+  });
+
+  test('抓取路径同理：信封里的逐 URL 原因算 detail，HTML 不算', async () => {
+    const envelope = await extractTavily({
+      apiKey: 'k',
+      url: 'https://example.com',
+      fetchImpl: respondWith({
+        status: 400,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: { failed_results: [{ url: 'nope', error: 'invalid url' }] } }),
+      }),
+    }).catch((thrown) => thrown);
+    assert.equal(envelope.detail, 'nope: invalid url', '逐 URL 的失败原因是上游信封的一部分');
+
+    const html = await extractTavily({
+      apiKey: 'k',
+      url: 'https://example.com',
+      fetchImpl: respondWith({ status: 401, contentType: 'text/html', body: PROXY_HTML_403[0] }),
+    }).catch((thrown) => thrown);
+    assert.equal(html.detail, undefined, '抓取路径上的中间层 HTML 同样不参与措辞判定');
   });
 });

@@ -140,6 +140,12 @@ setTimeout(0) @+3373                   inject:settings @+3385
   不合语法时会抛，因此必须先用后者判断）；
 - `@deepseek-ai/dsh-launch-environment` 仍导出 `launchEnvironmentOf`，且快照的 `get(name)`
   仍返回 `{ value, source }`；
+- `resolveOptions` 的**副作用**仍在：选项对象上带着 `recordRequest`，提供方在发请求前会
+  调用它，向会话追加一条 `web/deepseek-search-llm-request` 事件。ticket `22` F1 把它补进了
+  本插件的副本；`test/dsh-fallback.test.js` 会把本插件的选项键集与官方源码机械对账，上游
+  新增字段会让那条用例变红。注意读法是 `readService(ctx, 'agents')`——`agents` 不属于需要
+  `inject` 的那三项（耦合点 19），但它只在真实请求在途时才保证 active，而 `recordRequest`
+  正好是那一刻跑的；
 - **本插件复刻的官方默认值未变** —— `apiKeyEnv: DEEPSEEK_API_KEY`、
   `baseURL: https://api.deepseek.com/anthropic/v1`、`model: deepseek-v4-flash`、
   `apiVersion: 2023-06-01`、`maxTokens: 4096`、`maxUses: 5`，以及 `DEEPSEEK_SEARCH_BASE_URL`
@@ -160,7 +166,28 @@ setTimeout(0) @+3373                   inject:settings @+3385
 - `test/dsh-fetch-provider.test.js` 直接读**官方包的 `Config` schema** 逐字段比对，因此上游
   一改默认值它就红，而不必等人工复核这一节。
 
-### 6. 设置注册
+### 6. 宿主工具预算 —— 宿主真正武装的那条 deadline
+
+**看哪里：** `dsh-tools`（`get(name, scope)`）、`dsh-tool-call-timeout-policy`
+（`ctx.tools.get(exec.name, exec.agent)?.timeoutMs`）、`dsh-tool-web`（`web_search` /
+`web_fetch` 定义上的 `timeoutMs`，来自 `searchTimeoutMs` / `fetchTimeoutMs`）。
+**改哪个模块：** `lib/dsh/host-budget.js`
+
+两条路径的总预算都按宿主**真正绑定**的值折算，而不是按常量（ticket `22` F2）。读错它换来的
+不是「略微超时」：宿主的 deadline 先到时，模型看到的是一句
+`tool call timed out after <n>ms`，而本插件手里那条上游的真实错误就此丢失。
+
+检查 `ctx.tools.get(name)` 仍能解析出工具定义、且定义上仍带数值型 `timeoutMs`；检查 timeout
+policy 仍以 `?.timeoutMs` 读它、缺失时不武装；检查工具名仍是 `web_search` / `web_fetch`。
+`test/budgets.test.js` 会把本插件的常量与宿主自己的组合文件、包 schema 机械对账，并断言折算后
+的两条预算都严格早于宿主 deadline——宿主安装根定位不到时它**响亮失败而不是跳过**，自动找不到
+时可用 `DSH_HOST_ROOT` 指定。
+
+`tools` 是经插件的 context 视图、**不带 agent scope** 读的：提供方在请求时手里没有 agent，
+猜一个只会读到另一个 agent 的预算。读取结果如实报成 `host` / `unbound` / `unavailable`，
+因此「退回了常量」这件事是可观察的，而不是静默的。
+
+### 7. 设置注册
 
 **看哪里：** `dsh-settings` —— 服务上的 `register(ns, schema, options)`，以及读回某个已注册
 命名空间的 `get(ns)`。
@@ -173,7 +200,7 @@ setTimeout(0) @+3373                   inject:settings @+3385
 同时确认重复注册命名空间仍然抛错。本插件**不得**重新注册 `web-search-deepseek`：那个命名空间
 属于官方插件，而官方插件必须保持启用，重新注册会抛错。
 
-### 7. 清单字段
+### 8. 清单字段
 
 **看哪里：** `dsh-package-manifest/lib/types/types.d.ts` 的 `DshManifest` 接口。
 **改哪个模块：** `package.json`
@@ -181,9 +208,10 @@ setTimeout(0) @+3373                   inject:settings @+3385
 检查 `dsh.bundle.patch` / `dsh.client` 是否新增了必填的兄弟字段。客户端那一半对面板 ticket
 有影响：`dsh.client` 要求 `exports["./client"]` 存在，且 bundle id 必须等于包名。
 
-### 8. 客户端模块协议（仅面板 ticket）
+### 9. 客户端模块协议（仅面板 ticket）
 
-**看哪里：** `dsh-web-frontend/dist/assets/index-*.js`，搜 `staticModules`。
+**看哪里：** `dsh-web-frontend/dist/assets/index-*.js`，搜 `PLATFORM_MODULES`（`test/client-card.test.js`
+直接解析宿主产物对账，换表即红）。
 **改哪个模块：** `lib/client.js`
 
 种子模块表精确列出了零构建 bundle 可以 `require` 哪些说明符。若面板用到的一项被移除，

@@ -69,6 +69,28 @@ function realSettingsProvider({ preRegistered = true } = {}) {
 }
 
 /**
+ * 一个**注册动作也排在宏任务里**的 settings 服务。
+ *
+ * 真实 `SettingsProvider.register` 是同步的，于是「注入回调不在同步栈上」这条时序在走
+ * `apply()` 的用例里会被它自己抹掉：只要回调跑了，命名空间与路由就同时到位，`apply()`
+ * 返回时的那一瞬间看不出区别。这个桩件让 `settings` 服务在注入回调里直接就位、而面板路由
+ * 要等注册完才挂上，于是那条时序判据不再被替身自己抹掉——真机上 `inject:settings` 正是排在
+ * 整个 profile 组合完成之后（`@+3385ms`）。
+ *
+ * 它只做 `register`，不做 `get` / `update`：那条用例碰不到后两者，而假装实现它们只会
+ * 多出一份会在别处漂移的替身。
+ *
+ * @returns 一个只有 `register` 的 settings 服务桩件。
+ */
+function deferredSettingsService() {
+  return {
+    register() {
+      return { get: () => undefined, update: async () => undefined };
+    },
+  };
+}
+
+/**
  * 一个照抄宿主行为的 connection 服务。
  *
  * 重复路径会抛错、注册返回 disposer——这两点是宿主的真实语义，也是 ticket `09` 点名要
@@ -99,9 +121,14 @@ function fakeConnection() {
 /**
  * 一个只提供指定服务的替身 context；`launchEnvironment` 默认是空快照。
  *
- * `inject` 与真实宿主同形：依赖齐全时同步跑回调。插件经它取 `settings` / `connection` /
- * `credentials`，因此替身必须实现它——少了它，走 `apply()` 的用例会在这里抛，而在真实宿主
- * 上却一切正常。
+ * `inject` 与真实宿主同形：依赖齐全时**回调照跑，但不在同步栈上**（真机实测见
+ * `lib/dsh/host-services.js`；这条语义是 ticket `22` 的 `test-blindspots-1` 补上的，
+ * 同步替身会让「在注入回调里才成立的前置条件」这类缺陷永远隐形）。插件经它取
+ * `settings` / `connection` / `credentials`，因此替身必须实现它——少了它，走 `apply()`
+ * 的用例会在这里抛，而在真实宿主上却一切正常。
+ *
+ * 直接调它的用例（不经 `apply()`）只需知道**回调最终会跑**；要断言回调的后果，用
+ * {@link settleInjections} 等一个宏任务。
  */
 function fakeContext(services) {
   const table = {
@@ -110,10 +137,28 @@ function fakeContext(services) {
   };
   const ctx = { get: (name) => table[name] };
   ctx.inject = (deps, callback) => {
-    if (deps.every((name) => table[name] !== undefined)) callback(ctx);
+    if (deps.every((name) => table[name] !== undefined)) {
+      setTimeout(() => {
+        callback(ctx);
+      }, 0);
+    }
     return { dispose: () => undefined };
   };
   return ctx;
+}
+
+/**
+ * 等注入回调跑完。
+ *
+ * `ctx.inject` 用 `setTimeout` 推迟回调，而本函数用的是**排在它之后**的另一个宏任务
+ * （定时器按到期时刻与入队顺序兑现），因此 `await` 一次就足以看到回调的全部后果。
+ *
+ * @returns 无。
+ */
+function settleInjections() {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
 }
 
 /** 向一条已注册的路由发一次请求。 */
@@ -134,13 +179,14 @@ async function callJson(connection, path, options) {
 }
 
 /** 一个落在临时目录上的状态对象，形状与 `index.js` 里的 `state` 一致。 */
-async function panelState({ pool, usageRefresher, lastFallbackFailure } = {}) {
+async function panelState({ pool, usageRefresher, lastFallbackFailure, hostBudget } = {}) {
   return {
     pool,
     usageRefresher,
     capabilityReport: undefined,
     reportedFallbackReason: undefined,
     lastFallbackFailure,
+    hostBudget,
   };
 }
 
@@ -518,11 +564,10 @@ describe('index.js 真的把接口接上了', () => {
    * **真的临时目录**，因为密钥池的写入是真实的 `mkdir` + `rename`，指向一个不存在的根路径
    * 只会让每次编辑都以 EACCES 失败。
    */
-  async function hostWithRoutes() {
+  async function hostWithRoutes({ settings = realSettingsProvider({ preRegistered: false }) } = {}) {
     const connection = fakeConnection();
     // 不预注册：命名空间由 `apply()` 自己注册，否则这里会以「重复注册」失败，而那失败
     // 属于桩件而不是被测代码。
-    const settings = realSettingsProvider({ preRegistered: false });
     const home = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-apply-'));
     const warnings = [];
     const services = {
@@ -537,20 +582,54 @@ describe('index.js 真的把接口接上了', () => {
       get: (name) => services[name],
       logger: { warn: (message) => warnings.push(String(message)) },
     };
-    // 与真实宿主同形：依赖齐全时同步跑回调。
+    // 与真实宿主同形：回调不在同步栈上（见 `fakeContext` 的注释）。因此要断言注入回调的
+    // 后果（五条路由挂上、命名空间注册好），先 `await host.injections()`——这一条正是
+    // ticket `22` 的 `test-blindspots-1` 要压住的时序。
     ctx.inject = (deps, callback) => {
-      if (deps.every((name) => services[name] !== undefined)) callback(ctx);
+      if (deps.every((name) => services[name] !== undefined)) {
+        setTimeout(() => {
+          callback(ctx);
+        }, 0);
+      }
       return { dispose: () => undefined };
     };
-    return { connection, settings, warnings, home, ctx };
+    return {
+      connection,
+      settings,
+      warnings,
+      home,
+      ctx,
+      injections: () => new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      }),
+    };
   }
+
+  test('apply() 返回时一条路由都还没挂上——注入回调不在同步栈上', async () => {
+    // 这条用例守的是**替身本身**：同步替身下 `apply()` 返回时 `routes.size` 就是 5，而真机
+    // 上同一时刻是 0（实测 `apply:end @+817ms`、`inject:settings @+3385ms`）。没有这一条，
+    // 「在注入回调里才成立的前置条件」这类缺陷在单测里就没有判据。
+    //
+    // ⚠️ 判据只有在**没有任何一步同步注册**时才成立：`settings.register` 本身是同步的，
+    // 而 `realSettingsProvider` 一调它就注册好了——那 5 条路由因此会在 `apply()` 返回之前
+    // 出现，与真实宿主无关，纯粹是替身自己的时序。因此这里把 settings 服务换成一个
+    // **注册动作也排在宏任务里**的桩件，让整条链路的时序与真机一致。
+    const host = await hostWithRoutes({ settings: deferredSettingsService() });
+
+    apply(host.ctx, {});
+
+    assert.equal(host.connection.routes.size, 0, '注入回调还没跑，路由不该已经在');
+    await host.injections();
+    assert.equal(host.connection.routes.size, 5, '一个宏任务之后五条都在');
+  });
 
   test('apply() 注册面板路由，且能经它们读到状态', async () => {
     const host = await hostWithRoutes();
 
     apply(host.ctx, {});
+    await host.injections();
 
-    assert.equal(host.connection.routes.size, 5, '五条路由都该在 apply() 之后存在');
+    assert.equal(host.connection.routes.size, 5, '五条路由都该在注入回调跑完之后存在');
     const { response, body } = await callJson(host.connection, PANEL_ROUTE_PATHS.state);
     assert.equal(response.status, 200);
     assert.deepEqual(body.keys, []);
@@ -563,6 +642,7 @@ describe('index.js 真的把接口接上了', () => {
   test('apply() 注册的路由能真的添加密钥', async () => {
     const host = await hostWithRoutes();
     apply(host.ctx, {});
+    await host.injections();
 
     const { body } = await callJson(host.connection, PANEL_ROUTE_PATHS.keys, {
       method: 'POST',
@@ -586,6 +666,7 @@ describe('index.js 真的把接口接上了', () => {
     await seeded.addKey({ key: OTHER_SECRET });
 
     apply(host.ctx, {});
+    await host.injections();
 
     const { body } = await callJson(host.connection, PANEL_ROUTE_PATHS.state);
     assert.equal(body.keys.length, 2, '面板必须看到磁盘上已有的密钥');
@@ -602,6 +683,7 @@ describe('index.js 真的把接口接上了', () => {
     await seeded.addKey({ key: OTHER_SECRET });
 
     apply(host.ctx, {});
+    await host.injections();
 
     const third = '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';
     const { body } = await callJson(host.connection, PANEL_ROUTE_PATHS.keys, {
@@ -623,6 +705,7 @@ describe('index.js 真的把接口接上了', () => {
     const second = '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';
     const host = await hostWithRoutes();
     apply(host.ctx, {});
+    await host.injections();
 
     const { response, body } = await callJson(host.connection, PANEL_ROUTE_PATHS.keys, {
       method: 'POST',
@@ -639,6 +722,7 @@ describe('index.js 真的把接口接上了', () => {
   test('批量添加的入参非法时回一个 400，而不是把异常漏给宿主（POOL-8）', async () => {
     const host = await hostWithRoutes();
     apply(host.ctx, {});
+    await host.injections();
 
     const { response, body } = await callJson(host.connection, PANEL_ROUTE_PATHS.keys, {
       method: 'POST',
@@ -652,6 +736,7 @@ describe('index.js 真的把接口接上了', () => {
   test('apply() 注册的面板设置写入落到宿主的命名空间上（CFG-1）', async () => {
     const host = await hostWithRoutes();
     apply(host.ctx, {});
+    await host.injections();
 
     await callJson(host.connection, PANEL_ROUTE_PATHS.settings, { method: 'POST', body: { patch: { searchEnabled: false } } });
 
@@ -661,16 +746,172 @@ describe('index.js 真的把接口接上了', () => {
   test('apply() 二次执行只记一条告警，不把插件判死', async () => {
     const host = await hostWithRoutes();
     apply(host.ctx, {});
+    await host.injections();
 
     // 宿主对精确路由没有幂等语义，第二次注册会抛错；而那条抛出被 `apply()` 收在面板自己的
     // `try` 里（面板是可选能力，不该因为它把搜索一起关掉），因此这里表现为一条告警。
     // 记成行为而不是加一层「已存在就跳过」的包装：那会把一次真实的重复注册伪装成成功。
+    //
+    // 第二次 `apply()` 同样要等它的注入回调跑完才能看到那次重复注册——两次 `apply()` 之间
+    // 隔着真实的注入时序，与真机上「组件重建导致插件重新加载」的形状一致。
     assert.doesNotThrow(() => apply(host.ctx, {}));
+    await host.injections();
     assert.equal(
       host.warnings.some((message) => /could not register the panel HTTP API/u.test(message)),
       true,
       '重复注册必须留下痕迹',
     );
     assert.equal(host.connection.routes.size, 5, '先注册的那一份仍然有效');
+  });
+
+  test('进程运行期间外部改动的密钥池，面板下一次读取就能看到（ticket 22 C1）', async () => {
+    // 加载只做一次（它是基线），但对账每次都做：面板读到的必须是磁盘实况，而不是第一次
+    // 加载时的快照。看不到外部删掉的密钥，用户会以为它还在；看不到外部补上的，会以为丢了。
+    const host = await hostWithRoutes();
+    const stateDir = join(host.home, STATE_DIR_NAME);
+    const seeded = await new PoolStore({ dir: stateDir, fileName: KEYS_FILE_NAME }).load();
+    const doomed = await seeded.addKey({ key: SECRET, label: 'on-disk' });
+    await seeded.addKey({ key: OTHER_SECRET });
+
+    apply(host.ctx, {});
+    await host.injections();
+    const before = await callJson(host.connection, PANEL_ROUTE_PATHS.state);
+    assert.equal(before.body.keys.length, 2, '先是磁盘上那两把');
+
+    // 外部（另一个进程，或用户手工编辑）删掉一把、又补上一把。
+    const third = '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';
+    await seeded.removeKey(doomed.id);
+    await seeded.addKey({ key: third });
+
+    const after = await callJson(host.connection, PANEL_ROUTE_PATHS.state);
+    assert.deepEqual(
+      after.body.keys.map((entry) => entry.masked),
+      seeded.maskedList().map((entry) => entry.masked),
+      '面板上必须是磁盘实况：外部删掉的不见了，外部补上的看得见',
+    );
+  });
+
+  test('进程运行期间外部补的密钥不会被面板的下一次写入抹掉（ticket 22 C1）', async () => {
+    // 落盘前先重读磁盘：面板这次写入带的是「本进程加载之后看到的池」，而磁盘上已经有外部
+    // 补进来的那一把了——它必须活下来。
+    const host = await hostWithRoutes();
+    const stateDir = join(host.home, STATE_DIR_NAME);
+    const seeded = await new PoolStore({ dir: stateDir, fileName: KEYS_FILE_NAME }).load();
+    await seeded.addKey({ key: SECRET });
+
+    apply(host.ctx, {});
+    await host.injections();
+    await callJson(host.connection, PANEL_ROUTE_PATHS.state);
+
+    await seeded.addKey({ key: OTHER_SECRET });
+
+    const third = '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';
+    const { body } = await callJson(host.connection, PANEL_ROUTE_PATHS.keys, {
+      method: 'POST',
+      body: { action: 'add', key: third },
+    });
+
+    assert.equal(body.keys.length, 3, '面板上应当是「磁盘上那两把 + 这次加的」');
+    const onDisk = JSON.parse(await readFile(join(stateDir, KEYS_FILE_NAME), 'utf8'));
+    assert.equal(onDisk.keys.length, 3, '外部补的那把不得被抹掉');
+  });
+});
+
+describe('panel-http-6：写失败的响应体按白名单构造', () => {
+  test('500 响应里没有 pid、没有 .tmp、没有绝对路径，但仍有 errno 与文件名', async () => {
+    // 让 `keys.json` 的位置是一个**目录**：真实文件系统上「临时文件 + rename 覆盖目标」的
+    // 最后一步必然失败，而失败原文里同时带着运行账户的绝对状态目录、进程 pid 与形如
+    // `keys.json.<pid>.<uuid>.tmp` 的内部临时文件名。原文由卡片直接渲染给用户看，因此响应体
+    // 必须按白名单重新构造：保住 errno、哪一步、哪个文件与下一步，剥掉环境信息。
+    //
+    // 这里刻意用**真实 fs**（而不是注入的 fs 替身）与真实 `PoolStore`：要守住的正是真实错误
+    // 对象上的字段（`code` / `syscall` / 那句带路径的 message），替身会把它们换成我以为的形状。
+    const { mkdir } = await import('node:fs/promises');
+    const { homedir } = await import('node:os');
+    const home = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-panel-'));
+    await mkdir(join(home, KEYS_FILE_NAME));
+    const pool = await new PoolStore({ dir: home, fileName: KEYS_FILE_NAME }).load();
+
+    const connection = fakeConnection();
+    registerPanelRoutes(
+      fakeContext({ connection: connection.service, settings: realSettingsProvider() }),
+      await panelState({ pool }),
+    );
+
+    const { response, body } = await callJson(connection, PANEL_ROUTE_PATHS.keys, {
+      method: 'POST',
+      body: { action: 'add', key: SECRET },
+    });
+
+    assert.equal(response.status, 500);
+    assert.equal(body.error.code, 'PANEL_KEY_EDIT_FAILED');
+    const serialized = JSON.stringify(body);
+    assert.equal(serialized.includes(String(process.pid)), false, 'pid 是运行账户的内部信息');
+    assert.equal(serialized.includes('.tmp'), false, '内部临时文件名不该出现在界面上');
+    assert.equal(serialized.includes(home), false, '绝对状态目录同样不该出现');
+    assert.equal(serialized.includes(homedir()), false);
+    assert.equal(serialized.includes(SECRET), false, '错误出口也不能泄漏明文');
+    assert.match(body.error.message, /EISDIR/u, '但排障线索必须保住：errno');
+    assert.match(body.error.message, /keys\.json/u, '以及是哪个文件写不进去');
+  });
+});
+
+describe('panel-http-4：批量删除经 keys 命令出去', () => {
+  test('removeBatch 是 keys 的一个动作，一次请求删多把并如实计数', async () => {
+    // 批量删除**不需要新路由**：路由表是「每条命令一条 POST 路由」，而它是 `keys` 命令的
+    // 一个新动作。前端因此只需要在既有的 keys 端点上换一个 action。
+    const home = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-panel-'));
+    const pool = await new PoolStore({ dir: home, fileName: KEYS_FILE_NAME }).load();
+    const connection = fakeConnection();
+    registerPanelRoutes(
+      fakeContext({ connection: connection.service, settings: realSettingsProvider() }),
+      await panelState({ pool }),
+    );
+    const third = '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';
+    await callJson(connection, PANEL_ROUTE_PATHS.keys, {
+      method: 'POST',
+      body: { action: 'addBatch', text: `${SECRET}\n${OTHER_SECRET}\n${third}` },
+    });
+    const ids = pool.keysInOrder().map((record) => record.id);
+
+    const { response, body } = await callJson(connection, PANEL_ROUTE_PATHS.keys, {
+      method: 'POST',
+      body: { action: 'removeBatch', ids: [ids[0], ids[2]] },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.summary, { received: 2, removed: 2 });
+    assert.deepEqual(body.keys.map((entry) => entry.id), [ids[1]]);
+    assert.equal(JSON.stringify(body).includes(SECRET), false, '出口仍然只有脱敏形式（POOL-3）');
+    const onDisk = JSON.parse(await readFile(join(home, KEYS_FILE_NAME), 'utf8'));
+    assert.deepEqual(onDisk.keys.map((entry) => entry.id), [ids[1]], '删除必须已经落盘');
+  });
+});
+
+describe('host-contract-2：预算来源经 /state 如实投影', () => {
+  test('最近一次读数的来源与数值原样出现，一次都没搜过时是 null', async () => {
+    // 这条判据是**面板**那一侧的：`state.hostBudget` 由搜索/抓取路径在每次调用时写下，
+    // 而它是「宿主收紧 timeout 之后我们有没有跟着收」这个问题唯一的用户可见面。投影里漏掉
+    // 这个字段不会报错，只会让那条线索永远看不见——因此这里对着响应体断言。
+    const connection = fakeConnection();
+    const budget = {
+      search: { budgetMs: 58_000, source: 'host', hostSource: 'host' },
+      fetch: { budgetMs: 23_000, source: 'host', hostSource: 'host' },
+    };
+    registerPanelRoutes(
+      fakeContext({ connection: connection.service, settings: realSettingsProvider() }),
+      await panelState({ pool: await temporaryPool(), hostBudget: budget }),
+    );
+
+    const withReading = await callJson(connection, PANEL_ROUTE_PATHS.state);
+    assert.deepEqual(withReading.body.hostBudget, budget);
+
+    const fresh = fakeConnection();
+    registerPanelRoutes(
+      fakeContext({ connection: fresh.service, settings: realSettingsProvider() }),
+      await panelState({ pool: await temporaryPool() }),
+    );
+    const withoutReading = await callJson(fresh, PANEL_ROUTE_PATHS.state);
+    assert.equal(withoutReading.body.hostBudget, null, '还没搜过时如实给 null，而不是编一个来源');
   });
 });

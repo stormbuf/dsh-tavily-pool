@@ -6,17 +6,18 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdtemp } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
-import {
-  TavilyError,
-  extractCreditDelta,
-  extractTavily,
-  mapSearchResponse,
-  searchTavily,
-} from '../lib/tavily.js';
+import { runWithFailover } from '../lib/attempts.js';
+import { TavilyError, extractCreditDelta, extractTavily, mapSearchResponse, searchTavily } from '../lib/tavily.js';
 import { EXTRACT_FAILURE_STATUS, TAVILY_EXTRACT_URL, TAVILY_SEARCH_URL } from '../lib/constants.js';
-import { classifyFailure } from '../lib/health.js';
+import { KeyHealth, classifyFailure } from '../lib/health.js';
+import { PoolStore } from '../lib/pool.js';
+import { Scheduler } from '../lib/scheduler.js';
 
 /**
  * 一个记录自身调用并返回固定响应的 `fetch` 桩件。
@@ -200,6 +201,200 @@ describe('失败处理', () => {
     const { fetchImpl } = stubFetch({ failure: new DOMException('timed out', 'TimeoutError') });
     const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
     assert.equal(error.code, 'TAVILY_TIMEOUT');
+  });
+});
+
+describe('failure-paths-1：体读阶段的失败必须与发请求阶段同等对待', () => {
+  /**
+   * 一个「响应头已到、体读失败」的 `fetch` 桩件。
+   *
+   * 不用真的响应体：要复现的正是**体读这一步本身**的失败，而它只能由 `response.text()`
+   * 的拒绝表达。`fetch` 在这里如实兑现——这正是这条缺陷的形状：体读发生在它之后。
+   *
+   * @param failure - `response.text()` 抛出的值。
+   * @returns `{ fetchImpl, calls }`。
+   */
+  function stubBodyReadFailure(failure) {
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+      calls.push({ url, init });
+      const response = new Response('{"results":[]}', { status: 200 });
+      response.text = async () => { throw failure; };
+      return response;
+    };
+    return { fetchImpl, calls };
+  }
+
+  test('体读期间超时被上报为超时，而不是裸的 DOMException', async () => {
+    const { fetchImpl } = stubBodyReadFailure(new DOMException('timed out', 'TimeoutError'));
+    const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
+
+    assert.ok(error instanceof TavilyError, '宿主拿到的必须是带 code 的内核错误，而不是 undici 的裸异常');
+    assert.equal(error.code, 'TAVILY_TIMEOUT');
+  });
+
+  test('体读期间连接被重置被上报为传输失败', async () => {
+    const { fetchImpl } = stubBodyReadFailure(new TypeError('terminated'));
+    const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
+
+    assert.ok(error instanceof TavilyError);
+    assert.equal(error.code, 'TAVILY_NETWORK_ERROR');
+  });
+
+  test('体读期间被调用方取消按取消上报，与超时区分得开', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { fetchImpl } = stubBodyReadFailure(new DOMException('aborted', 'AbortError'));
+    const error = await searchTavily({
+      apiKey: 'k',
+      query: 'q',
+      signal: controller.signal,
+      fetchImpl,
+    }).catch((thrown) => thrown);
+
+    assert.equal(error.code, 'TAVILY_ABORTED');
+  });
+
+  test('抓取路径共用同一个体读步骤，因此同样被翻译', async () => {
+    const { fetchImpl } = stubBodyReadFailure(new DOMException('timed out', 'TimeoutError'));
+    const error = await extractTavily({
+      apiKey: 'k',
+      url: 'https://example.com',
+      fetchImpl,
+    }).catch((thrown) => thrown);
+
+    assert.ok(error instanceof TavilyError);
+    assert.equal(error.code, 'TAVILY_TIMEOUT');
+  });
+
+  test('体读失败进入分类，而不是绕过它', async () => {
+    // 这条压的是**后果**：分类是冷却、调用历史与故障切换共同的上游。绕过它，这把密钥
+    // 不进冷却、下一次调度仍会选中它，而本次请求也不会换下一把。
+    const { fetchImpl } = stubBodyReadFailure(new DOMException('timed out', 'TimeoutError'));
+    const error = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl }).catch((thrown) => thrown);
+
+    assert.ok(error instanceof TavilyError, '编排层只对 TavilyError 做分类，别的错误会被原样透穿');
+    assert.equal(error.code, 'TAVILY_TIMEOUT');
+    assert.equal(classifyFailure({ code: error.code }).action, 'cooldown');
+  });
+});
+
+describe('failure-paths-1：先发响应头再断流时，整条编排都按失败处理', () => {
+  /**
+   * 一个「先发响应头、再挂住不发体」的真实服务端。
+   *
+   * 这里用真实的 `node:http` 与真实的 `fetch`，而不是桩件：要复现的失败发生在 `fetch`
+   * 兑现**之后**，桩件替不掉 undici 在这一步抛出的东西（超时是 `DOMException`、连接重置
+   * 是 `TypeError: terminated`）。
+   *
+   * @param mode - `stall`：只发头后挂住；`reset`：发头与部分体之后销毁连接。
+   * @param run - 拿到 base URL 后要跑的东西。
+   * @returns `run` 的返回值。
+   */
+  async function withStallingServer(mode, run) {
+    const server = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '1000' });
+      res.write('{"results":[');
+      if (mode === 'reset') setTimeout(() => { res.socket?.destroy(); }, 20);
+    });
+    await new Promise((resolve) => { server.listen(0, '127.0.0.1', resolve); });
+    try {
+      return await run(`http://127.0.0.1:${String(server.address().port)}`);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => { server.close(resolve); });
+    }
+  }
+
+  /**
+   * 在一个三把密钥的真实池子上跑一次完整的故障切换编排。
+   *
+   * @param base - 服务端地址。
+   * @param options - 本次编排的参数。
+   * @param options.timeoutMs - 单次尝试的超时。
+   * @param options.signal - 调用方取消信号。
+   * @returns `{ caught, invoked, pool, records, attempted }`。
+   */
+  async function failoverAgainst(base, { timeoutMs, signal } = {}) {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-tavily-'));
+    const pool = await new PoolStore({ dir, fileName: 'keys.json' }).load();
+    const records = [];
+    for (const label of ['A', 'B', 'C']) {
+      records.push(await pool.addKey({ key: `tvly-${label.repeat(20)}`, label }));
+    }
+    const health = new KeyHealth({ pool });
+    const scheduler = new Scheduler({ pool, health });
+    const invoked = [];
+    const attempted = [];
+    let caught;
+    try {
+      await runWithFailover({
+        scheduler,
+        health,
+        invoke: ({ key }) => {
+          invoked.push(key);
+          return searchTavily({
+            apiKey: key,
+            query: 'q',
+            fetchImpl: (url, init) => fetch(`${base}/search`, init),
+            timeoutMs,
+            signal,
+          });
+        },
+        signal,
+        onAttempt: (attempt) => { attempted.push(attempt); },
+        deadlineMs: Date.now() + 60_000,
+        maxAttempts: 3,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    return { caught, invoked, pool, records, attempted };
+  }
+
+  test('体读超时：换到池内每一把密钥、各自进冷却、各自留下调用历史', async () => {
+    await withStallingServer('stall', async (base) => {
+      const { caught, invoked, pool, records, attempted } = await failoverAgainst(base, { timeoutMs: 150 });
+
+      assert.equal(invoked.length, 3, '体读失败必须换下一把密钥，而不是在第一把上终结整个请求');
+      assert.ok(caught instanceof TavilyError, '宿主拿到的必须是带 code 的 WebError 来源');
+      assert.equal(caught.code, 'TAVILY_TIMEOUT');
+      assert.equal(attempted.length, 3, '每次尝试都要留下调用历史');
+      for (const record of records) {
+        const stats = pool.statsOf(record.id);
+        assert.equal(stats.failures, 1, '失败的密钥要记一次失败');
+        assert.notEqual(stats.cooldownUntil, undefined, '失败一次就要进冷却，否则下次调度仍会选中它');
+      }
+    });
+  });
+
+  test('体读期间连接被重置：同样换密钥、同样进冷却', async () => {
+    await withStallingServer('reset', async (base) => {
+      const { caught, invoked, pool, records } = await failoverAgainst(base, { timeoutMs: 2_000 });
+
+      assert.equal(caught.code, 'TAVILY_NETWORK_ERROR');
+      assert.equal(invoked.length, 3);
+      for (const record of records) {
+        assert.notEqual(pool.statsOf(record.id).cooldownUntil, undefined);
+      }
+    });
+  });
+
+  test('体读期间被调用方取消：按取消向上传递，不计入密钥健康', async () => {
+    await withStallingServer('stall', async (base) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => { controller.abort(); }, 60);
+      const { caught, invoked, pool, records, attempted } = await failoverAgainst(base, {
+        timeoutMs: 5_000,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      assert.equal(caught.code, 'TAVILY_ABORTED', '取消是取消，不是一次密钥失败');
+      assert.equal(invoked.length, 1, '取消之后按定义不再换密钥');
+      assert.equal(attempted.length, 0, '取消不进调用历史');
+      assert.equal(pool.statsOf(records[0].id).failures, undefined, '取消不计入密钥健康');
+    });
   });
 });
 

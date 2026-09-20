@@ -22,13 +22,40 @@ This plugin does **not** read environment variables, and does not read DSH's cre
 
 To add several at once, click **Add several**: a dialog opens with a text box. Paste one key per line and confirm — every line becomes a key. Leading and trailing whitespace is trimmed, blank lines are ignored, and lines that are already in the pool (or repeated within the same paste) are skipped; the card then reports how many were added and how many were skipped. Downstream nothing differs from a single paste: the same local file, the same masked list.
 
-You can add as many as you like. The list only ever shows a masked form (`tvly-...xxxx`); the plaintext is stored locally only:
+Submitting the same plaintext twice does not take two slots: the single-key form de-duplicates too, and the card says "that key is already in the pool" when it does.
+
+To remove several at once, click **Remove several**: tick them in the dialog and confirm — the selected keys go away in **one write**. Single-key removal stays per-key; this is the bulk exit, because ticking rows one by one is too slow once a bad paste has blown the pool up.
+
+Writes are bounded: a single key is at most 512 characters (a real one is about 50), one paste adds at most 200, and the pool holds at most 200. Over the limit the server **rejects the whole batch** and states the limit, the count it received, and which line — it never truncates silently, because silent truncation reads as success.
+
+The pool holds up to 200 keys. The list only ever shows a masked form (`tvly-...xxxx`); the plaintext is stored locally only:
 
 ```
 ~/.dsh/dsh-tavily-pool/keys.json
 ```
 
 That file is readable only by your user. The plugin exposes no endpoint that returns a key's plaintext, and provides no import/export.
+
+### Editing that file while DSH is running
+
+**The file is the source of truth for the key set; the pool inside the DSH process is only a cache of it.** Changes made to the file while DSH runs do count:
+
+| External change | Result |
+|---|---|
+| Add a key (hand-written record, or added by another instance/process) | It is picked up, and is not overwritten by the older in-memory pool |
+| Remove a key | It stops being used for search or fetch, and is not written back by the next write |
+| Change a record field such as `label` / `disabled` | The file wins unless this process is the one changing it right now; a record this process just changed stays as this process left it |
+| Add a top-level key this version does not know (e.g. written by a newer version) | Preserved verbatim, and not wiped by the next edit |
+| Change `order` (the sequence) | The sequence follows the in-process pool; hand-edits to it take effect after a restart. The record set itself still follows the file |
+
+The rule in the other direction is just as explicit: **per-key call stats and balance caches follow this process's runtime records** and overwrite the same entries in the file on write — they are never read back from it.
+
+Nothing is guaranteed to be instant: an external change is absorbed at the latest on the **next write** (accounting after a search or fetch, a balance refresh, a panel edit) or the **next time the panel is opened**.
+
+Two edges worth knowing:
+
+- **Deleting `keys.json` outright is not the same as emptying the pool.** When the file cannot be read (missing, or its contents broken) the plugin does nothing and your keys are not lost. To empty the pool, remove keys one by one in the panel.
+- **Do not break the file.** When the contents are not valid JSON the plugin continues with an empty pool and reports it (the message names the file), and **while the file is broken any write from the panel replaces it with a pool holding only the new keys** — the price of that deliberate "continue with an empty pool" tradeoff.
 
 ## Toggles
 

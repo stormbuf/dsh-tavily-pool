@@ -262,29 +262,6 @@ describe('SCHED-6：并发不重复选中', () => {
     assert.equal(await mutex.runExclusive(() => 'still works'), 'still works');
   });
 
-  test('sleep 到点即兑现，且不把信号误报成已中止', async () => {
-    const controller = new AbortController();
-    await sleep(5, controller.signal);
-    assert.equal(controller.signal.aborted, false, '到点兑现不等于被中止');
-  });
-
-  test('sleep 在信号中止时立即兑现，不等满时长', async () => {
-    // 取消必须立刻打断等待：模型取消一次搜索时，插件不能还抱着一个 30 秒的定时器不放。
-    const controller = new AbortController();
-    const startedAt = Date.now();
-    const waiting = sleep(30_000, controller.signal);
-    controller.abort();
-    await waiting;
-
-    assert.ok(Date.now() - startedAt < 1_000, '取消必须立刻生效');
-  });
-
-  test('sleep 在信号已经中止时不挂起', async () => {
-    const controller = new AbortController();
-    controller.abort();
-    await sleep(30_000, controller.signal);
-  });
-
   test('决策本身是同步的，因此并发不可能读到同一份旧快照', async () => {
     // `SCHED-6` 的最终保障是这一条，而不是锁：锁只保证调用不交错，保证「读到的一定是
     // 最新的 lastUsedAt」的是决策区间内没有 `await`。给它加上一个 `await` 会让两个并发
@@ -300,6 +277,48 @@ describe('SCHED-6：并发不重复选中', () => {
 
     assert.equal(new Set(chosen).size, 2, `并发决策必须看到彼此的选择：${JSON.stringify(chosen)}`);
     assert.deepEqual([...chosen].sort(), [ids.a, ids.b].sort());
+  });
+});
+
+describe('SCHED-9：sleep 的两条语义', () => {
+  // 独立成一个 describe 而不是留在 SCHED-6 里：这三条压的是 `sleep` 本身，而它们此前混在
+  // `SCHED-6：并发不重复选中` 那一块里——变异 `sleep` 时顶层报告只会说「SCHED-6 里有一条子用例
+  // 失败」，看不出是哪条守卫抓到的（ticket `22` 的审查发现）。
+  test('sleep 真的等满给它的时长', async () => {
+    // **这条守卫必须压住「不看 ms」的实现。** 它此前断言的是「测试自己造的、从没人改过的
+    // 标志位」（ticket `22` 的 `test-blindspots-8`）：把 `sleep` 换成 `async () => {}`，
+    // 整个套件仍然 555/555 全绿，而 SCHED-9 的有界等待会静默退化成「预算之内也不等」。
+    // 因此判据只能是墙钟：等待时长是这个函数唯一的外部可观测后果。
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    await sleep(300, controller.signal);
+    const elapsed = Date.now() - startedAt;
+
+    assert.ok(elapsed >= 250, `必须真的等接近 300ms，实际 ${String(elapsed)}ms`);
+    assert.ok(elapsed < 3_000, `也必须只等到 300ms 左右（放大 1000 倍的实现会被这条抓住），实际 ${String(elapsed)}ms`);
+    assert.equal(controller.signal.aborted, false, '到点兑现不等于被中止');
+  });
+
+  test('sleep 在信号中止时立即兑现，不等满时长', async () => {
+    // 取消必须立刻打断等待：模型取消一次搜索时，插件不能还抱着一个 30 秒的定时器不放。
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const waiting = sleep(30_000, controller.signal);
+    controller.abort();
+    await waiting;
+
+    assert.ok(Date.now() - startedAt < 1_000, '取消必须立刻生效');
+  });
+
+  test('sleep 在信号已经中止时不挂起', async () => {
+    // 判据同样是墙钟，而不是「跑完了就算过」：函数体里一个断言都没有时（本用例此前的样子），
+    // 一个把 ms 当秒、或干脆忽略已中止信号的实现照样全绿。
+    const controller = new AbortController();
+    controller.abort();
+    const startedAt = Date.now();
+    await sleep(30_000, controller.signal);
+
+    assert.ok(Date.now() - startedAt < 1_000, '已中止的信号必须让它立刻兑现，而不是挂满 30 秒');
   });
 });
 

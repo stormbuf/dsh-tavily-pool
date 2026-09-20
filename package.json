@@ -44,7 +44,7 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "scripts": {
-    "test": "node scripts/check-duplicate-members.mjs index.js lib/*.js lib/dsh/*.js && node --test \"test/*.test.js\""
+    "test": "node scripts/check-duplicate-members.mjs index.js lib/*.js lib/dsh/*.js scripts/*.mjs && node --test \"test/*.test.js\""
   },
   "dsh": {
     "bundle": {

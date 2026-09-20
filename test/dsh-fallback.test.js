@@ -7,14 +7,24 @@
  */
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test, { describe } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 
+import { credentialRef } from '@deepseek-ai/dsh-credentials';
+import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment';
+
+import { apply } from '../index.js';
 import {
   FALLBACK_CREDENTIAL_INVALID,
   FALLBACK_CREDENTIAL_MISSING,
   resolveOfficialOptions,
   searchWithOfficialProvider,
 } from '../lib/dsh/fallback.js';
+import { PANEL_ROUTE_PATHS } from '../lib/dsh/panel-routes.js';
 
 /**
  * 一个只提供指定服务的替身 context。
@@ -23,14 +33,36 @@ import {
  * 在快照缺席时会退回真实的 `process.env`，于是「本机没配 DEEPSEEK_API_KEY」这个环境
  * 偶然事实会变成这些用例的隐含前提——开发机上装了官方凭据，它们就会红。空快照让结果
  * 只取决于测试自己给的东西。需要覆盖环境变量时显式传 `environment`。
+ *
+ * `agents` 只在显式传入时可见：官方提供方的 `recordRequest` 读的就是它，而「服务缺席
+ * 时静默不记」与「读到会话时确实追加」两条都要能测。
  */
-function fakeContext({ settings, credentials, environment } = {}) {
+function fakeContext({ settings, credentials, environment, agents } = {}) {
   const services = {
     ...settings === undefined ? {} : { settings: { get: () => settings } },
     ...credentials === undefined ? {} : { credentials },
+    ...agents === undefined ? {} : { agents },
     launchEnvironment: { get: (name) => environment?.(name) },
   };
   return { get: (name) => services[name] };
+}
+
+/**
+ * 一份官方提供方会当作成功的最小 Messages 响应。
+ *
+ * 它要求响应里带 `web_search_tool_result` 块——缺了会按 `WEB_PROVIDER_ERROR` 抛错，
+ * 因此这条桩件同时也钉住了「我们确实走完了整条回落链路」，而不只是没抛错。
+ *
+ * @param url - 引用来源的地址。
+ * @returns 官方 Messages 响应体。
+ */
+function officialSuccess(url = 'https://official.example') {
+  return {
+    content: [
+      { type: 'text', text: 'answer', citations: [{ url, cited_text: 'cited' }] },
+      { type: 'web_search_tool_result', content: [{ type: 'web_search_result', url, title: 'Official' }] },
+    ],
+  };
 }
 
 describe('resolveOfficialOptions：与官方包同一套优先级', () => {
@@ -149,21 +181,6 @@ describe('CFG-5：凭据未配置与凭据已失效必须可区分', () => {
 });
 
 describe('回落的成功路径', () => {
-  /**
-   * 一份官方提供方会当作成功的最小 Messages 响应。
-   *
-   * 它要求响应里带 `web_search_tool_result` 块——缺了会按 `WEB_PROVIDER_ERROR` 抛错，
-   * 因此这条桩件同时也钉住了「我们确实走完了整条回落链路」，而不只是没抛错。
-   */
-  function officialSuccess(url = 'https://official.example') {
-    return {
-      content: [
-        { type: 'text', text: 'answer', citations: [{ url, cited_text: 'cited' }] },
-        { type: 'web_search_tool_result', content: [{ type: 'web_search_result', url, title: 'Official' }] },
-      ],
-    };
-  }
-
   /** 在桩住的 fetch 下跑一次回落。 */
   async function withStubbedFetch(response, run) {
     const original = globalThis.fetch;
@@ -290,5 +307,277 @@ describe('取消经回落路径向上传递', () => {
     }).catch((thrown) => thrown);
 
     assert.equal(error.code, 'WEB_ABORTED');
+  });
+});
+
+describe('host-contract-1：回落要复刻官方的会话副作用', () => {
+  /** 一个把会话追加记下来的 `agents` 服务替身。 */
+  function recordingAgents(appended) {
+    return {
+      currentInitiator: () => ({
+        session: { append: (type, payload) => appended.push({ type, payload }) },
+      }),
+    };
+  }
+
+  /**
+   * 在桩住的 fetch 下跑一次回落。
+   *
+   * @param options - 本次回落。
+   * @param options.agents - `agents` 服务替身；省略表示宿主没有这项服务。
+   * @returns 会话事件的追加记录。
+   */
+  async function runFallback({ agents } = {}) {
+    const appended = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify(officialSuccess()), { status: 200 });
+    try {
+      await searchWithOfficialProvider({
+        ctx: fakeContext({
+          settings: { apiKey: 'sk-literal-test-key' },
+          agents: agents?.(appended),
+        }),
+        request: { query: 'hello' },
+      });
+    } finally {
+      globalThis.fetch = original;
+    }
+    return appended;
+  }
+
+  test('每一次真正发出去的回落搜索都追加 web/deepseek-search-llm-request', async () => {
+    // 官方提供方在 fetch **之前**调 `options.recordRequest?.()`，而调用点是可选链：
+    // 缺了这个键，一次成功的回落搜索不会在会话里留下任何持久记录，两条路径因此产生
+    // 结构不同的会话，而单测与面板都不会有任何异样。
+    const appended = await runFallback({ agents: recordingAgents });
+
+    assert.equal(appended.length, 1, '官方会记一次，我们也要记一次');
+    assert.equal(appended[0].type, 'web/deepseek-search-llm-request');
+    assert.equal(appended[0].payload.endpoint, 'https://api.deepseek.com/anthropic/v1/messages');
+    assert.equal(appended[0].payload.apiVersion, '2023-06-01');
+    assert.equal(appended[0].payload.body.model, 'deepseek-v4-flash', '事件体要带走这次请求的 body');
+    assert.equal(appended[0].payload.body.messages[0].content[0].text.includes('hello'), true);
+  });
+
+  test('recordRequest 是 options 上的一个函数，与官方逐字同名', () => {
+    const options = resolveOfficialOptions(fakeContext());
+    assert.equal(typeof options.recordRequest, 'function');
+  });
+
+  test('agents 服务缺席时静默不记，而不是让搜索失败', async () => {
+    // `agents` 不在本插件 `inject` 的三项之内，组合完成之前读不到它是正常状态；记录
+    // 会话不该有能力让一次搜索失败——官方也是这么写的。
+    const appended = await runFallback({ agents: undefined });
+    assert.deepEqual(appended, []);
+  });
+});
+
+describe('host-contract-1：与官方 resolveOptions 的键集对账', () => {
+  /** 官方提供方的产物；`resolveOptions` 没有导出，因此从源码里抽。 */
+  const OFFICIAL_INDEX_URL = new URL(
+    '../node_modules/@deepseek-ai/dsh-web-search-deepseek/lib/index.js',
+    import.meta.url,
+  );
+
+  /**
+   * 从源码里按大括号配平抽出一个函数的全文。
+   *
+   * @param source - 源码。
+   * @param signature - 函数签名，含结尾的 `{`。
+   * @returns 函数全文。
+   */
+  function extractFunction(source, signature) {
+    const start = source.indexOf(signature);
+    assert.notEqual(start, -1, `官方源码里找不到 ${signature}——上游的写法变了，这条对账要跟着改`);
+    let depth = 0;
+    for (let index = source.indexOf('{', start); index < source.length; index += 1) {
+      if (source[index] === '{') depth += 1;
+      else if (source[index] === '}') {
+        depth -= 1;
+        if (depth === 0) return source.slice(start, index + 1);
+      }
+    }
+    throw new Error(`从 ${signature} 开始的大括号没有配平`);
+  }
+
+  /**
+   * 用官方源码亲手造一份 options，再读出它的键集。
+   *
+   * 不是正则去数 `xxx:` 的字面量：官方的对象里有一个条件展开
+   * （`...literalApiKey === void 0 ? {} : { apiKey }`），只有真的把它跑起来才知道
+   * 键集长什么样。手法与审计探针 `.scratch/audit-probes/hc1-record-request.mjs` 一致。
+   *
+   * @returns 排好序的键名。
+   */
+  function officialOptionKeys() {
+    const source = readFileSync(OFFICIAL_INDEX_URL, 'utf8');
+    const literal = (name) => {
+      const matched = new RegExp(`const ${name} = "([^"]+)"`).exec(source);
+      assert.notEqual(matched, null, `官方源码里找不到常量 ${name}`);
+      return matched[1];
+    };
+    // eslint-disable-next-line no-new-func -- 在受控作用域里重建官方函数，用的全是官方自己的依赖
+    const build = new Function(
+      'credentialRef',
+      'launchEnvironmentOf',
+      'DEFAULT_API_KEY_ENV',
+      'SEARCH_BASE_URL_ENV',
+      `${extractFunction(source, 'function resolveOptions(ctx, config) {')}\nreturn resolveOptions;`,
+    );
+    const resolve = build(
+      credentialRef,
+      launchEnvironmentOf,
+      literal('DEFAULT_API_KEY_ENV'),
+      literal('SEARCH_BASE_URL_ENV'),
+    );
+    return Object.keys(resolve(fakeContext(), {})).sort();
+  }
+
+  test('我们的选项对象与官方逐键相同', () => {
+    // 这是一条**对账**而不是一份手抄副本：上游给 `resolveOptions` 加字段时这里会变红，
+    // 而不是继续静默漏一次官方的副作用（`recordRequest` 就是这么漏掉的）。
+    assert.deepEqual(Object.keys(resolveOfficialOptions(fakeContext())).sort(), officialOptionKeys());
+  });
+});
+
+describe('failure-paths-7：官方凭据状态必须可撤销', () => {
+  /**
+   * 一个足以让插件经 `apply()` 加载的替身宿主。
+   *
+   * `inject` 是**异步**的，与真实宿主同形：回调排在 profile 组合完成之后（实测时序见
+   * `lib/dsh/host-services.js`），因此用之前必须先 `await delay(0)`。这条用例要走的正是
+   * 「服务就绪之后才注册」的那半条路径——面板路由只能在 `connection` 的就绪回调里注册。
+   *
+   * @returns `{ ctx, registered, routes, warnings, setNamespaceValue }`。
+   */
+  async function fakeHost() {
+    const home = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-fallback-'));
+    const registered = [];
+    const routes = new Map();
+    const warnings = [];
+    const values = {
+      // 官方命名空间里的字面凭据：回落要真的走到发请求那一步，而 `credentials` 服务在
+      // 这个替身里是缺席的。
+      'web-search-deepseek': { apiKey: 'sk-literal-test-key' },
+    };
+
+    const services = {
+      web: {
+        registerSearchProvider(provider) {
+          registered.push(provider);
+          return () => undefined;
+        },
+        registerFetchProvider() {
+          return () => undefined;
+        },
+      },
+      settings: {
+        get: (namespace) => values[namespace],
+        register: (namespace) => ({
+          get: () => values[namespace],
+          set: (next) => { values[namespace] = next; },
+        }),
+      },
+      connection: {
+        fetch: {
+          register: (spec) => { routes.set(spec.path, spec.fetch); },
+        },
+      },
+      clientModules: {},
+      dshHomePath: (...segments) => join(home, ...segments),
+      launchEnvironment: { get: () => undefined },
+    };
+
+    const ctx = {
+      get: (name) => services[name],
+      inject: (deps, callback) => {
+        if (deps.every((name) => services[name] !== undefined)) setTimeout(() => { callback(ctx); }, 0);
+        return { dispose: () => undefined };
+      },
+      logger: { warn: (message) => warnings.push(String(message)) },
+    };
+
+    return {
+      ctx,
+      registered,
+      routes,
+      warnings,
+      /** 改一个设置命名空间的值，用来模拟用户在 Models 页改配置。 */
+      setNamespaceValue: (namespace, next) => { values[namespace] = next; },
+    };
+  }
+
+  /**
+   * 读一次面板状态。
+   *
+   * 面板是用户唯一能看到「凭据需要更换」的地方，因此这条状态机只能从它这一面观察。
+   *
+   * @param routes - 已注册的路由表。
+   * @returns 面板状态对象。
+   */
+  async function readPanelState(routes) {
+    const handler = routes.get(PANEL_ROUTE_PATHS.state);
+    assert.notEqual(handler, undefined, 'connection 就绪后面板路由必须已注册');
+    const response = await handler(new Request(`http://localhost${PANEL_ROUTE_PATHS.state}`));
+    assert.equal(response.status, 200);
+    return response.json();
+  }
+
+  test('一次 403 之后回落成功，面板不再报告凭据需要更换', async () => {
+    const { ctx, registered, routes } = await fakeHost();
+    apply(ctx, {});
+    await delay(0);
+
+    assert.equal(registered.length, 1, '搜索提供方必须先注册');
+    const provider = registered[0];
+    const original = globalThis.fetch;
+    try {
+      // ① 官方以 401 拒绝：这是「凭据已失效」唯一的来源——`available()` 只会说「有值」。
+      globalThis.fetch = async () => new Response(JSON.stringify({ error: 'authentication_error' }), { status: 401 });
+      const rejected = await provider.search({ query: 'q' }, undefined).catch((thrown) => thrown);
+      assert.equal(rejected.code, FALLBACK_CREDENTIAL_INVALID);
+
+      const before = await readPanelState(routes);
+      assert.equal(before.fallback.credential, 'invalid', '一次真实的鉴权失败才让面板知道凭据不能用');
+      assert.equal(before.fallback.credentialSource, 'last-failure');
+      assert.notEqual(before.fallback.lastFailureAt, null);
+
+      // ② 同一把凭据，官方这次接受了它。
+      globalThis.fetch = async () => new Response(JSON.stringify(officialSuccess()), { status: 200 });
+      const result = await provider.search({ query: 'q' }, undefined);
+      assert.equal(result.sources.length, 1, '这一次是真的回落成功了');
+
+      // ③ 面板必须撤销那条结论。留着一个永远不撤的 `invalid`，用户会去换一把其实可用的
+      // 凭据，而真正的问题（网络、代理、WAF 的 403）被盖住。
+      const after = await readPanelState(routes);
+      assert.equal(after.fallback.credential, 'configured', '官方反过来接受了这把凭据，旧结论必须撤销');
+      assert.equal(after.fallback.credentialSource, 'probe');
+      assert.equal(after.fallback.lastFailureAt, null, '那次失败的时刻也不该继续挂着');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test('凭据缺失那一档同样不留痕', async () => {
+    const { ctx, registered, routes, setNamespaceValue } = await fakeHost();
+    apply(ctx, {});
+    await delay(0);
+
+    const original = globalThis.fetch;
+    try {
+      // 让本机真的没有官方凭据：settings 里的字面 key 抽掉，凭据服务与启动环境都是空的。
+      setNamespaceValue('web-search-deepseek', {});
+      globalThis.fetch = async () => { throw new Error('不该发出请求'); };
+
+      const provider = registered[0];
+      const missing = await provider.search({ query: 'q' }, undefined).catch((thrown) => thrown);
+      assert.equal(missing.code, FALLBACK_CREDENTIAL_MISSING);
+
+      const state = await readPanelState(routes);
+      assert.equal(state.fallback.credential, 'missing');
+      assert.equal(state.fallback.lastFailureAt, null, '`describeOfficialCredential` 对 MISSING 不做保留，这里也不留痕');
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });

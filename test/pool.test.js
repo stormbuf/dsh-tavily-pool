@@ -551,3 +551,301 @@ describe('POOL-8：批量添加是一次编辑', () => {
     assert.equal(JSON.stringify(store.maskedList()).includes(secret), false);
   });
 });
+
+describe('22 D2：批量删除是一次编辑', () => {
+  /**
+   * 一个计着写入次数的存储（与 `POOL-8` 那组同一手法）。
+   *
+   * 「一次落盘」只有数得出来才谈得上被检验：`removeKeys` 若退化成循环调用 `removeKey`，
+   * 最终状态完全一样，只有写入次数会从 1 变成 N——而那个差别正是「中途失败留半个池子」
+   * 这个风险的全部来源。
+   *
+   * @returns `{ store, writes }`。
+   */
+  async function countingStore() {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-remove-batch-'));
+    const real = await import('node:fs/promises');
+    const counter = { count: 0 };
+    const store = await new PoolStore({
+      dir,
+      fileName: 'keys.json',
+      fs: {
+        mkdir: real.mkdir,
+        readFile: real.readFile,
+        rename: real.rename,
+        unlink: real.unlink,
+        writeFile: (...args) => {
+          counter.count += 1;
+          return real.writeFile(...args);
+        },
+      },
+    }).load();
+    return { store, writes: counter };
+  }
+
+  test('删 5 把只写一次盘，连统计与余额缓存一起清掉', async () => {
+    const { store, writes } = await countingStore();
+    const records = await store.addKeys({
+      keys: Array.from({ length: 6 }, (unused, index) => ({ key: `tvly-dev-remove-${String(index)}-000000000000` })),
+    });
+    await store.writeStats(records[0].id, () => ({ calls: 3 }));
+    await store.setUsage(records[0].id, { key: { limit: 1000, usage: 10 } });
+    const doomed = records.slice(0, 5).map((record) => record.id);
+    const before = writes.count;
+
+    const removed = await store.removeKeys(doomed);
+
+    assert.equal(removed.length, 5);
+    assert.equal(writes.count - before, 1, '批量删除是一次编辑，不是 5 次');
+    assert.equal(store.keysInOrder().length, 1);
+    assert.equal(store.keysInOrder()[0].id, records[5].id, '没被点到的那些原样保留');
+    assert.equal(store.statsOf(records[0].id), undefined, '统计随记录一起删掉');
+    assert.equal(store.usageOf(records[0].id), undefined, '余额缓存同理');
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    assert.equal(onDisk.keys.length, 1);
+    assert.deepEqual(onDisk.order, [records[5].id]);
+  });
+
+  test('未知 id 被静默忽略（存在性判断属于调用方）', async () => {
+    // 存储层不做领域判断：`lib/panel.js` 才是那个先校验再删的地方（它要保证「一个不存在的
+    // id 一把都不删」）。这里如实记录这条分工，免得将来有人把校验挪进存储层。
+    const { store, writes } = await countingStore();
+    const [only] = await store.addKeys({ keys: [{ key: 'tvly-dev-remove-only-0000000000' }] });
+
+    const removed = await store.removeKeys(['no-such-id']);
+
+    assert.deepEqual(removed, []);
+    assert.equal(store.keysInOrder().length, 1, '未知 id 不该动到已有的记录');
+    assert.equal(writes.count, 2, '加上第一次添加，一共两次写入');
+    assert.equal(store.keysInOrder()[0].id, only.id);
+  });
+
+  test('空列表什么都不做，也不落盘', async () => {
+    const { store, writes } = await countingStore();
+    await store.addKeys({ keys: [{ key: 'tvly-dev-remove-empty-000000000' }] });
+    const before = writes.count;
+
+    assert.deepEqual(await store.removeKeys([]), []);
+    assert.deepEqual(await store.removeKeys(undefined), []);
+    assert.equal(writes.count, before, '没东西可删时不该产生一次写入');
+  });
+});
+
+describe('22 C1：密钥池的真源是磁盘，内存只是它的缓存', () => {
+  /**
+   * 一份**非空**的初始状态：先由另一个存储把密钥写进磁盘，再让被测存储加载它。
+   *
+   * 「先在磁盘上放一份非空的池」是 ticket `21` 留下的纪律：总是从零开始的固件会让
+   * 「忘记读已有状态」这类缺陷隐形，而本组用例测的正是「运行期磁盘变了会怎样」。
+   *
+   * @param keys - 初始密钥明文，按顺序写进磁盘。
+   * @returns `{ writer, store, filePath, disk }`——`writer` 扮演另一个进程（或用户手工编辑），
+   *   `store` 是被测的那个「本进程」。
+   */
+  async function seededStore(keys) {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-truth-'));
+    const filePath = join(dir, 'keys.json');
+    const writer = await new PoolStore({ dir, fileName: 'keys.json' }).load();
+    for (const key of keys) await writer.addKey({ key });
+    const store = await new PoolStore({ dir, fileName: 'keys.json' }).load();
+    return { writer, store, filePath, disk: async () => JSON.parse(await readFile(filePath, 'utf8')) };
+  }
+
+  test('外部新增的密钥不会被下一次与密钥无关的记账写入覆盖', async () => {
+    // 搜索命中密钥之后的统计落盘走的就是 writeStats 这条路：它与密钥内容毫无关系，
+    // 却是把外部补进来的那把抹掉的那次写入。
+    const { writer, store, disk } = await seededStore(['tvly-dev-first-aaaaaaaaaaaa']);
+    await writer.addKey({ key: 'tvly-dev-added-bbbbbbbbbbbb' });
+
+    await store.writeStats(store.keysInOrder()[0].id, () => ({ calls: 1 }));
+
+    assert.deepEqual(
+      (await disk()).keys.map((entry) => entry.key),
+      ['tvly-dev-first-aaaaaaaaaaaa', 'tvly-dev-added-bbbbbbbbbbbb'],
+      '外部补进来的那把必须还在磁盘上',
+    );
+    assert.deepEqual(
+      store.keysInOrder().map((entry) => entry.key),
+      ['tvly-dev-first-aaaaaaaaaaaa', 'tvly-dev-added-bbbbbbbbbbbb'],
+      '内存里的候选也要跟上磁盘',
+    );
+  });
+
+  test('外部删除的密钥不再被使用，也不会被下一次落盘写回', async () => {
+    const { writer, store, disk } = await seededStore(['tvly-dev-doomed-aaaaaaaaaaaa', 'tvly-dev-kept-bbbbbbbbbbbb']);
+    const [doomed, kept] = store.keysInOrder();
+    await writer.removeKey(doomed.id);
+
+    await store.writeStats(kept.id, () => ({ calls: 1 }));
+
+    assert.deepEqual(
+      store.keysInOrder().map((entry) => entry.key),
+      ['tvly-dev-kept-bbbbbbbbbbbb'],
+      '调度器手里的候选必须去掉它',
+    );
+    assert.deepEqual(
+      (await disk()).keys.map((entry) => entry.key),
+      ['tvly-dev-kept-bbbbbbbbbbbb'],
+      '它也不得被写回磁盘',
+    );
+  });
+
+  test('外部改过的记录字段以磁盘为准（本进程没碰过它时）', async () => {
+    const { writer, store, disk } = await seededStore(['tvly-dev-first-aaaaaaaaaaaa']);
+    const id = store.keysInOrder()[0].id;
+    await writer.rename(id, '外部改的备注');
+    await writer.setDisabled(id, true);
+
+    await store.writeStats(id, () => ({ calls: 2 }));
+
+    const document = await disk();
+    assert.equal(document.keys[0].label, '外部改的备注', '外部的编辑不得被内存里那份旧记录覆盖');
+    assert.equal(document.keys[0].disabled, true);
+    assert.equal(document.stats[id].calls, 2, '而统计仍以本进程为准');
+  });
+
+  test('本进程刚做的编辑与外部改动同时存在时，两边都不丢', async () => {
+    // 只做「磁盘优先」是不够的：本进程的面板编辑在落盘之前只存在于内存里，磁盘上还没有它。
+    // 归并因此要按「本进程改过哪几条」把编辑意图叠到磁盘之上。
+    const { writer, store, disk } = await seededStore(['tvly-dev-first-aaaaaaaaaaaa']);
+    const id = store.keysInOrder()[0].id;
+    await writer.addKey({ key: 'tvly-dev-external-bbbbbbbbbbbb' });
+
+    await store.rename(id, '本进程改的');
+
+    const document = await disk();
+    assert.deepEqual(
+      document.keys.map((entry) => entry.key),
+      ['tvly-dev-first-aaaaaaaaaaaa', 'tvly-dev-external-bbbbbbbbbbbb'],
+    );
+    assert.equal(document.keys[0].label, '本进程改的', '本进程的编辑必须落盘，而不是被磁盘那份盖回去');
+  });
+
+  test('统计与余额缓存以本进程为准，外部改过的统计不会把运行期记账顶掉', async () => {
+    const { store, filePath, disk } = await seededStore(['tvly-dev-first-aaaaaaaaaaaa']);
+    const id = store.keysInOrder()[0].id;
+    await store.writeStats(id, () => ({ calls: 1 }));
+
+    // 外部把统计改成一个不属于本进程运行期的值，随后本进程做一次记录级编辑。
+    const document = await disk();
+    document.stats[id] = { calls: 99 };
+    await writeFile(filePath, `${JSON.stringify(document, null, 2)}\n`, 'utf8');
+
+    await store.setDisabled(id, true);
+
+    assert.equal((await disk()).stats[id].calls, 1, '运行期记账是本进程的状态，不会被磁盘上的旧值顶掉');
+  });
+
+  test('外部改动如实记在 lastExternalChange 上，供上报出口读走', async () => {
+    const { writer, store } = await seededStore(['tvly-dev-first-aaaaaaaaaaaa', 'tvly-dev-second-bbbbbbbbbbbb']);
+    const [first, second] = store.keysInOrder();
+    assert.equal(store.lastExternalChange, undefined, '还没有外部改动时它是空的');
+
+    await writer.removeKey(first.id);
+    await writer.addKey({ key: 'tvly-dev-added-cccccccccccc' });
+    await writer.rename(second.id, '外部改的');
+
+    await store.refreshFromDisk();
+
+    assert.equal(store.lastExternalChange.added, 1, '外部新增了一条');
+    assert.equal(store.lastExternalChange.removed, 1, '外部删掉了一条');
+    assert.equal(store.lastExternalChange.changed, 1, '外部改了一条的字段');
+    assert.match(store.lastExternalChange.at, /^\d{4}-\d{2}-\d{2}T/u, '要带上观察时刻');
+    assert.deepEqual(
+      store.keysInOrder().map((entry) => entry.key),
+      ['tvly-dev-second-bbbbbbbbbbbb', 'tvly-dev-added-cccccccccccc'],
+      '对账把外部删除与外部新增一起带进内存',
+    );
+    assert.equal(store.keysInOrder()[0].label, '外部改的', '外部改的字段也在内存里生效');
+  });
+
+  test('删除整个文件不等于清空密钥池：读不出来时什么都不做', async () => {
+    // 读盘失败（含文件不存在）与「磁盘上是空的」是两件事：把它们当成同一件，会让一次
+    // 备份/同步工具的临时挪动把用户手上的密钥清掉。
+    const { store, filePath } = await seededStore(['tvly-dev-first-aaaaaaaaaaaa']);
+    const { unlink } = await import('node:fs/promises');
+    await unlink(filePath);
+
+    await store.refreshFromDisk();
+
+    assert.equal(store.keysInOrder().length, 1, '一次读盘失败不该动内存里的密钥池');
+  });
+
+  test('写盘失败的编辑即使期间发生过对账，也整体回滚', async () => {
+    // 对账会在一次编辑写盘的**期间**替换内存文档（面板读一次、搜索开始前都会触发它）。
+    // 编辑失败时若拿「文档引用没变」当回滚判据，这次没写进去的编辑就会留在内存里——而面板
+    // 此刻显示的正是内存，于是用户看到一把磁盘上并不存在的密钥。判据因此是「有没有更晚的编辑」。
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-truth-'));
+    const real = await import('node:fs/promises');
+    let writes = 0;
+    const store = new PoolStore({
+      dir,
+      fileName: 'keys.json',
+      fs: {
+        ...real,
+        writeFile: async (...args) => {
+          writes += 1;
+          if (writes === 2) {
+            await store.refreshFromDisk();
+            throw new Error('simulated edit failure');
+          }
+          return real.writeFile(...args);
+        },
+      },
+    });
+    await store.load();
+    const record = await store.addKey({ key: 'tvly-dev-base-aaaaaaaaaaaa' });
+
+    await assert.rejects(() => store.setDisabled(record.id, true), /simulated edit failure/u);
+
+    assert.equal(store.maskedList()[0].disabled, false, '失败的那次编辑不生效');
+    const onDisk = JSON.parse(await readFile(store.filePath, 'utf8'));
+    assert.equal(onDisk.keys[0].disabled, false, '磁盘上也不生效');
+  });
+});
+
+describe('22 C3：本版本不认识的顶层键往返保留', () => {
+  test('经一次面板编辑之后，未知顶层键与记录级未知字段都还在', async () => {
+    // 真实场景：同一台机器上跑过更新版本的插件、或用户手工加了字段，随后回到本版本。
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-extras-'));
+    const filePath = join(dir, 'keys.json');
+    await writeFile(filePath, `${JSON.stringify({
+      version: 1,
+      keys: [{ id: 'a', key: 'tvly-dev-first-aaaaaaaaaaaa', disabled: false, note: '记录级未知字段' }],
+      order: ['a'],
+      stats: {},
+      usageCache: {},
+      schemaExtras: { writtenBy: 'future-version' },
+      labels: ['自定义顶层键'],
+    }, null, 2)}\n`, 'utf8');
+
+    const store = await new PoolStore({ dir, fileName: 'keys.json' }).load();
+    await store.setDisabled('a', true);
+
+    const document = JSON.parse(await readFile(filePath, 'utf8'));
+    assert.deepEqual(document.schemaExtras, { writtenBy: 'future-version' }, '未知顶层键必须原样带上');
+    assert.deepEqual(document.labels, ['自定义顶层键']);
+    assert.equal(document.keys[0].note, '记录级未知字段', '记录级未知字段同样保留');
+    assert.equal(document.keys[0].disabled, true, '而这次编辑本身照常生效');
+  });
+
+  test('进程运行期间外部写下的未知顶层键，也不被下一次落盘抹掉', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-extras-'));
+    const filePath = join(dir, 'keys.json');
+    const writer = await new PoolStore({ dir, fileName: 'keys.json' }).load();
+    await writer.addKey({ key: 'tvly-dev-first-aaaaaaaaaaaa' });
+    const store = await new PoolStore({ dir, fileName: 'keys.json' }).load();
+    const id = store.keysInOrder()[0].id;
+
+    // 外部（用户手工编辑）补一个本版本不认识的顶层键。
+    const document = JSON.parse(await readFile(filePath, 'utf8'));
+    document.schemaExtras = { writtenBy: 'future-version' };
+    await writeFile(filePath, `${JSON.stringify(document, null, 2)}\n`, 'utf8');
+
+    await store.writeStats(id, () => ({ calls: 1 }));
+
+    const written = JSON.parse(await readFile(filePath, 'utf8'));
+    assert.deepEqual(written.schemaExtras, { writtenBy: 'future-version' }, '外部写的未知顶层键跟着磁盘走');
+    assert.equal(written.stats[id].calls, 1, '本进程的统计照常落盘');
+  });
+});

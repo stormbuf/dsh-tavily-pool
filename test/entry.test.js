@@ -37,9 +37,11 @@ import { maskKey } from '../lib/pool.js';
  * @param options.omitRegistration - 移除 seam 的注册函数。
  * @param options.settings - 命名空间的初始值。
  * @param options.environment - launcher 环境快照的内容；默认为空。
+ * @param options.tools - 宿主的 `tools` 服务替身（形如 `{ get(name) }`）；省略表示这个宿主
+ *   没有该服务，总预算退回本插件的常量（`host-contract-2`）。
  * @returns `{ ctx, registered, warnings, registerCalls, settings }`。
  */
-function fakeHost({ harnessHome, omitRegistration = false, omitFetchRegistration = false, settings = {}, environment = {} } = {}) {
+function fakeHost({ harnessHome, omitRegistration = false, omitFetchRegistration = false, settings = {}, environment = {}, tools } = {}) {
   const registered = [];
   const registeredFetch = [];
   const warnings = [];
@@ -72,6 +74,10 @@ function fakeHost({ harnessHome, omitRegistration = false, omitFetchRegistration
         },
       }),
     },
+    // 宿主的工具注册表（`host-contract-2`）。默认**不提供**：真实宿主里它由
+    // `dsh-tools` 提供，而本替身此前完全没有它——那正是「总预算从不读宿主绑定值」
+    // 这条缺陷在单测里没有判据的原因之一。要检验读取，就显式传一个进来。
+    ...(tools === undefined ? {} : { tools }),
     clientModules: {},
     connection: { fetch: { register: () => async () => {} } },
     dshHomePath: (...segments) => join(harnessHome ?? '/nonexistent-home/.dsh', ...segments),
@@ -87,13 +93,25 @@ function fakeHost({ harnessHome, omitRegistration = false, omitFetchRegistration
   const ctx = {
     get: (name) => services[name],
     services,
-    // 与真实宿主同形的 `inject`：依赖齐全时**同步**跑回调，缺一个就永不跑。
+    // 与真实宿主同形的 `inject`：依赖齐全时**回调照跑，但不在同步栈上**；缺一个就永不跑。
+    //
+    // 「不在同步栈上」这一条是这张票（`22` 的 `test-blindspots-1`）补上的，也是最容易被
+    // 替身抹掉的一条：真机实测（见 `lib/dsh/host-services.js`）`apply()` 在 `@+817ms` 就
+    // 结束，而 `inject:settings` 到 `@+3385ms` 才跑——它排在**整个 profile 组合完成之后**。
+    // 同前的替身在这里同步跑回调，于是「在注入回调里才成立的前置条件」这类缺陷在单测里
+    // 永远隐形（bug #1 与 bug #4 都是这么来的）。回调用 `setTimeout` 推迟，比任何微任务
+    // 都晚，因此 `apply()` 返回时五项服务一个都没绑上——要断言它们就调
+    // {@link FakeHost#settleInjections}。
     //
     // 插件用 `ctx.inject` 取 `settings` / `connection` / `credentials`（见
     // `lib/dsh/host-services.js` 的实测表），因此替身少了这个方法，插件在真实宿主上会
     // 走通、在这里却直接抛——那正是替身最容易掩盖的一类失败。
     inject: (deps, callback) => {
-      if (deps.every((name) => services[name] !== undefined)) callback(ctx);
+      if (deps.every((name) => services[name] !== undefined)) {
+        setTimeout(() => {
+          callback(ctx);
+        }, 0);
+      }
       return { dispose: () => undefined };
     },
     // 自有属性，不是服务——因此刻意不出现在 `services` 里。
@@ -106,6 +124,17 @@ function fakeHost({ harnessHome, omitRegistration = false, omitFetchRegistration
     registeredFetch,
     warnings,
     registerCalls: () => registerCalls,
+    /**
+     * 等注入回调跑完。
+     *
+     * `setTimeout` 排在注入回调用以推迟自己的那个宏任务**之后**（定时器按到期时刻与入队
+     * 顺序兑现），因此 `await` 它一次就足以看到回调的全部后果。
+     *
+     * @returns 无。
+     */
+    settleInjections: () => new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    }),
     /** 改一个设置值，供「改动即时生效」的检验使用。 */
     setSettings: (next) => {
       values[SETTINGS_NAMESPACE] = { ...values[SETTINGS_NAMESPACE], ...next };
@@ -168,19 +197,39 @@ describe('PIN-5 / 硬约束 5：注册发生在最前', () => {
     assert.match(host.warnings.join('\n'), /initialization failed/u, '并且该失败必须被上报');
   });
 
-  test('logger 损坏绝不会成为搜索失败的原因', () => {
-    const host = fakeHost();
-    // 方法会抛错的 logger 不得从 apply() 里传播出去：日志是尽力而为的，而这段代码
-    // 运行在提供方已经注册之后。
+  test('logger 损坏绝不会成为搜索失败的原因', async () => {
+    // **这条用例名承诺的是「搜索照常」，而正文此前只断言 `apply()` 不抛**（ticket `22` 的
+    // `test-blindspots-7`）——把一处裸 `ctx.logger.warn(...)` 加进搜索路径，这条用例照样
+    // 全绿，因为它一次 `search` 都没跑。日志按定义是尽力而为的，而 `report()` 的 `try` 就是
+    // 那条承诺的实现，因此判据只能是「跑一次搜索，而且它真的记过日志」。
+    //
+    // 一份坏掉的 `keys.json` 同时满足这两个条件：加载期与每次搜索各有一条告警（`POOL-7`），
+    // 而搜索本身照常回落、照常返回结果——那条回落**成功**的日志同样只经 `report()` 出去。
+    const home = await temporaryHarnessHome('{ this is not json');
+    const host = fakeHost({ harnessHome: home });
+    const warnings = [];
     host.ctx.logger = {
-      warn() {
+      warn(message) {
+        warnings.push(String(message));
         throw new Error('simulated logger failure');
       },
     };
+
     assert.doesNotThrow(() => {
       apply(host.ctx, {});
     });
     assert.equal(host.registered.length, 1);
+
+    const error = await host.registered[0]
+      .search({ query: 'q' })
+      .then(() => undefined, (thrown) => thrown);
+
+    assert.equal(
+      error?.code,
+      'TAVILY_FALLBACK_CREDENTIAL_MISSING',
+      '搜索必须照常走到回落那条路上，而不是被坏 logger 打断',
+    );
+    assert.ok(warnings.length > 0, '坏 logger 必须真的被调用过，否则这条用例是空转');
   });
 
   test('退化的宿主在加载期被上报，并点名缺了什么', async () => {
@@ -414,10 +463,17 @@ async function withStubbedFetch(handler, run) {
       url,
       method: init?.method,
       authorization: init?.headers?.authorization,
+      // 信号也收下来：它是**唯一**能反查「宿主给了这个工具多久」的观测面——单次尝试的超时
+      // 就挂在它上面（`AbortSignal.timeout`），而它由本次的总预算折算而来（`host-contract-2`）。
+      signal: init?.signal,
       body: JSON.parse(init?.body ?? '{}'),
     };
     calls.push(call);
     const outcome = handler(call) ?? { status: 200, body: { results: [] } };
+    // **异步桩件按原样返回。** 它存在的理由正是造出「响应一直不来」这类真实时序（体读阶段
+    // 超时、连接重置、取消），而在这里 `await` 会把它拆成一个 `Response`——于是「挂住」变成
+    // 「立刻回一个空响应」，被检验的时序根本不会发生。
+    if (outcome instanceof Promise) return outcome;
     if (outcome.throw !== undefined) throw outcome.throw;
     return new Response(JSON.stringify(outcome.body ?? {}), {
       status: outcome.status ?? 200,
@@ -434,7 +490,7 @@ async function withStubbedFetch(handler, run) {
 /** 一个已加载插件、池中已有若干密钥的替身宿主。 */
 async function hostWithKeys(keys, options = {}) {
   const home = await temporaryHarnessHome('{"version":1,"keys":[],"order":[],"stats":{},"usageCache":{}}');
-  const host = fakeHost({ harnessHome: home, settings: options.settings });
+  const host = fakeHost({ harnessHome: home, settings: options.settings, tools: options.tools });
   apply(host.ctx, {});
 
   // 先经真实的加载路径读入空池，再经存储自身的编辑接口添加密钥——与面板将来做的
@@ -1219,5 +1275,108 @@ describe('14：调用历史经入口真的落盘', () => {
 
     assert.equal(result.value.sources.length, 1, '历史写不进去也不该让搜索失败');
     assert.equal(result.calls.length, 1);
+  });
+});
+
+describe('host-contract-2：总预算读宿主真正绑定的值', () => {
+  /**
+   * 一个宿主的 `tools` 服务替身，只实现 `get(name)`。
+   *
+   * 真实签名是 `get(name, scope)`，且 `scope` 是发起调用的 agent——本插件在发起请求之前
+   * 拿不到它，因此固定按**全局视图**（省略 scope）读取。这个替身照此实现，因此它同时也
+   * 是「有没有偷偷去猜 agent」的判据：一旦代码传了 scope，这里会把它记下来。
+   *
+   * @param definitions - 工具名到定义的映射。
+   * @returns 服务本身（形状 `{ get(name, scope) }`），外加一个 `scopes` 数组，
+   *   记录每次读取用过的 scope。
+   */
+  function fakeTools(definitions) {
+    const scopes = [];
+    return {
+      scopes,
+      get(name, scope) {
+        scopes.push(scope);
+        return definitions[name];
+      },
+    };
+  }
+
+  test('宿主绑了 3000ms 时，单次尝试在一个远早于插件常量的时间点上超时', async () => {
+    // **这是「读到了宿主绑定值」唯一的直接判据。** 宿主把 `timeoutMs` 绑在工具定义上、
+    // 由 timeout-policy 武装成硬 deadline；插件若不读它，就会按自己的 20 秒单次超时排布，
+    // 于是宿主先用一句 `tool call timed out after …ms` 顶掉上游的真实错误（`REST-10`）。
+    //
+    // 观测面只有一处：插件的单次尝试超时挂在它交给 `fetch` 的那个信号上。因此让 fetch
+    // 一直挂着，看它多久被中止——3000ms 的宿主预算（减去余量后 1000ms，被单次尝试的下限
+    // `MIN_ATTEMPT_TIMEOUT_MS` 抬到 2000ms）必定在 4.5 秒内中止，而按插件自己的常量
+    // 排布时第一次尝试要 20 秒才会中止——那正是这条用例能反向验证的地方。
+    const tools = fakeTools({ web_search: { timeoutMs: 3_000 } });
+    const host = await hostWithKeys([{ label: 'only' }], { tools });
+
+    const startedAt = Date.now();
+    const outcome = await withStubbedFetch(
+      // 一个「没有对端会回应」的连接：promise 一直挂着，直到插件的单次超时把信号中止掉。
+      // `keep` 是有意留着的**普通**定时器：`AbortSignal.timeout` 内部的定时器不持有事件循环，
+      // 少了它，Node 会在这个挂起的 await 处直接退出——那会被报成用例失败，而失败的其实是
+      // 测试自己没能把时间等出来。
+      (call) => new Promise((resolve, reject) => {
+        const keep = setTimeout(() => reject(new Error('the plugin never aborted this attempt')), 15_000);
+        call.signal?.addEventListener('abort', () => {
+          clearTimeout(keep);
+          reject(call.signal.reason);
+        }, { once: true });
+      }),
+      (calls) => host.registered[0].search({ query: 'q' })
+        .then(() => ({ aborted: false, calls }))
+        .catch(() => ({ aborted: true, calls })),
+    );
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(outcome.result.calls.length, 1, '只该发出一次尝试');
+    assert.equal(outcome.result.aborted, true, '宿主给出的信号必须真的中止这次尝试');
+    assert.ok(elapsed < 4_500, `必须按宿主绑定的 3000ms 排布，实际 ${String(elapsed)}ms`);
+    assert.deepEqual(tools.scopes, [undefined], '必须按全局视图读，不去猜 agent scope');
+  });
+
+  test('宿主没有 tools 服务时退回常量预算，搜索照常', async () => {
+    // 退化宿主（或 `tools` 在本 fiber 不可见）不是错误：预算是排布依据，不是正确性前提。
+    // 判据是这次调用仍然成功，且**没有**因为读不到而抛。
+    const host = await hostWithKeys([{ label: 'only' }]);
+
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      (calls) => host.registered[0].search({ query: 'q' }).then((value) => ({ value, calls })),
+    );
+
+    assert.equal(result.value.sources.length, 1, '读不到宿主预算时搜索必须照常');
+    assert.equal(result.calls.length, 1);
+  });
+
+  test('抓取路径同样按 web_fetch 的绑定值排布', async () => {
+    // 两条路径各自的宿主预算不同（`web_search` 默认 30 秒、`dsh-base` 抬到 60；`web_fetch`
+    // 30 秒），因此「按工具名问」是这条修复的一半——两个常量共用一份读取代码时，把
+    // `web_fetch` 写成 `web_search` 会让抓取按 60 秒排布，而宿主 30 秒就掐断。
+    const tools = fakeTools({ web_search: { timeoutMs: 60_000 }, web_fetch: { timeoutMs: 3_000 } });
+    const host = await hostWithKeys([{ label: 'only' }], { tools });
+
+    const startedAt = Date.now();
+    const outcome = await withStubbedFetch(
+      (call) => new Promise((resolve, reject) => {
+        const keep = setTimeout(() => reject(new Error('the plugin never aborted this attempt')), 15_000);
+        call.signal?.addEventListener('abort', () => {
+          clearTimeout(keep);
+          reject(call.signal.reason);
+        }, { once: true });
+      }),
+      (calls) => host.registeredFetch[0].fetch({ url: 'https://slow.example' })
+        .then(() => ({ aborted: false, calls }))
+        .catch(() => ({ aborted: true, calls })),
+    );
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(outcome.result.calls.length, 1, '只该发出一次尝试');
+    assert.equal(outcome.result.aborted, true);
+    assert.ok(elapsed < 4_500, `抓取必须按 web_fetch 的 3000ms 排布，实际 ${String(elapsed)}ms`);
+    assert.deepEqual(tools.scopes, [undefined], '同样按全局视图读');
   });
 });

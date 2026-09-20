@@ -260,6 +260,53 @@ describe('SCHED-8：只有官方确认余额回升才恢复', () => {
   });
 });
 
+describe('failure-paths-3：永久失效有可用的复位路径', () => {
+  test('一次成功的 /usage 撤销永久失效标记', async () => {
+    const { health, refresher, record } = await harness({
+      respond: () => ({ status: 200, body: usageBody({ usage: 5, limit: 100 }) }),
+    });
+    await health.recordFailure(record.id, { failure: { status: 401, detail: 'invalid api key' } });
+    assert.equal(health.snapshotOf(record.id).permanentlyInvalid, true, '先把它移出池子');
+
+    const outcome = await refresher.refresh(record.id, record.key);
+
+    assert.equal(outcome.ok, true);
+    assert.equal(
+      health.snapshotOf(record.id).permanentlyInvalid,
+      false,
+      '官方读通了这次 /usage，而它是带着这把密钥的 Authorization 读通的——「凭据不可再用」这条结论被反驳',
+    );
+    assert.equal(health.statsOf(record.id).invalidReason, undefined, '注解随标记一并清掉');
+  });
+
+  test('余额为零也照样撤销：额度耗尽是另一个标记', async () => {
+    // 撤销与余额无关。余额用尽的 200 响应说的是「这把密钥没量了」，而不是「这把密钥
+    // 不可用」——后者才是永久失效标记的全部内容。
+    const { health, refresher, record } = await harness({
+      respond: () => ({ status: 200, body: usageBody({ usage: 100, limit: 100 }) }),
+    });
+    await health.recordFailure(record.id, { failure: { status: 432 } });
+    await health.recordFailure(record.id, { failure: { status: 401, detail: 'invalid api key' } });
+
+    await refresher.refresh(record.id, record.key);
+
+    assert.equal(health.snapshotOf(record.id).permanentlyInvalid, false);
+    assert.equal(health.snapshotOf(record.id).quotaExhausted, true, '额度耗尽只认余额为正，不因这次读数解除');
+  });
+
+  test('刷新失败时标记原样保留：没读到官方读数就什么也没被确认', async () => {
+    const { health, refresher, record } = await harness({
+      respond: () => ({ status: 500, body: { detail: { error: 'boom' } } }),
+    });
+    await health.recordFailure(record.id, { failure: { status: 401, detail: 'invalid api key' } });
+
+    const outcome = await refresher.refresh(record.id, record.key);
+
+    assert.equal(outcome.ok, false);
+    assert.equal(health.snapshotOf(record.id).permanentlyInvalid, true);
+  });
+});
+
 describe('hasPositiveBalance：读不出余额一律不算「恢复」', () => {
   test('两侧都没有上限时为正', () => {
     assert.equal(hasPositiveBalance({ key: { usage: 1, limit: null }, account: { plan_limit: null } }), true);

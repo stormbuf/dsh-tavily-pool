@@ -157,6 +157,14 @@ directly, because the fallback path is what a user gets when they switch this pl
   throws on a name outside the grammar, so the latter must be checked first);
 - `@deepseek-ai/dsh-launch-environment` still exports `launchEnvironmentOf`, and its snapshot's
   `get(name)` still returns `{ value, source }`;
+- `resolveOptions`'s **side effect** is still there: the options object carries `recordRequest`, and
+  the provider calls it (optionally, before the request) to append a
+  `web/deepseek-search-llm-request` event to the session. Ticket `22` F1 added it to this plugin's
+  copy; `test/dsh-fallback.test.js` reconciles this plugin's option keys against the official
+  source mechanically, so a new field upstream turns that test red. Note the read is
+  `readService(ctx, 'agents')` — `agents` is not one of the three services that need `inject`
+  (coupling point 19), but it is only guaranteed active once a real request is in flight, which
+  is exactly when `recordRequest` runs;
 - the official defaults this plugin mirrors are unchanged — `apiKeyEnv: DEEPSEEK_API_KEY`,
   `baseURL: https://api.deepseek.com/anthropic/v1`, `model: deepseek-v4-flash`,
   `apiVersion: 2023-06-01`, `maxTokens: 4096`, `maxUses: 5`, and the `DEEPSEEK_SEARCH_BASE_URL`
@@ -183,7 +191,32 @@ things:
   by field, so an upstream default change turns it red without anyone having to re-read this
   section by hand.
 
-### 6. Settings registration
+### 6. Host tool budgets — the deadline the host actually arms
+
+**Where:** `dsh-tools` (`get(name, scope)`), `dsh-tool-call-timeout-policy`
+(`ctx.tools.get(exec.name, exec.agent)?.timeoutMs`), and `dsh-tool-web` (`timeoutMs` on the
+`web_search` / `web_fetch` definitions, from `searchTimeoutMs` / `fetchTimeoutMs`).
+**Then edit:** `lib/dsh/host-budget.js`
+
+Both paths size their total budget from the value the host actually bound, not from a constant
+(ticket `22` F2). Reading it wrong is not a "slightly late timeout": when the host's deadline
+fires first, the model sees `tool call timed out after <n>ms` and the upstream error this plugin
+was carrying is lost.
+
+Check that `ctx.tools.get(name)` still resolves the tool definition and that it still carries a
+numeric `timeoutMs`; that the timeout policy still reads it with `?.timeoutMs` and skips arming
+when absent; and that the tool names are still `web_search` / `web_fetch`. `test/budgets.test.js`
+reconciles this plugin's constants against the host's own composition file and package schema
+mechanically, and asserts both folded budgets finish strictly before the host deadline — it fails
+loudly (never skips) when the host install cannot be located, and honours `DSH_HOST_ROOT` when it
+can't be found automatically.
+
+`tools` is read through the plugin's context view with **no agent scope** — the provider has no
+agent at request time, and guessing one would read another agent's budget. The reading is
+reported as `host` / `unbound` / `unavailable`, so "we fell back to the constant" is observable
+rather than silent.
+
+### 7. Settings registration
 
 **Where:** `dsh-settings` — `register(ns, schema, options)` on the service, and `get(ns)` on
 the service for reading a registered namespace back.
@@ -198,7 +231,7 @@ Confirm too that duplicate namespace registration still throws. The plugin must 
 re-register `web-search-deepseek`: that namespace belongs to the official plugin, which
 must stay enabled, and re-registering it throws.
 
-### 7. Manifest fields
+### 8. Manifest fields
 
 **Where:** `dsh-package-manifest/lib/types/types.d.ts`, interface `DshManifest`.
 **Then edit:** `package.json`
@@ -207,9 +240,9 @@ Check whether `dsh.bundle.patch` / `dsh.client` gained new required siblings. Th
 half matters for the panel ticket: `dsh.client` requires `exports["./client"]` to exist, and
 the bundle id must equal the package name.
 
-### 8. Client module protocol (panel ticket only)
+### 9. Client module protocol (panel ticket only)
 
-**Where:** `dsh-web-frontend/dist/assets/index-*.js`, search for `staticModules`.
+**Where:** `dsh-web-frontend/dist/assets/index-*.js`, search for `PLATFORM_MODULES`.
 **Then edit:** `lib/client.js`
 
 The seed module table lists exactly which specifiers a zero-build bundle may `require`. If

@@ -10,8 +10,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, mkdtemp, readFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
@@ -24,8 +24,15 @@ import {
   readPanelState,
   runPanelCommand,
 } from '../lib/panel.js';
-import { HISTORY_MAX_ENTRIES } from '../lib/constants.js';
+import {
+  HISTORY_MAX_ENTRIES,
+  PANEL_KEY_MAX_LENGTH,
+  PANEL_KEYS_MAX,
+  PANEL_KEYS_MAX_PER_REQUEST,
+} from '../lib/constants.js';
+import { KeyHealth } from '../lib/health.js';
 import { PoolStore } from '../lib/pool.js';
+import { UsageQuota, UsageRefresher } from '../lib/usage.js';
 
 /** 用例里用到的那把明文密钥。任何响应里出现它，都是 `POOL-3` 的失败。 */
 const SECRET = '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';
@@ -769,5 +776,325 @@ describe('14：调用历史的投影', () => {
 
     assert.equal(state.history.daily.length, HISTORY_CHART_DAYS);
     assert.equal(state.history.daily.reduce((total, day) => total + day.search, 0), 0);
+  });
+});
+
+describe('panel-http-3：单把添加也要去重', () => {
+  test('同一把明文提交两次只占一个槽位，第二次明确回报「已在池中」', async () => {
+    const { deps, pool } = await panelDeps();
+    const first = await runPanelCommand('keys', { action: 'add', key: SECRET, label: 'primary' }, deps);
+    assert.deepEqual(first.body.summary, { received: 1, added: 1, duplicates: 0 }, '新增要如实报出来');
+    const onDisk = await readFile(pool.filePath, 'utf8');
+
+    const second = await runPanelCommand('keys', { action: 'add', key: SECRET, label: 'again' }, deps);
+
+    // 两个槽位不是「多存了一份数据」这么轻：两行掩码一模一样，而冷却与额度耗尽按各自的
+    // record id 独立记账——一次 429 只冷却其中一行，故障切换被自我抵消，同一个上游配额
+    // 也被用得更快。
+    assert.equal(second.status, 200, '重复不是入参非法：这一把密钥本身完全合法');
+    assert.deepEqual(second.body.summary, { received: 1, added: 0, duplicates: 1 }, '必须明确说出没有新增');
+    assert.equal(second.body.keys.length, 1);
+    assert.equal(pool.keysInOrder().length, 1);
+    assert.equal(second.body.keys[0].label, 'primary', '改备注是 rename 的事，重复提交不改动已有那一行');
+    assert.equal(await readFile(pool.filePath, 'utf8'), onDisk, '重复提交连一次落盘都不该发生');
+    assert.equal(JSON.stringify(second).includes(SECRET), false, '出口仍然只有脱敏形式（POOL-3）');
+  });
+
+  test('两端空白不同的同一把明文同样算重复', async () => {
+    // 单把添加会先 trim（粘贴常常带上换行与空格），因此判据必须建在 trim 之后的值上。
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+
+    const { body } = await runPanelCommand('keys', { action: 'add', key: `  ${SECRET}\n` }, deps);
+
+    assert.deepEqual(body.summary, { received: 1, added: 0, duplicates: 1 });
+    assert.equal(pool.keysInOrder().length, 1);
+  });
+
+  test('单把与批量共用同一份判据：先单把加过的，批量里也算重复', async () => {
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+
+    const { body } = await runPanelCommand('keys', { action: 'addBatch', text: `${SECRET}\n${OTHER_SECRET}` }, deps);
+
+    assert.deepEqual(body.summary, { received: 2, added: 1, duplicates: 1 });
+    assert.equal(pool.keysInOrder().length, 2);
+  });
+
+  test('反方向同样成立：批量加过的，单把再提交一次也不算新增', async () => {
+    // 两个方向各测一次，是因为「共用同一份判据」这句话只有在两条路径上都能被观察到时
+    // 才算被守住；只测一个方向时，单把那条路径完全可以另写一份 includes 而用例照绿。
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'addBatch', text: SECRET }, deps);
+
+    const { body } = await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+
+    assert.deepEqual(body.summary, { received: 1, added: 0, duplicates: 1 });
+    assert.equal(pool.keysInOrder().length, 1);
+  });
+});
+
+describe('panel-http-4：写入上限', () => {
+  test('单把超长被拒绝，并说清上限、实收长度与下一步', async () => {
+    // 审计里那一把 200 KB 的「密钥」是误粘一整行文件的形状：它会变成一条永远鉴权不通过的
+    // 记录，此后每一次 GET /state 都要把它序列化一遍。
+    const { deps, pool } = await panelDeps();
+    const huge = `tvly-dev-${'a'.repeat(200_000)}`;
+
+    await assert.rejects(
+      () => runPanelCommand('keys', { action: 'add', key: huge }, deps),
+      (error) => error instanceof PanelError
+        && error.status === 400
+        && error.code === PANEL_ERROR_CODES.BAD_REQUEST
+        && error.message.includes(String(PANEL_KEY_MAX_LENGTH))
+        && error.message.includes(String(huge.length))
+        && /nothing was written/u.test(error.message),
+      '拒绝消息里要有上限、实收长度与下一步，否则用户不知道该删掉什么',
+    );
+    assert.deepEqual(pool.keysInOrder(), [], '拒绝就是拒绝：不截断，也不留下记录');
+    await assert.rejects(
+      () => readFile(pool.filePath, 'utf8'),
+      (error) => error.code === 'ENOENT',
+      '被拒绝的添加不该开出一个池文件',
+    );
+  });
+
+  test('批量里的超长行指名第几行，并拒绝整次粘贴', async () => {
+    const { deps, pool } = await panelDeps();
+    const text = `${SECRET}\n${'b'.repeat(PANEL_KEY_MAX_LENGTH + 1)}\n${OTHER_SECRET}`;
+
+    await assert.rejects(
+      () => runPanelCommand('keys', { action: 'addBatch', text }, deps),
+      (error) => error.status === 400
+        && /line 2/u.test(error.message)
+        && error.message.includes(String(PANEL_KEY_MAX_LENGTH + 1)),
+    );
+    assert.deepEqual(pool.keysInOrder(), [], '一次粘贴是一个整体：不能把合法的两把偷偷写进去');
+  });
+
+  test('一次粘贴超过条数上限时整次拒绝，并说清上限与实收', async () => {
+    const { deps, pool } = await panelDeps();
+    const text = Array.from(
+      { length: PANEL_KEYS_MAX_PER_REQUEST + 1 },
+      (unused, index) => `tvly-dev-limit-${index}`,
+    ).join('\n');
+
+    await assert.rejects(
+      () => runPanelCommand('keys', { action: 'addBatch', text }, deps),
+      (error) => error.status === 400
+        && error.code === PANEL_ERROR_CODES.BAD_REQUEST
+        && error.message.includes(String(PANEL_KEYS_MAX_PER_REQUEST + 1))
+        && error.message.includes(String(PANEL_KEYS_MAX_PER_REQUEST)),
+    );
+    assert.deepEqual(pool.keysInOrder(), [], '5000 行那类误粘必须在写盘之前被挡住');
+  });
+
+  test('池内总数上限同时生效：刚好装满允许，再添加被拒，删掉一把之后又可以加', async () => {
+    const { deps, pool } = await panelDeps();
+    const text = Array.from({ length: PANEL_KEYS_MAX }, (unused, index) => `tvly-dev-full-${index}`).join('\n');
+    const { body } = await runPanelCommand('keys', { action: 'addBatch', text }, deps);
+    assert.deepEqual(
+      body.summary,
+      { received: PANEL_KEYS_MAX, added: PANEL_KEYS_MAX, duplicates: 0 },
+      '上限本身是允许的：正好装满不算超',
+    );
+
+    await assert.rejects(
+      () => runPanelCommand('keys', { action: 'add', key: SECRET }, deps),
+      (error) => error.status === 400
+        && error.message.includes(String(PANEL_KEYS_MAX))
+        && /remove some keys/u.test(error.message),
+      '满了之后的添加要给出可操作的下一步，而不是一句「失败」',
+    );
+
+    await runPanelCommand('keys', { action: 'removeBatch', ids: [body.keys[0].id] }, deps);
+    const after = await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+
+    assert.deepEqual(after.body.summary, { received: 1, added: 1, duplicates: 0 }, '上限是为了回到可用规模，不是锁死池子');
+  });
+});
+
+describe('panel-http-4：批量删除出口', () => {
+  const THIRD_SECRET = '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';
+
+  test('一次请求删多把，内存与磁盘都如实', async () => {
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'addBatch', text: `${SECRET}\n${OTHER_SECRET}\n${THIRD_SECRET}` }, deps);
+    const ids = pool.keysInOrder().map((record) => record.id);
+
+    const { status, body } = await runPanelCommand('keys', { action: 'removeBatch', ids: [ids[0], ids[2]] }, deps);
+
+    assert.equal(status, 200);
+    assert.deepEqual(body.summary, { received: 2, removed: 2 });
+    assert.deepEqual(body.keys.map((entry) => entry.id), [ids[1]], '没被点到的那些原样留在池里');
+    const onDisk = JSON.parse(await readFile(pool.filePath, 'utf8'));
+    assert.deepEqual(onDisk.keys.map((entry) => entry.id), [ids[1]]);
+    assert.deepEqual(onDisk.order, [ids[1]], '顺序表也要跟着收缩');
+  });
+
+  test('未知 id 是 404，而且一把都不删：先全部确认存在再动手', async () => {
+    // `PoolStore.removeKey` 是逐把落盘的，边删边发现某个 id 不存在会留下一个删了一半的
+    // 池子——而用户点的是一个按钮，期望的是一个结果。
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'addBatch', text: `${SECRET}\n${OTHER_SECRET}` }, deps);
+    const ids = pool.keysInOrder().map((record) => record.id);
+
+    await assert.rejects(
+      () => runPanelCommand('keys', { action: 'removeBatch', ids: [ids[0], 'no-such-id'] }, deps),
+      (error) => error.status === 404 && error.code === PANEL_ERROR_CODES.NO_SUCH_KEY,
+    );
+    assert.deepEqual(pool.keysInOrder().map((entry) => entry.id), ids);
+  });
+
+  test('重复给到的 id 折叠：同一次请求里出现两次不该变成一次 404', async () => {
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+    const [record] = pool.keysInOrder();
+
+    const { body } = await runPanelCommand('keys', { action: 'removeBatch', ids: [record.id, record.id] }, deps);
+
+    assert.deepEqual(body.summary, { received: 1, removed: 1 });
+    assert.deepEqual(body.keys, []);
+  });
+
+  test('空列表是合法的一次「什么都不删」，不是入参非法', async () => {
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+
+    const { status, body } = await runPanelCommand('keys', { action: 'removeBatch', ids: [] }, deps);
+
+    assert.equal(status, 200);
+    assert.deepEqual(body.summary, { received: 0, removed: 0 });
+    assert.equal(pool.keysInOrder().length, 1);
+  });
+
+  test('ids 形状不对是 400，且不会碰写入路径', async () => {
+    const { deps, pool } = await panelDeps();
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+    const onDisk = await readFile(pool.filePath, 'utf8');
+
+    for (const ids of [undefined, 'no', [7], [null]]) {
+      await assert.rejects(
+        () => runPanelCommand('keys', { action: 'removeBatch', ids }, deps),
+        (error) => error.status === 400 && error.code === PANEL_ERROR_CODES.BAD_REQUEST,
+        `${JSON.stringify(ids)} 必须被拒绝`,
+      );
+    }
+    assert.equal(await readFile(pool.filePath, 'utf8'), onDisk);
+  });
+});
+
+describe('panel-http-6：写失败的错误文案按白名单构造', () => {
+  /**
+   * 一个**真的会写失败**的密钥池：`keys.json` 的位置是一个目录，于是「临时文件 + rename
+   * 覆盖目标」的最后一步必然以 EISDIR 失败，失败原文里同时带着运行账户的绝对状态目录、
+   * 进程 pid 与内部临时文件名。
+   *
+   * 用真实文件系统而不是注入的 fs 替身，是因为要守住的东西正是**真实错误对象上的字段**
+   * （`code` / `syscall` / 那句带路径的 message）——替身会把它们换成我以为的形状。
+   */
+  async function unwritablePool() {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tavily-panel-eisdir-'));
+    await mkdir(join(dir, 'keys.json'));
+    return { dir, pool: await new PoolStore({ dir, fileName: 'keys.json' }).load() };
+  }
+
+  test('只给 errno、文件名与下一步，不给路径、pid 与临时文件名', async () => {
+    const { dir, pool } = await unwritablePool();
+    const { deps } = await panelDeps({ pool });
+
+    let error;
+    try {
+      await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+    } catch (thrown) {
+      error = thrown;
+    }
+
+    assert.ok(error instanceof PanelError, '落盘失败必须以 PanelError 上报');
+    assert.equal(error.status, 500);
+    assert.equal(error.code, PANEL_ERROR_CODES.KEY_EDIT_FAILED);
+    // 保住的排障线索：errno、哪一步、哪个文件、下一步做什么。
+    assert.match(error.message, /EISDIR/u, 'errno 是唯一能拿去搜索的线索');
+    assert.match(error.message, /rename/u, 'rename 失败与 open 失败要分得开');
+    assert.match(error.message, /keys\.json/u, '要指名是哪个文件写不进去');
+    assert.match(error.message, /writable|free space/u, '还要给出下一步');
+    // 剥掉的东西：它们是 fs 原文里的环境信息，会被卡片渲染到界面上。
+    assert.equal(error.message.includes(dir), false, '绝对状态目录不得出现');
+    assert.equal(error.message.includes(homedir()), false);
+    assert.equal(error.message.includes(String(process.pid)), false);
+    assert.equal(error.message.includes('.tmp'), false, '内部临时文件名不得出现');
+    assert.equal(error.message.includes(SECRET), false);
+    // 原文并没有丢：它作为 cause 留在进程内，供日志与调试读取。
+    assert.equal(error.cause.code, 'EISDIR');
+    assert.equal(error.cause.message.includes(dir), true, '原始错误仍在 cause 上');
+  });
+
+  test('没有 errno 的失败同样不透出原文——白名单不是「只认 fs 错误」', async () => {
+    // 这里是本组唯一用替身的地方：真实文件系统造不出「错误消息里有路径、却没有 `code`」这种
+    // 形状，而那正是白名单要挡住的一般情形（将来某个中间层抛出的 TypeError 就长这样）。
+    // 替身只参与错误出口，不参与任何明文或落盘路径——本文件开头那条「全程用真实 PoolStore」
+    // 的纪律针对的正是后两者。
+    const leaked = '/Users/someone/.dsh/dsh-tavily-pool/keys.json.4242.deadbeef.tmp';
+    const leaky = {
+      filePath: '/Users/someone/.dsh/dsh-tavily-pool/keys.json',
+      keysInOrder: () => [],
+      maskedList: () => [],
+      addKey: async () => {
+        throw new TypeError(`cannot write ${leaked}`);
+      },
+    };
+    const { deps } = await panelDeps({ pool: leaky });
+
+    let error;
+    try {
+      await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+    } catch (thrown) {
+      error = thrown;
+    }
+
+    assert.ok(error instanceof PanelError);
+    assert.equal(error.code, PANEL_ERROR_CODES.KEY_EDIT_FAILED);
+    assert.equal(error.message.includes(leaked), false, '没有 errno 时更不能把原文端出去');
+    assert.equal(error.message.includes('/Users/someone'), false);
+    assert.equal(error.message.includes('.tmp'), false);
+    assert.match(error.message, /keys\.json/u, '文件名仍然要说出来');
+    assert.match(error.message, /TypeError/u, '错误的种类仍然要说出来');
+  });
+});
+
+describe('failure-paths-3：面板的单把刷新是永久失效的复位入口', () => {
+  test('「测试连通性」读通一次 /usage 之后，该密钥重新进入候选', async () => {
+    // 永久失效在调度器里是硬排除（`SCHED-4`），因此它不可能靠一次搜索成功来撤销——被
+    // 排除的密钥没有机会成功。唯一可达的复位信号是官方读通了这把密钥：面板上单把的
+    // 「刷新余额」与「测试连通性」两条命令都走 `UsageRefresher.refresh`，这里走后者。
+    const pool = await temporaryPool();
+    const record = await pool.addKey({ key: SECRET, label: 'primary' });
+    const health = new KeyHealth({ pool });
+    await health.recordFailure(record.id, { failure: { status: 401, detail: 'invalid api key' } });
+    assert.equal(health.snapshotOf(record.id).permanentlyInvalid, true, '先把它移出池子');
+
+    const refresher = new UsageRefresher({
+      pool,
+      health,
+      quota: new UsageQuota(),
+      fetchImpl: async () => new Response(
+        JSON.stringify({ key: { usage: 1, limit: 100 }, account: { plan_limit: 1000 } }),
+        { status: 200 },
+      ),
+    });
+    const { deps } = await panelDeps({
+      pool,
+      refresh: (id, key, options) => refresher.refresh(id, key, options),
+    });
+
+    const response = await runPanelCommand('test', { id: record.id }, deps);
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(
+      health.snapshotOf(record.id).permanentlyInvalid,
+      false,
+      '用户点得到的那条复位入口必须真的复位',
+    );
   });
 });
