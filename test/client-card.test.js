@@ -1426,7 +1426,9 @@ describe('PANEL-6：余额未知时显示未知', () => {
     assert.equal(freshBar.props.className, 'dtp-bar', '新鲜的读数不该带陈旧样式');
   });
 
-  test('统计行显示调用、成功、失败与消耗（USAGE-7）', async () => {
+  test('统计行显示调用、成功与失败，且不再显示任何积分（USAGE-7）', async () => {
+    // 插件不再统计自身消耗积分（2026-09-20 决定）：积分规则由上游随时可能更改，任何自算的
+    // 数字都可能在某次规则调整后变成误导。展示只用 `/usage` 的官方余额。
     const { component, t } = await mountedCard({
       hooks: {
         ui: readyUi({ keys: [keyRecord({ stats: { calls: 2, successes: 1, failures: 1, credits: 3 } })] }),
@@ -1434,13 +1436,22 @@ describe('PANEL-6：余额未知时显示未知', () => {
       },
     });
 
+    const texts = textsOf(component({ t }));
     assert.equal(
-      textsOf(component({ t })).some((text) => text.includes('调用 2 · 成功 1 · 失败 1 · 消耗 3 积分')),
+      texts.some((text) => text.includes('调用 2 · 成功 1 · 失败 1')),
       true,
+      '统计行只报调用次数',
+    );
+    assert.equal(
+      texts.some((text) => text.includes('消耗')),
+      false,
+      '即使状态里还带着 credits，也不该再渲染出任何「消耗」字样',
     );
   });
 
-  test('消耗未知的次数被如实标出，而不是并进那个数字里（REST-3）', async () => {
+  test('状态里残留的 creditsUnknown 也不再渲染——「消耗未知」这一态已不存在', async () => {
+    // 旧口径下「不知道消耗了多少」会单独标出来（`REST-3`）。现在没有记账、只有估算，而估算
+    // 总是已知的，因此那条文案连同它的 i18n 键一并删掉了。
     const { component, t } = await mountedCard({
       hooks: {
         ui: readyUi({
@@ -1450,7 +1461,9 @@ describe('PANEL-6：余额未知时显示未知', () => {
       },
     });
 
-    assert.equal(textsOf(component({ t })).some((text) => text.includes('其中 1 次消耗未知')), true);
+    const texts = textsOf(component({ t }));
+    assert.equal(texts.some((text) => text.includes('其中 1 次消耗未知')), false);
+    assert.equal(texts.some((text) => text.includes('调用 3 · 成功 3 · 失败 0')), true, '其余统计照常显示');
   });
 });
 
@@ -1724,14 +1737,14 @@ describe('14：调用历史与图表', () => {
     }
   });
 
-  test('明细表列出时间、端点、密钥、结果、积分与耗时', async () => {
+  test('明细表列出时间、端点、密钥、结果与耗时，且没有积分列', async () => {
     const { component, t } = await mountedCard({
       hooks: {
         ui: readyUi({
           history: {
             entries: [
               callRecord(),
-              callRecord({ endpoint: 'extract', keyMasked: 'tvly-dev-…0000', outcome: 'failed', code: 'TAVILY_HTTP_401', credits: undefined, durationMs: 41 }),
+              callRecord({ endpoint: 'extract', keyMasked: 'tvly-dev-…0000', outcome: 'failed', code: 'TAVILY_HTTP_401', durationMs: 41 }),
             ],
             daily: daily(),
             error: null,
@@ -1746,8 +1759,10 @@ describe('14：调用历史与图表', () => {
     assert.equal(texts.includes('时间'), true);
     assert.equal(texts.some((text) => text.includes('tvly-dev-…iJWq')), true);
     assert.equal(texts.includes('TAVILY_HTTP_401'), true, '失败行要给出机器码');
-    assert.equal(texts.includes('未知'), true, '消耗未知时显示「未知」，而不是 0（REST-3）');
     assert.equal(texts.some((text) => text.includes('812 ms')), true);
+    // 积分列连同「未知」那一格一并删掉：插件不再统计自身消耗。
+    assert.equal(texts.includes('积分'), false, '表头里不该再有积分列');
+    assert.equal(texts.includes('未知'), false, '「消耗未知」这一格已不存在');
   });
 
   test('没有任何记录时说「还没有调用」而不是画一条零线', async () => {
@@ -2122,18 +2137,11 @@ const BILLING_COPY = Object.freeze([
     pattern: /每第(\S+)次成功抓取/gu,
     roles: ['tierUrls'],
   },
-  {
-    file: 'README.md',
-    label: '英文计费行',
-    pattern: /(\S+) credit per (\S+) successful extractions/gu,
-    roles: ['basicCredits', 'tierUrls'],
-  },
-  {
-    file: 'README.zh-CN.md',
-    label: '中文计费行',
-    pattern: /每 (\S+) 个成功抽取的 URL 计一档/gu,
-    roles: ['tierUrls'],
-  },
+  // ⚠️ 两份 README **不再有**计费数字的副本（2026-09-20 决定）：它们先前各有一条
+  // 「每 5 个成功 URL 计 1 / 2 积分」的功能说明，而那正是「插件自己算积分」时代的产物。
+  // 现在插件不做任何记账，README 的功能列表改为指向官方 `/usage` 读数，计费规则只在
+  // `docs/usage*.md` 里作为**背景知识**保留（并继续被下面的条目守着）。因此这里不再
+  // 为 README 设守卫——守一个不存在的副本只会得到一条「正则与文案脱节」的假警报。
 ]);
 
 describe('22-E3：客户端副本与权威常量对账', () => {

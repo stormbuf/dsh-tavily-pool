@@ -488,6 +488,24 @@ async function withStubbedFetch(handler, run) {
 }
 
 /** 一个已加载插件、池中已有若干密钥的替身宿主。 */
+/**
+ * 抓取开关**默认关闭**（`CFG-2`，2026-09-20 决定），因此凡是断言「请求真的走了 Tavily
+ * `/extract`」的用例，都必须先把设置显式打开——否则请求会按设计回落给官方本地抓取器。
+ *
+ * @param extra - 与 `fetchEnabled` 一并写进设置的其它字段。
+ * @returns 可以直接交给 `hostWithKeys` 的 `settings` 值。
+ */
+function fetchOn(extra = {}) {
+  return { [SETTINGS_NAMESPACE]: { fetchEnabled: true, ...extra } };
+}
+
+/**
+ * 造一个带密钥池的假宿主。
+ *
+ * @param keys - 要预置的密钥。
+ * @param options - 宿主选项。
+ * @returns 假宿主，另带密钥池文件路径。
+ */
 async function hostWithKeys(keys, options = {}) {
   const home = await temporaryHarnessHome('{"version":1,"keys":[],"order":[],"stats":{},"usageCache":{}}');
   const host = fakeHost({ harnessHome: home, settings: options.settings, tools: options.tools });
@@ -890,42 +908,88 @@ describe('SCHED-10：跨月起始后自动探测并恢复', () => {
   });
 });
 
-describe('USAGE-5：搜索成功后按官方积分前推余额', () => {
-  test('成功搜索把 usage.credits 记进统计', async () => {
-    const host = await hostWithKeys([{ label: 'only' }]);
-
-    await withStubbedFetch(
-      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }], usage: { credits: 2 } } }),
-      () => host.registered[0].search({ query: 'q' }),
-    );
-
+describe('USAGE-5：搜索成功后按**估算**前推余额', () => {
+  /** 读出密钥池文件里那把密钥的官方余额读数与本地前推后的 `usage`。 */
+  async function usageOnDisk(host) {
     const onDisk = JSON.parse(
       await readFile(join(host.ctx.services.dshHomePath(STATE_DIR_NAME), KEYS_FILE_NAME), 'utf8'),
     );
-    const [stats] = Object.values(onDisk.stats);
-    assert.equal(stats.credits, 2, 'REST-3：用响应回传的 usage.credits 记账');
+    return { onDisk, stats: Object.values(onDisk.stats)[0], usage: Object.values(onDisk.usageCache)[0] };
+  }
+
+  test('一次 basic 搜索成功把余额前推 1——用的是本地估算，不是上游回传值', async () => {
+    const host = await hostWithKeys([{ label: 'only' }]);
+
+    // 先播一份官方余额，否则前推没有可减的对象。
+    const { PoolStore } = await import('../lib/pool.js');
+    const store = new PoolStore({ dir: join(host.ctx.services.dshHomePath(STATE_DIR_NAME), ''), fileName: KEYS_FILE_NAME });
+    await store.load();
+    await store.setUsage(store.maskedList()[0].id, {
+      key: { usage: 10, limit: 100 },
+      account: { plan_usage: 10, plan_limit: 1000 },
+    });
+
+    // 上游回传 credits: 7，但默认档是 basic，估算值应当是 1——若这里读到 17 就说明
+    // 插件又在读上游回传值了（spec 的 Gherkin 场景「响应里的 credits 被忽略」）。
+    await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }], usage: { credits: 7 } } }),
+      () => host.registered[0].search({ query: 'q' }),
+    );
+
+    const { stats, usage } = await usageOnDisk(host);
     assert.equal(stats.successes, 1);
+    assert.equal('credits' in stats, false, '统计里不再有积分流水这一项');
+    assert.equal(usage.key.usage, 11, '下降幅度是估算值 1，而不是响应里的 7');
   });
 
-  test('缺失 credits 记「未知」而不是 0', async () => {
-    const host = await hostWithKeys([{ label: 'only' }]);
+  test('advanced 搜索前推 2：深度取自设置，且改动即时生效', async () => {
+    const host = await hostWithKeys([{ label: 'only' }], {
+      settings: { [SETTINGS_NAMESPACE]: { searchDepth: 'advanced' } },
+    });
+
+    const { PoolStore } = await import('../lib/pool.js');
+    const store = new PoolStore({ dir: join(host.ctx.services.dshHomePath(STATE_DIR_NAME), ''), fileName: KEYS_FILE_NAME });
+    await store.load();
+    await store.setUsage(store.maskedList()[0].id, {
+      key: { usage: 10, limit: 100 },
+      account: { plan_usage: 10, plan_limit: 1000 },
+    });
 
     await withStubbedFetch(
       () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
       () => host.registered[0].search({ query: 'q' }),
     );
 
-    const onDisk = JSON.parse(
-      await readFile(join(host.ctx.services.dshHomePath(STATE_DIR_NAME), KEYS_FILE_NAME), 'utf8'),
+    const { usage } = await usageOnDisk(host);
+    assert.equal(usage.key.usage, 12, 'advanced 搜索估 2 积分');
+  });
+
+  test('估算值总是已知的：上游没回传 usage 也照样前推', async () => {
+    // 旧口径下「上游没回传 credits」会被记成未知并放弃前推（`REST-3`）。现在没有记账、
+    // 只有估算，而估算总有值。
+    const host = await hostWithKeys([{ label: 'only' }]);
+
+    const { PoolStore } = await import('../lib/pool.js');
+    const store = new PoolStore({ dir: join(host.ctx.services.dshHomePath(STATE_DIR_NAME), ''), fileName: KEYS_FILE_NAME });
+    await store.load();
+    await store.setUsage(store.maskedList()[0].id, {
+      key: { usage: 10, limit: 100 },
+      account: { plan_usage: 10, plan_limit: 1000 },
+    });
+
+    await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      () => host.registered[0].search({ query: 'q' }),
     );
-    const [stats] = Object.values(onDisk.stats);
-    assert.equal(stats.credits, undefined, 'credits 不得被记成 0：那会让余额前推长期偏低');
-    assert.equal(stats.creditsUnknown, 1, '而这次「不知道消耗了多少」必须留下痕迹');
+
+    const { stats, usage } = await usageOnDisk(host);
+    assert.equal(usage.key.usage, 11, '估算不依赖上游回传，照常前推 1');
+    assert.equal('creditsUnknown' in stats, false, '「消耗未知」这一态已不存在');
   });
 });
 
 describe('10：抓取接管经入口真实生效', () => {
-  /** 在桩件 `fetch` 之下跑一次抓取。 */
+  /** 在桩件 `fetch` 之下跑一次抓取。抓取开关默认关闭，因此调用方要先把设置打开（`CFG-2`）。 */
   async function fetchVia(host, url) {
     const provider = host.registeredFetch[0];
     assert.notEqual(provider, undefined, '抓取提供方必须在 apply() 之后存在');
@@ -943,7 +1007,7 @@ describe('10：抓取接管经入口真实生效', () => {
   });
 
   test('FETCH-1：开关为开且池中有密钥时走 /extract，并返回纯文本', async () => {
-    const host = await hostWithKeys([{ label: 'only' }]);
+    const host = await hostWithKeys([{ label: 'only' }], { settings: fetchOn() });
     const { result } = await fetchVia(host, 'https://example.com');
 
     assert.equal(result.calls.length, 1);
@@ -958,7 +1022,7 @@ describe('10：抓取接管经入口真实生效', () => {
 
   test('抓取参数从设置里来（WebFetchRequest 只有 url）', async () => {
     const host = await hostWithKeys([{ label: 'only' }], {
-      settings: { [SETTINGS_NAMESPACE]: { fetchDepth: 'advanced', fetchFormat: 'text' } },
+      settings: fetchOn({ fetchDepth: 'advanced', fetchFormat: 'text' }),
     });
     const { result } = await fetchVia(host, 'https://example.com');
 
@@ -966,27 +1030,37 @@ describe('10：抓取接管经入口真实生效', () => {
     assert.equal(result.calls[0].body.format, 'text');
   });
 
-  test('USAGE-6：抓取按成功 URL 数**累计**记账，而不是按请求计费', async () => {
+  test('USAGE-6：抓取按成功 URL 数**累计估算**前推余额，而不是按请求计费', async () => {
     // 官方口径是「每 5 个成功 URL 计 1 积分」，而 5 是跨请求累计的。因此单 URL 的前四次抓取
-    // 各记 0，直到第五次才记 1。按请求计费（每次记 1）会让本地余额比官方账单快五倍地掉，
+    // 各估 0，直到第五次才估 1。按请求计费（每次估 1）会让本地余额比官方账单快五倍地掉，
     // 而余额正是 `balance` 策略的排序输入——这条用例因此是那个口径在**入口**上的守卫。
-    const host = await hostWithKeys([{ label: 'only' }]);
+    //
+    // 插件不再统计自身消耗积分（2026-09-20 决定），因此这里断言的是**余额前推**：估算值
+    // 唯一的去处是 `usageCache`，`stats` 里只留下累计的成功 URL 数。
+    const host = await hostWithKeys([{ label: 'only' }], { settings: fetchOn() });
+
+    // 先给这把密钥一份官方余额读数，否则前推没有可减的对象（`advanceUsage` 不凭空造估计）。
+    const { PoolStore } = await import('../lib/pool.js');
+    const store = new PoolStore({ dir: join(host.ctx.services.dshHomePath(STATE_DIR_NAME), ''), fileName: KEYS_FILE_NAME });
+    await store.load();
+    const [seeded] = store.maskedList();
+    await store.setUsage(seeded.id, { key: { usage: 0, limit: 100 }, account: { plan_usage: 0, plan_limit: 1000 } });
 
     for (let call = 1; call <= 4; call += 1) {
       await fetchVia(host, 'https://example.com');
       const midway = JSON.parse(await readFile(host.keyPoolPath, 'utf8'));
       const midwayStats = Object.values(midway.stats)[0];
       assert.equal(
-        midwayStats.credits,
-        0,
-        `第 ${String(call)} 次抓取还没跨过第 5 个成功 URL，记 0 而不是 1`,
+        midwayStats.extractUrls,
+        call,
+        `第 ${String(call)} 次抓取：累计成功 URL 数每次都要落盘，它才是跨档估算的输入`,
       );
+      assert.equal('credits' in midwayStats, false, '不再有积分流水这一项');
       assert.equal(
-        midwayStats.creditsUnknown,
-        undefined,
-        '抓取的「0」是已知的零（按档位算出来的），不该落进「未知」那一档（REST-3）',
+        Object.values(midway.usageCache)[0].key.usage,
+        0,
+        `第 ${String(call)} 次抓取还没跨过第 5 个成功 URL，估算值为 0，余额不该被前推`,
       );
-      assert.equal(midwayStats.extractUrls, call, '累计计数每次都要落盘');
     }
 
     await fetchVia(host, 'https://example.com');
@@ -994,9 +1068,12 @@ describe('10：抓取接管经入口真实生效', () => {
     const [stats] = Object.values(onDisk.stats);
 
     assert.equal(stats.successes, 5, '五次抓取各算一次成功');
-    assert.equal(stats.extractUrls, 5, '累计的成功 URL 数要落盘——它才是下一条计费判据的来源');
-    assert.equal(stats.credits, 1, '第 5 个成功 URL 跨过档位，记 1 积分');
-    assert.equal(stats.creditsUnknown, undefined, '这一次的消耗是已知的，不该落进「未知」那一档');
+    assert.equal(stats.extractUrls, 5, '累计的成功 URL 数要落盘——它才是下一条估算判据的来源');
+    assert.equal(
+      Object.values(onDisk.usageCache)[0].key.usage,
+      1,
+      '第 5 个成功 URL 跨过档位，估算出 1 积分并前推进余额缓存',
+    );
   });
 
   test('CFG-2：抓取开关独立于搜索开关——关掉抓取不影响搜索', async () => {
@@ -1038,7 +1115,7 @@ describe('10：抓取接管经入口真实生效', () => {
 
   test('反过来也成立：关掉搜索不影响抓取', async () => {
     const host = await hostWithKeys([{ label: 'only' }], {
-      settings: { [SETTINGS_NAMESPACE]: { searchEnabled: false } },
+      settings: fetchOn({ searchEnabled: false }),
     });
 
     const { result } = await fetchVia(host, 'https://example.com');
@@ -1046,7 +1123,7 @@ describe('10：抓取接管经入口真实生效', () => {
   });
 
   test('池内无可用密钥时回落到官方抓取器，而不是抛错', async () => {
-    const host = await hostWithKeys([]);
+    const host = await hostWithKeys([], { settings: fetchOn() });
     const original = officialFetchProvider();
     const seen = [];
     setOfficialFetchProvider({
@@ -1197,7 +1274,7 @@ describe('14：调用历史经入口真的落盘', () => {
     return history.read();
   }
 
-  test('一次成功的搜索记一条，带端点、密钥、消耗与耗时', async () => {
+  test('一次成功的搜索记一条，带端点、密钥与耗时', async () => {
     const host = await hostWithKeys([{ label: 'only' }]);
     await withStubbedFetch(
       () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }], usage: { credits: 1 }, request_id: 'req-h1' } }),
@@ -1214,14 +1291,16 @@ describe('14：调用历史经入口真的落盘', () => {
     assert.equal(entries.length, 1);
     assert.equal(entries[0].endpoint, 'search');
     assert.equal(entries[0].outcome, 'ok');
-    assert.equal(entries[0].credits, 1);
+    // 上游回传了 usage.credits，但插件刻意不读它：积分规则由上游随时可能更改，历史只记
+    // 「发生了一次调用」这个事实（2026-09-20 决定）。
+    assert.equal('credits' in entries[0], false, '历史记录里不再有积分字段');
     assert.equal(entries[0].requestId, 'req-h1', 'request_id 要持久化，供上游排障');
     assert.equal(entries[0].keyMasked, maskKey('tvly-dev-0-' + 'a'.repeat(20)), '脱敏形式当场存一份，密钥删掉后记录仍可读');
     assert.ok(entries[0].durationMs >= 0);
   });
 
-  test('抓取记成 extract，消耗按累计档位走，并带上是这一次成功几个 URL', async () => {
-    const host = await hostWithKeys([{ label: 'only' }]);
+  test('抓取记成 extract，并带上是这一次成功几个 URL（不再记积分）', async () => {
+    const host = await hostWithKeys([{ label: 'only' }], { settings: fetchOn() });
     await withStubbedFetch(
       () => ({ status: 200, body: { results: [{ url: 'https://example.com', raw_content: '# 正文' }], failed_results: [] } }),
       () => host.registeredFetch[0].fetch({ url: 'https://example.com' }),
@@ -1235,8 +1314,8 @@ describe('14：调用历史经入口真的落盘', () => {
 
     assert.equal(entries.length, 1);
     assert.equal(entries[0].endpoint, 'extract');
-    assert.equal(entries[0].credits, 0, '第 1 个成功 URL 还没跨过 5 个那一档');
-    assert.equal(entries[0].successfulUrls, 1, '这一次成功几个 URL 要留下，它才是计费的原始事实');
+    assert.equal(entries[0].successfulUrls, 1, '这一次成功几个 URL 要留下：它是关于这次调用的事实');
+    assert.equal('credits' in entries[0], false, '积分估算不写进历史');
   });
 
   test('每次尝试各记一条——换过密钥的那次搜索留下两条', async () => {
@@ -1357,7 +1436,7 @@ describe('host-contract-2：总预算读宿主真正绑定的值', () => {
     // 30 秒），因此「按工具名问」是这条修复的一半——两个常量共用一份读取代码时，把
     // `web_fetch` 写成 `web_search` 会让抓取按 60 秒排布，而宿主 30 秒就掐断。
     const tools = fakeTools({ web_search: { timeoutMs: 60_000 }, web_fetch: { timeoutMs: 3_000 } });
-    const host = await hostWithKeys([{ label: 'only' }], { tools });
+    const host = await hostWithKeys([{ label: 'only' }], { tools, settings: fetchOn() });
 
     const startedAt = Date.now();
     const outcome = await withStubbedFetch(

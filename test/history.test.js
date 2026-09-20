@@ -87,14 +87,23 @@ describe('14：裁剪策略（票里那条未决）', () => {
 });
 
 describe('14：记录形状', () => {
-  test('未知消耗不写成 0（REST-3）', () => {
+  test('记录里没有 credits 字段——插件不再统计自身消耗', () => {
+    // 积分规则由上游随时可能更改，任何自算的数字都可能在某次规则调整后变成误导，
+    // 因此历史只记「发生了一次调用」这个事实（2026-09-20 决定）。
     const record = normalizeRecord({ endpoint: 'search', keyId: 'k', durationMs: 5 });
-    assert.equal('credits' in record, false, '未知就没有这个键，而不是 credits: 0');
+    assert.equal('credits' in record, false, '搜索记录不带任何积分数字');
   });
 
-  test('已知的 0 保留为 0', () => {
+  test('调用方硬塞 credits 也不会落盘：白名单式重建把它丢掉', () => {
+    // 旧版本会写 `credits`，升级后若原样保留，一份旧文件会在每次追加时把那个字段带回来，
+    // 迁移永远不会发生。
     const record = normalizeRecord({ endpoint: 'extract', keyId: 'k', durationMs: 5, credits: 0 });
-    assert.equal(record.credits, 0);
+    assert.equal('credits' in record, false, '连已知的 0 也不再保留——那个概念已经不存在');
+  });
+
+  test('抓取记录保留 successfulUrls：它是关于这次调用的事实，不是估算的产物', () => {
+    const record = normalizeRecord({ endpoint: 'extract', keyId: 'k', durationMs: 5, successfulUrls: 3 });
+    assert.equal(record.successfulUrls, 3);
   });
 
   test('只带白名单字段，调用方多给的东西不落盘', () => {
@@ -131,6 +140,19 @@ describe('14：文档校验', () => {
     assert.deepEqual(decoded.entries.map((item) => item.endpoint), ['search', 'extract']);
   });
 
+  test('旧文件里的 credits 在下次写盘时被丢弃——校验层做白名单重建', () => {
+    // 旧版本写下的 `credits` 不该随读盘回到内存：`validateHistory` 逐字段重建记录，
+    // 白名单之外的键（含已废弃的 `credits`）在这里被丢掉，迁移因此自动完成。
+    const decoded = validateHistory({
+      version: HISTORY_SCHEMA_VERSION,
+      entries: [{ ...entry(0), credits: 7 }],
+    });
+
+    assert.equal(decoded.entries.length, 1, '多带一个旧字段不该让整条记录失效');
+    assert.equal('credits' in decoded.entries[0], false, '已废弃的字段被丢掉');
+    assert.equal(decoded.entries[0].endpoint, 'search', '其余字段照常保留');
+  });
+
   test('整体形状不对时抛错，由调用方退到空历史', () => {
     assert.throws(() => validateHistory([]), /must be a JSON object/u);
     assert.throws(() => validateHistory({ version: 99, entries: [] }), /version/u);
@@ -145,8 +167,8 @@ describe('14：文档校验', () => {
 describe('14：落盘与读回', () => {
   test('追加之后能读回来，且顺序是时间升序', async () => {
     const { history } = await temporaryHistory();
-    await history.append({ endpoint: 'search', keyId: 'a', keyMasked: 'x', durationMs: 10, credits: 1 });
-    await history.append({ endpoint: 'extract', keyId: 'b', keyMasked: 'y', durationMs: 20, credits: 2 });
+    await history.append({ endpoint: 'search', keyId: 'a', keyMasked: 'x', durationMs: 10 });
+    await history.append({ endpoint: 'extract', keyId: 'b', keyMasked: 'y', durationMs: 20, successfulUrls: 1 });
 
     const entries = await history.read();
     assert.equal(entries.length, 2);

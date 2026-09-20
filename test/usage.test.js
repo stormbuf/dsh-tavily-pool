@@ -461,31 +461,42 @@ describe('USAGE-4：不在本地推断计费周期', () => {
   });
 });
 
-describe('USAGE-5：搜索成功后前推余额', () => {
-  test('一次成功搜索把缓存余额减掉上游回传的消耗', async () => {
-    // spec 里那条 Gherkin 场景：「某把密钥的缓存余额为 100，一次 basic 搜索成功并返回
-    // usage.credits = 1，则缓存余额应变为 99」。
+describe('USAGE-5：搜索成功后按**估算**前推余额', () => {
+  test('一次 basic 成功搜索把缓存余额减掉 1（估算是本地算的，不是上游回传的）', async () => {
+    // 官方回传多少积分与本插件无关了（2026-09-20 决定）：插件不再统计自身消耗，前推用的是
+    // `estimateSearchCredits` 给出的固定估算——`basic` 记 1、`advanced` 记 2。
     const { pool, health, record } = await harness();
 
     await pool.setUsage(record.id, usageBody({ usage: 0, limit: 100 }));
     assert.equal(balanceRank(pool.usageOf(record.id)), 100, '先有 100');
 
-    await health.recordSuccess(record.id, { credits: 1 });
+    await health.recordSuccess(record.id, { searchDepth: 'basic' });
 
     assert.equal(balanceRank(pool.usageOf(record.id)), 99, '前推之后是 99');
     assert.equal(pool.usageOf(record.id).key.usage, 1, '前推的是 usage 那一项');
   });
 
-  test('前推改变的是**调度真正读的那份**余额', async () => {
-    // 这一条是这次审查抓到的真问题：只累加 stats.credits 而不前推 usageCache，等于
-    // 「记了账，却没有任何东西读它」——余额排序仍按上一次 /usage 的旧数字来。
+  test('advanced 搜索前推 2，fast / ultra-fast 与 basic 同样前推 1', async () => {
     const { pool, health, record } = await harness();
-    const health2 = health;
+
+    await pool.setUsage(record.id, usageBody({ usage: 0, limit: 100 }));
+    await health.recordSuccess(record.id, { searchDepth: 'advanced' });
+    assert.equal(pool.usageOf(record.id).key.usage, 2, 'advanced 每次估 2 积分');
+
+    await health.recordSuccess(record.id, { searchDepth: 'fast' });
+    await health.recordSuccess(record.id, { searchDepth: 'ultra-fast' });
+    assert.equal(pool.usageOf(record.id).key.usage, 4, '另两档各估 1 积分');
+  });
+
+  test('前推改变的是**调度真正读的那份**余额', async () => {
+    // 这一条是早先审查抓到的真问题：只累加本地流水而不前推 usageCache，等于
+    // 「记了个数，却没有任何东西读它」——余额排序仍按上一次 /usage 的旧数字来。
+    const { pool, health, record } = await harness();
 
     await pool.setUsage(record.id, usageBody({ usage: 90, limit: 100 }));
     assert.equal(balanceRank(pool.usageOf(record.id)), 10, '官方读数：还剩 10');
 
-    await health2.recordSuccess(record.id, { credits: 2 });
+    await health.recordSuccess(record.id, { searchDepth: 'advanced' });
 
     assert.equal(
       balanceRank(pool.usageOf(record.id)),
@@ -494,22 +505,37 @@ describe('USAGE-5：搜索成功后前推余额', () => {
     );
   });
 
-  test('缺失 credits 时既不记账也不前推', async () => {
+  test('估算值总是已知的：深度缺席也照样前推 1，不再有「消耗未知」这一态', async () => {
+    // 旧口径下「上游没回传 credits」会被记成未知并放弃前推（`REST-3`）。现在没有记账、
+    // 只有估算，而估算总有值——缺席的深度按默认档 `basic` 处理。
     const { pool, health, record } = await harness();
 
     await pool.setUsage(record.id, usageBody({ usage: 10, limit: 100 }));
-    await health.recordSuccess(record.id, { credits: undefined });
+    await health.recordSuccess(record.id, {});
 
-    assert.equal(pool.usageOf(record.id).key.usage, 10, 'REST-3：不知道扣了多少就不要猜一个数字');
-    assert.equal(health.statsOf(record.id).credits, undefined, 'credits 不得被记成 0');
-    assert.equal(health.statsOf(record.id).creditsUnknown, 1, '但这次「未知」要留下痕迹');
+    assert.equal(pool.usageOf(record.id).key.usage, 11, '估算是本地算的，不会因为上游没给就缺席');
+    assert.equal('creditsUnknown' in health.statsOf(record.id), false, '「消耗未知」这一态已不存在');
+  });
+
+  test('抓取按累计档位前推：跨过第 5 个成功 URL 时才推 1', async () => {
+    const { pool, health, record } = await harness();
+
+    await pool.setUsage(record.id, usageBody({ usage: 0, limit: 100 }));
+
+    for (let call = 1; call <= 4; call += 1) {
+      await health.recordSuccess(record.id, { successfulUrls: 1, extractDepth: 'basic' });
+    }
+    assert.equal(pool.usageOf(record.id).key.usage, 0, '前四次各 1 个 URL，都还没跨档');
+
+    await health.recordSuccess(record.id, { successfulUrls: 1, extractDepth: 'basic' });
+    assert.equal(pool.usageOf(record.id).key.usage, 1, '第五次跨过档位，估 1 积分');
   });
 
   test('真·无限的密钥不前推：没有有限的余额可供减少', async () => {
     const { pool, health, record } = await harness();
 
     await pool.setUsage(record.id, usageBody({ usage: 500, limit: null, planLimit: null }));
-    await health.recordSuccess(record.id, { credits: 2 });
+    await health.recordSuccess(record.id, { searchDepth: 'advanced' });
 
     assert.equal(pool.usageOf(record.id).key.usage, 500, '无限额度前推不改变任何排序决策，却会污染官方读数');
   });
@@ -518,7 +544,7 @@ describe('USAGE-5：搜索成功后前推余额', () => {
     const { pool, health, record } = await harness();
 
     await pool.setUsage(record.id, usageBody({ usage: 500, limit: null, planLimit: 1000 }));
-    await health.recordSuccess(record.id, { credits: 2 });
+    await health.recordSuccess(record.id, { searchDepth: 'advanced' });
 
     assert.equal(
       pool.usageOf(record.id).key.usage,
@@ -530,10 +556,9 @@ describe('USAGE-5：搜索成功后前推余额', () => {
   test('从未刷新过余额的密钥不前推：不凭空造一份本地估计', async () => {
     const { pool, health, record } = await harness();
 
-    await health.recordSuccess(record.id, { credits: 2 });
+    await health.recordSuccess(record.id, { searchDepth: 'advanced' });
 
     assert.equal(pool.usageOf(record.id), undefined, '上限只能来自官方，本地不知道它');
-    assert.equal(health.statsOf(record.id).credits, 2, '但流水照记');
   });
 
   test('前推不改变 fetchedAt 与 stale：它们谈的是「上一次官方读数」', async () => {
@@ -543,7 +568,7 @@ describe('USAGE-5：搜索成功后前推余额', () => {
     await pool.setUsage(record.id, usageBody({ usage: 0, limit: 100 }));
     const before = pool.usageOf(record.id);
 
-    await health.recordSuccess(record.id, { credits: 3 });
+    await health.recordSuccess(record.id, { searchDepth: 'advanced' });
 
     const after = pool.usageOf(record.id);
     assert.equal(after.fetchedAt, before.fetchedAt, '前推不是一次官方读数');
@@ -556,8 +581,8 @@ describe('USAGE-5：搜索成功后前推余额', () => {
     });
 
     await pool.setUsage(record.id, usageBody({ usage: 10, limit: 100 }));
-    await health.recordSuccess(record.id, { credits: 5 });
-    assert.equal(pool.usageOf(record.id).key.usage, 15, '本地估计');
+    await health.recordSuccess(record.id, { searchDepth: 'basic' });
+    assert.equal(pool.usageOf(record.id).key.usage, 11, '本地估计');
 
     await refresher.refresh(record.id, record.key);
 

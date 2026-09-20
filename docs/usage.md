@@ -12,11 +12,13 @@ From the npm registry:
 dsh plugin add dsh-tavily-pool
 ```
 
-Or straight from GitHub, which needs no registry account and lets you pin a tag or a commit:
+Or straight from GitHub, which needs no registry account. Pin a released tag when you want a
+reproducible version — see the [tags](https://github.com/stormbuf/dsh-tavily-pool/tags) for
+the ones that exist:
 
 ```sh
 dsh plugin add github:stormbuf/dsh-tavily-pool
-dsh plugin add github:stormbuf/dsh-tavily-pool#v0.1.0
+dsh plugin add github:stormbuf/dsh-tavily-pool#vX.Y.Z
 ```
 
 Both routes install the same files: the `files` whitelist in `package.json` applies to git installs too, so no `test/` or `scripts/` directory comes along.
@@ -72,14 +74,18 @@ Two edges worth knowing:
 
 There are two **independent** toggles:
 
-| Toggle | Behaviour when off |
-|---|---|
-| **Search takeover** | Search requests go to DSH's official search provider |
-| **Fetch takeover** | Fetch requests go to DSH's built-in local HTTP fetcher |
+| Toggle | Default | Behaviour when off |
+|---|---|---|
+| **Search takeover** | **on** | Search requests go to DSH's official search provider |
+| **Fetch takeover** | **off** | Fetch requests go to DSH's built-in local HTTP fetcher |
 
-They do not affect each other — you can use Tavily for search while keeping the built-in fetcher, for example.
+They do not affect each other — you can use Tavily for search while keeping the built-in fetcher, which is exactly the default state.
+
+**Fetch takeover is off by default**: installing this plugin is usually about search, while fetching is a separate upstream path that spends its own quota. Defaulting it to on would make a quota decision on your behalf that you never asked for. Turn it on in settings when you want Tavily to handle fetching too.
 
 Toggle changes take effect **immediately**, with no restart.
+
+> **Upgrade note**: a default only applies to a setting you have **never** configured. If you explicitly turned fetch takeover on before, it stays on after upgrading — the default never overrides your choice.
 
 ## Search parameters
 
@@ -108,6 +114,8 @@ Depth and count are independent dimensions: **depth decides how thoroughly the s
 There are no per-call fetch controls: DSH's fetch request type carries **only a URL**, so the model cannot ask for a different depth or format on an individual call. These two settings are the only way to change it.
 
 A fetched page comes back as **plain text, never as HTML**. Tavily already returns markdown, so the plugin tells DSH it is text and DSH passes it straight through; marking it as HTML would make DSH convert a markdown document a second time and mangle the content.
+
+Both settings only apply while **fetch takeover is on**.
 
 ## Scheduling
 
@@ -176,24 +184,42 @@ The plugin **does not infer the billing cycle** — balances always come from th
 
 ## Billing
 
+Tavily's billing rules (for reference — **the official docs are authoritative**):
+
 - **Search**: `basic` / `fast` / `ultra-fast` cost 1 credit, `advanced` costs 2
 - **Fetch**: every **5 successful** URL extractions cost 1 credit (`basic`) or 2 (`advanced`); failed URLs are **not charged**
 
 A single fetch therefore usually costs **0 credits**: the five-URL counter is **cumulative across calls**, and a DSH fetch call carries one URL, so only every fifth successful fetch crosses a tier.
 
-The plugin counts successful URLs per key and turns that running total into credits itself — it does not read back Tavily's per-response `usage.credits`, which is rounded against Tavily's own running total and is therefore frequently `0` on a response that did cost credit. Counting locally also keeps the balance estimate honest: charging 1 credit per call would drain it five times faster than Tavily does, and that estimate is what decides which key goes first.
+> ⚠️ **This plugin keeps no credit accounting of its own.** The two rules above are background only: the plugin does **not** total up "how many credits I spent", and it shows **no** locally computed credit figure anywhere.
+>
+> The reason is that these rules can change upstream at any time. If Tavily adjusts a tier or the way it charges, a locally computed number would not fail — it would quietly become wrong, and you would have no way to tell.
+>
+> The only credit figure the panel and settings page ever show comes from the official `/usage` reading (limit − used, both official numbers). No local estimate is involved in it.
+
+### Why an estimate still exists
+
+The scheduling policy is balance-first, and `/usage` cannot be refreshed on every call (it is rate-limited to 10 per 10 minutes). Without any forward advance, keys with plenty of quota would stay ranked first — ordering would keep using the stale numbers from the last `/usage` until you refreshed by hand.
+
+So after each successful call the plugin **estimates** a cost from the two rules above, purely to nudge the cached balance forward so ordering roughly reflects reality. That estimate:
+
+- is **never displayed** to you
+- only affects scheduling order, where the worst case is that two keys swap places
+- never affects the displayed balance, which always comes from the official reading
 
 ## Call history
 
-Every Tavily call is recorded — the key used, the endpoint, whether it succeeded, the credits, the duration, and the upstream `request_id` when there is one — in:
+Every Tavily call is recorded — the key used, the endpoint, whether it succeeded, the duration, and the upstream `request_id` when there is one — in:
 
 ```
 ~/.dsh/dsh-tavily-pool/history.json
 ```
 
-The panel shows a **chart of daily credit spend** over the last 14 days (search and fetch as separate lines, because their magnitudes differ too much to share a vertical scale) plus a table of the most recent calls.
+The panel shows a **chart of daily call counts** over the last 14 days (search and fetch as separate lines, because their magnitudes differ too much to share a vertical scale) plus a table of the most recent calls.
 
-**One request can produce several entries.** Key failover means each attempt is a separate real upstream call, so a search that tried two keys leaves one failed entry and one successful one. That is deliberate: those attempts each cost real credits, and a request-level summary would hide them.
+> The chart plots **calls**, not credits: call counts come entirely from local facts (one entry is one real call) and are unaffected by upstream billing rules. Credits appear only once, at the top of the panel, as the official `/usage` reading.
+
+**One request can produce several entries.** Key failover means each attempt is a separate real upstream call, so a search that tried two keys leaves one failed entry and one successful one. That is deliberate: those attempts were each real calls, and a request-level summary would hide them.
 
 ### Rotation
 
@@ -208,7 +234,7 @@ The file therefore never exceeds roughly 100 KB. Trimming happens on every write
 
 The age window is measured from the **newest entry**, not from the current time: a history file you copied from elsewhere, or one left behind after the system clock moved, is not wiped out the moment it is read.
 
-An entry whose credits are unknown is stored **without** a `credits` field rather than with `0`, so "this call cost nothing" and "we do not know what this call cost" stay distinguishable in the history too. Unknown-credit entries appear in the table but contribute nothing to the chart.
+There is **no credit field** in the history. Older versions (0.1.0 and earlier) wrote one; those fields disappear on the next write, because both reading and writing rebuild each entry from a whitelist and never carry unknown keys back.
 
 If the history file cannot be written, calls are unaffected — the plugin reports it in the log and the chart is simply missing those entries. If it cannot be read, the panel says so instead of showing an empty chart.
 

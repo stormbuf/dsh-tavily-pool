@@ -140,7 +140,6 @@ check('对照项：未注册的 pin 抛 WEB_PROVIDER_CONFIGURED_MISSING');
     keyMasked: 'tvly-dev-…seam',
     outcome: 'ok',
     durationMs: 42,
-    credits: 1,
     requestId: 'seam-check-request',
   });
   assert.equal(appended, true, `全新目录上的第一次追加必须成功：${String(history.lastWriteError)}`);

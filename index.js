@@ -381,6 +381,8 @@ async function search(state, request, signal) {
       signal,
       // 总预算交给编排层：有界等待（`SCHED-9`）与单次尝试的超时都从它里面分。
       deadlineMs,
+      // 搜索深度决定本次按 1 还是 2 积分估算——只用于余额前推，不写进历史。
+      searchDepth: settings.searchDepth,
       // `SCHED-5` 的例外：池内只剩额度耗尽的密钥时，先看看有没有哪把已经跨过月起始、
       // 值得问一次官方（`SCHED-10`）。
       probeQuota: () => probeQuotaForReset(state, signal),
@@ -564,7 +566,6 @@ function recordCall(state, endpoint, attempt) {
     keyMasked: record === undefined ? '' : maskKey(record.key),
     outcome: attempt.outcome,
     durationMs: attempt.durationMs,
-    credits: attempt.credits,
     successfulUrls: attempt.successfulUrls,
     status: attempt.status,
     code: attempt.code,

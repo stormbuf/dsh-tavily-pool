@@ -13,7 +13,14 @@ import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
 import { runWithFailover } from '../lib/attempts.js';
-import { TavilyError, extractCreditDelta, extractTavily, mapSearchResponse, searchTavily } from '../lib/tavily.js';
+import {
+  TavilyError,
+  estimateExtractCredits,
+  estimateSearchCredits,
+  extractTavily,
+  mapSearchResponse,
+  searchTavily,
+} from '../lib/tavily.js';
 import { EXTRACT_FAILURE_STATUS, TAVILY_EXTRACT_URL, TAVILY_SEARCH_URL } from '../lib/constants.js';
 import { KeyHealth, classifyFailure } from '../lib/health.js';
 import { PoolStore } from '../lib/pool.js';
@@ -51,7 +58,7 @@ describe('REST-1/REST-2：请求在线上实际发出的样子', () => {
     assert.equal(calls[0].init.headers.authorization, 'Bearer tvly-secret');
   });
 
-  test('总是索取 usage，使记账永远不靠猜', async () => {
+  test('总是索取 usage，让响应形状与官方文档一致（本插件不读它）', async () => {
     const { fetchImpl, calls } = stubFetch({ body: { results: [] } });
     await searchTavily({ apiKey: 'k', query: 'q', fetchImpl });
     assert.equal(JSON.parse(calls[0].init.body).include_usage, true);
@@ -174,14 +181,18 @@ describe('失败处理', () => {
     assert.doesNotMatch(error.message, /request_id/u);
   });
 
-  test('REST-3：成功时回传 credits，缺失则为 undefined 而不是 0', async () => {
+  test('搜索结果不含 credits——插件不再统计自身消耗', async () => {
+    // 上游回传了 `usage.credits`，但本插件刻意不读它：积分规则由上游随时可能更改，
+    // 任何自算或搬运的数字都可能在某次规则调整后变成误导。余额前推改用固定估算
+    // （见 `estimateSearchCredits`），展示则只用 `/usage` 的官方余额。
     const withUsage = stubFetch({ body: { results: [], usage: { credits: 2 } } });
     const counted = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl: withUsage.fetchImpl });
-    assert.equal(counted.credits, 2);
+    assert.equal('credits' in counted, false, '即使上游给了 usage.credits 也不该出现在返回值里');
 
     const withoutUsage = stubFetch({ body: { results: [] } });
     const unknown = await searchTavily({ apiKey: 'k', query: 'q', fetchImpl: withoutUsage.fetchImpl });
-    assert.equal(unknown.credits, undefined, '「不知道消耗了多少」不是「没消耗」');
+    assert.equal('credits' in unknown, false);
+    assert.equal(unknown.result.sources.length, 0, '少了 credits 不影响结果本身');
   });
 
   test('调用方中止可与超时区分开', async () => {
@@ -522,49 +533,49 @@ describe('FETCH-1：抓取返回纯文本', () => {
   });
 });
 
-describe('USAGE-6：抓取按成功 URL 数计费', () => {
-  test('累计跨过第 5 个成功 URL 时才记 1 积分（basic）', () => {
+describe('USAGE-6：抓取按成功 URL 数**估算**积分（只用于余额前推）', () => {
+  test('累计跨过第 5 个成功 URL 时才估到 1 积分（basic）', () => {
     // 官方口径是「Every 5 successful URL extractions cost 1 API credit」——5 是**跨请求累计**
-    // 的。因此前四次各记 0，第五次记 1，第六到九次又是 0，第十次再记 1。
-    const billed = [];
+    // 的。因此前四次各估 0，第五次估 1，第六到九次又是 0，第十次再估 1。
+    const estimated = [];
     for (let call = 1; call <= 10; call += 1) {
-      billed.push(extractCreditDelta({ successfulUrls: call - 1, added: 1, depth: 'basic' }));
+      estimated.push(estimateExtractCredits({ successfulUrls: call - 1, added: 1, depth: 'basic' }));
     }
 
-    assert.deepEqual(billed, [0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
-    assert.equal(billed.reduce((total, value) => total + value, 0), 2, '十次各一个 URL = 2 积分');
+    assert.deepEqual(estimated, [0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    assert.equal(estimated.reduce((total, value) => total + value, 0), 2, '十次各一个 URL = 2 积分');
   });
 
-  test('一次成功 5 个 URL 记 1 积分（basic）——Gherkin 那条场景', () => {
-    assert.equal(extractCreditDelta({ successfulUrls: 0, added: 5, depth: 'basic' }), 1);
-    assert.equal(extractCreditDelta({ successfulUrls: 5, added: 5, depth: 'basic' }), 1);
+  test('一次成功 5 个 URL 估 1 积分（basic）——Gherkin 那条场景', () => {
+    assert.equal(estimateExtractCredits({ successfulUrls: 0, added: 5, depth: 'basic' }), 1);
+    assert.equal(estimateExtractCredits({ successfulUrls: 5, added: 5, depth: 'basic' }), 1);
   });
 
-  test('advanced 档每 5 个成功 URL 记 2 积分', () => {
-    assert.equal(extractCreditDelta({ successfulUrls: 0, added: 5, depth: 'advanced' }), 2);
-    assert.equal(extractCreditDelta({ successfulUrls: 5, added: 5, depth: 'advanced' }), 2);
+  test('advanced 档每 5 个成功 URL 估 2 积分', () => {
+    assert.equal(estimateExtractCredits({ successfulUrls: 0, added: 5, depth: 'advanced' }), 2);
+    assert.equal(estimateExtractCredits({ successfulUrls: 5, added: 5, depth: 'advanced' }), 2);
   });
 
-  test('一次抓取 1 个 URL 记 0 积分——按请求取整会让余额以五倍速度下降', () => {
-    // 这条是本票最要紧的一条断言：余额是 `balance` 策略的排序输入，按请求取整（每抓一次记 1）
+  test('一次抓取 1 个 URL 估 0 积分——按请求取整会让余额以五倍速度下降', () => {
+    // 这条是最要紧的一条断言：余额是 `balance` 策略的排序输入，按请求取整（每抓一次估 1）
     // 会让本地读数比官方账单快五倍地掉。
-    assert.equal(extractCreditDelta({ successfulUrls: 0, added: 1, depth: 'basic' }), 0);
-    assert.equal(extractCreditDelta({ successfulUrls: 3, added: 1, depth: 'basic' }), 0);
+    assert.equal(estimateExtractCredits({ successfulUrls: 0, added: 1, depth: 'basic' }), 0);
+    assert.equal(estimateExtractCredits({ successfulUrls: 3, added: 1, depth: 'basic' }), 0);
   });
 
-  test('抓取失败不计费', async () => {
-    assert.equal(extractCreditDelta({ successfulUrls: 4, added: 0, depth: 'basic' }), 0);
+  test('抓取失败不估算', async () => {
+    assert.equal(estimateExtractCredits({ successfulUrls: 4, added: 0, depth: 'basic' }), 0);
 
     const { fetchImpl } = stubFetch({
       body: { results: [], failed_results: [{ url: 'https://bad.example', error: 'nope' }] },
     });
     const outcome = await extractTavily({ apiKey: 'k', url: 'https://bad.example', fetchImpl });
-    assert.equal(outcome.successfulUrls, 0, '内核只如实回报成功数与失败数，积分由累计计数那一层算');
+    assert.equal(outcome.successfulUrls, 0, '内核只如实回报成功数与失败数，估算由累计计数那一层算');
     assert.equal(outcome.failedUrls, 1);
   });
 
-  test('内核不自己算积分——它交回的是「这次成功了几个 URL」', async () => {
-    // 计费口径只有一个来源：`lib/health.js` 的 `recordSuccess`（它持有累计计数）。
+  test('内核不自己估算积分——它交回的是「这次成功了几个 URL」', async () => {
+    // 估算口径只有一个来源：`lib/health.js` 的 `recordSuccess`（它持有累计计数）。
     // 内核若也算一遍，同一份知识就有两处，而两处迟早会分叉。
     const { fetchImpl } = stubFetch({
       body: { results: [{ url: 'https://example.com', raw_content: 'x' }], failed_results: [] },
@@ -573,6 +584,22 @@ describe('USAGE-6：抓取按成功 URL 数计费', () => {
 
     assert.equal('credits' in outcome, false);
     assert.equal(outcome.successfulUrls, 1);
+  });
+});
+
+describe('USAGE-5：搜索按深度**估算**积分（只用于余额前推）', () => {
+  test('advanced 估 2 积分，其余三档各估 1 积分', () => {
+    // 官方 `search_depth` 描述：`advanced` 每次计 2 积分，`basic` / `fast` / `ultra-fast` 各计 1。
+    assert.equal(estimateSearchCredits('advanced'), 2);
+    assert.equal(estimateSearchCredits('basic'), 1);
+    assert.equal(estimateSearchCredits('fast'), 1);
+    assert.equal(estimateSearchCredits('ultra-fast'), 1);
+  });
+
+  test('深度缺席时按 1 积分估算，而不是 NaN 或 0', () => {
+    // 估算值总是**已知**的：这是它与旧记账口径的关键区别（旧口径下「上游没回传消耗」
+    // 会被记成未知）。缺席深度只说明调用方没传，默认档就是 `basic`。
+    assert.equal(estimateSearchCredits(undefined), 1);
   });
 });
 

@@ -672,7 +672,7 @@ describe('12：单密钥连通性测试', () => {
 });
 
 describe('14：调用历史的投影', () => {
-  /** 一条调用记录。 */
+  /** 一条调用记录。积分字段已不存在（2026-09-20 决定：插件不再统计自身消耗）。 */
   function record(at, overrides = {}) {
     return {
       at: new Date(at).toISOString(),
@@ -680,7 +680,6 @@ describe('14：调用历史的投影', () => {
       keyId: 'key-1',
       keyMasked: 'tvly-dev-…iJWq',
       outcome: 'ok',
-      credits: 1,
       durationMs: 100,
       ...overrides,
     };
@@ -696,7 +695,7 @@ describe('14：调用历史的投影', () => {
 
   test('面板回传的条数上限与文件层面的条数上限一致', () => {
     // 先前这里取 200，而文件上限是 500：14 天里调用超过 200 次时，曲线会**静默**少算前面那
-    // 300 条，而「图表正确反映积分趋势」正是这张票的验收之一。体积由文件那一层的裁剪兜住，
+    // 300 条，而「图表正确反映调用趋势」正是这张票的验收之一。体积由文件那一层的裁剪兜住，
     // 面板没有理由再截一刀——这一条断言钉的就是那两个上限相等。
     assert.equal(PANEL_HISTORY_ENTRIES, HISTORY_MAX_ENTRIES);
 
@@ -714,7 +713,7 @@ describe('14：调用历史的投影', () => {
   });
 
   test('按**本地**日期分桶，而不是 UTC', () => {
-    // UTC+8 的早晨会把前一晚的调用算到 UTC 的前一天去，而用户看的是「我昨天花了多少」。
+    // UTC+8 的早晨会把前一晚的调用算到 UTC 的前一天去，而用户看的是「我昨天调了几次」。
     // 取一个本地时刻，断言它落在本地那一天的桶里。
     const now = new Date(2026, 8, 19, 10, 0, 0);
     const state = readPanelState({
@@ -730,7 +729,10 @@ describe('14：调用历史的投影', () => {
     assert.equal(today.calls, 1);
   });
 
-  test('搜索与抓取分开累计，未知消耗不进曲线', () => {
+  test('搜索与抓取分开累计，累计的是**次数**而不是积分', () => {
+    // 图表画的是调用次数（2026-09-20 决定）：次数完全来自本地事实（一条记录就是一次真实
+    // 调用），不受上游计费规则影响。旧口径下这里累计的是 `credits`，而「消耗未知」的那条
+    // 不进曲线；现在没有记账，也就不存在「未知」这一态。
     const now = new Date(2026, 8, 19, 10, 0, 0).getTime();
     const state = readPanelState({
       settings: {},
@@ -738,8 +740,8 @@ describe('14：调用历史的投影', () => {
       history: {
         entries: [
           record(now),
-          record(now, { endpoint: 'extract', credits: 2 }),
-          record(now, { endpoint: 'extract', credits: undefined }),
+          record(now, { endpoint: 'extract' }),
+          record(now, { endpoint: 'extract' }),
         ],
         error: null,
       },
@@ -747,9 +749,31 @@ describe('14：调用历史的投影', () => {
     });
 
     const today = state.history.daily.at(-1);
-    assert.equal(today.search, 1);
-    assert.equal(today.extract, 2, '消耗未知的那条不加猜测值');
-    assert.equal(today.calls, 3, '但它确实发生过，因此要计入调用数');
+    assert.equal(today.search, 1, '一次搜索算一次');
+    assert.equal(today.extract, 2, '两次抓取算两次');
+    assert.equal(today.calls, 3, '合计三次调用');
+  });
+
+  test('记录里残留的 credits 不参与汇总——汇总口径与积分无关', () => {
+    // 旧文件里可能还带着 `credits`，而投影层读的是记录条数。若哪天有人把汇总改回读
+    // `credits`，这条会立刻炸。
+    const now = new Date(2026, 8, 19, 10, 0, 0).getTime();
+    const state = readPanelState({
+      settings: {},
+      fallback: {},
+      history: {
+        entries: [
+          record(now, { credits: 99 }),
+          record(now, { endpoint: 'extract', credits: 99 }),
+        ],
+        error: null,
+      },
+      nowMs: now,
+    });
+
+    const today = state.history.daily.at(-1);
+    assert.equal(today.search, 1, '一次搜索就是 1，不是 99');
+    assert.equal(today.extract, 1, '一次抓取就是 1，不是 99');
   });
 
   test('今天之外的记录不影响今天的桶', () => {

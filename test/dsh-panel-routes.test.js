@@ -634,7 +634,11 @@ describe('index.js 真的把接口接上了', () => {
     assert.equal(response.status, 200);
     assert.deepEqual(body.keys, []);
     assert.equal(body.settings.searchEnabled, true, '设置由宿主按 schema 解析出默认值');
-    assert.equal(body.settings.fetchEnabled, true, '第二个开关同样经宿主 schema 解析（CFG-2）');
+    assert.equal(
+      body.settings.fetchEnabled,
+      false,
+      '第二个开关同样经宿主 schema 解析（CFG-2）；抓取默认关闭，因此这里读到的是 false',
+    );
     assert.equal(body.settings.fetchDepth, 'basic');
     assert.equal(body.settings.fetchFormat, 'markdown');
   });

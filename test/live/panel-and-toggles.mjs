@@ -272,19 +272,27 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
 
   assert.ok(stats?.calls >= 1, `一次真实搜索之后 calls 必须落盘，实际 ${String(stats?.calls)}（${poolPath}）`);
   assert.ok(stats.successes >= 1, '成功次数必须记上');
-  assert.ok(
-    typeof stats.credits === 'number' || typeof stats.creditsUnknown === 'number',
-    '积分消耗要么记成数字、要么记成「未知」，绝不能什么都不记（REST-3）',
-  );
+  // 插件**不**统计自身消耗积分（2026-09-20 决定）：积分规则由上游随时可能更改，任何自算的
+  // 数字都可能在某次规则调整后变成误导。因此 stats 里既没有 credits 也没有 creditsUnknown，
+  // 展示只用 `/usage` 的官方余额。
+  assert.equal('credits' in stats, false, '不再有积分流水这一项');
+  assert.equal('creditsUnknown' in stats, false, '也不再有「消耗未知」这一项');
   check(
-    '第 11 项：调用数/成功数/积分落在 keys.json 的 stats 里',
-    `calls=${String(stats.calls)} successes=${String(stats.successes)} credits=${String(stats.credits ?? '未知')}`,
+    '第 11 项：调用数与成功数落在 keys.json 的 stats 里（不统计积分）',
+    `calls=${String(stats.calls)} successes=${String(stats.successes)}`,
   );
 }
 
 // ── 第 10 项：抓取接管与它的独立开关（ticket 10） ──────────────────────────────
 {
   // 抓取开关为开：请求必须走 Tavily `/extract`，且返回纯文本。
+  //
+  // ⚠️ 抓取开关**默认关闭**（2026-09-20 决定），因此这里必须先把它显式打开——否则请求会
+  // 按设计回落给官方抓取器，而下面那条「必须打到 /extract」的断言会以一条看起来像接线
+  // 坏掉的错误失败。开关是否真的默认为关由 `test/settings.test.js` 与
+  // `test/dsh-settings.test.js` 直接断言 schema 默认值。
+  await settings.update(SETTINGS_NAMESPACE, { fetchEnabled: true });
+  assert.equal(settings.get(SETTINGS_NAMESPACE).fetchEnabled, true, '先把抓取开关打开再测接管');
   //
   // 出站请求在这里被**换掉**而不是真的发出去：本脚本要证明的是「接管的接线对不对」——
   // 请求有没有抵达 Tavily 的抽取端点、参数对不对、返回值是不是被标成 `text`——而
@@ -298,7 +306,6 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
     return Promise.resolve(new Response(JSON.stringify({
       results: [{ url: 'https://example.com', title: 'Example Domain', raw_content: '# Example Domain\n\n正文' }],
       failed_results: [],
-      usage: { credits: 0 },
       request_id: 'req-live-extract',
     }), { status: 200 }));
   };

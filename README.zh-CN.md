@@ -2,7 +2,7 @@
 
 [English](./README.md) | **简体中文**
 
-用 [Tavily](https://tavily.com) 替代 DeepSeek Harness 内置的 web 搜索**与**网页抓取：多密钥池、余额感知轮转、失败自动切换、冷却、用量统计，搜索与抓取各有独立开关，全部在 DSH 设置面板内配置。
+用 [Tavily](https://tavily.com) 替代 DeepSeek Harness 内置的 web 搜索**与**网页抓取：多密钥池、余额感知轮转、失败自动切换、冷却、官方 `/usage` 余额展示，搜索与抓取各有独立开关，全部在 DSH 设置面板内配置。
 
 > 请勿与 [`szmy-haruhi/dsh-tavily`](https://github.com/SZMY-haruhi/dsh-tavily)（单密钥 / 免密钥，无调度）或 [`@yuuz12/dsh-tavily`](https://www.npmjs.com/package/@yuuz12/dsh-tavily)（多密钥，但不接管抓取，且在运行时改写内部字段）混淆。本插件管理一个密钥**池**，按剩余余额调度，并**同时**接管 `web_search` 与 `web_fetch`。
 
@@ -13,17 +13,16 @@
 - **失败自动切换** —— 一把失败就交给下一把
 - **冷却** —— 遵循上游 `Retry-After`；冷却期内硬排除，全部冷却时在预算内等待最早到期的一把
 - **按状态码分别处理** —— 区分临时失败、密钥永久失效（**看响应体**，绝不只看状态码）与额度耗尽（432 / 433 同等处理：该密钥不被选中，直到 `/usage` 确认余额回升）
-- **用量记账** —— 读取响应中的真实 `usage.credits`；未知记为未知，绝不记 0
+- **只展示官方余额** —— 卡片显示 `/usage` 的读数（上限 − 已用，两个数字都来自官方）。插件**不**做自己的积分记账：Tavily 的计费规则随时可能更改，本地算出来的数字会在某次规则调整后悄悄变成误导。余额排序在两次刷新之间仍保持新鲜，靠的是一个刻意粗糙、且**从不展示**的每次调用估算
 - **余额刷新** —— 拉取官方 `/usage`，按密钥做滑动窗口配额预占，不会触发 10 次 / 10 分钟的限流
 - **搜索参数可配** —— 搜索深度、结果数上限、主题、是否生成答案，改动即时生效
-- **抓取接管** —— 把 `web_fetch` 映射到 Tavily `/extract`，返回纯文本（绝不标成 HTML——那会让 DSH 再转换一次）；抽取深度与返回格式可配
-- **抓取按成功 URL 计费** —— 每 5 个成功抽取的 URL 计一档、跨调用累计，因此单次抓取通常消耗 0
-- **调用历史与图表** —— 每次调用都留下记录（密钥、端点、结果、积分、耗时、`request_id`），并画成 14 天的积分曲线；文件同时受条数上限与 30 天窗口约束
+- **抓取接管（默认关闭）** —— 把 `web_fetch` 映射到 Tavily `/extract`，返回纯文本（绝不标成 HTML——那会让 DSH 再转换一次）；抽取深度与返回格式可配。想让 Tavily 也接管抓取时，在设置里打开它
+- **调用历史与图表** —— 每次调用都留下记录（密钥、端点、结果、耗时、`request_id`），并画成 14 天的调用次数曲线；文件同时受条数上限与 30 天窗口约束
 - **两个独立开关** —— 搜索与抓取可分别切回官方提供方
 - **零运行时依赖** —— 纯 ESM，无构建步骤
 
 > **已交付：** spec 要的全部——搜索接管与它的开关、密钥池（单把或整批粘贴录入）、故障切换与冷却、
-> 搜索参数、调度策略、余额刷新、抓取接管与它自己的开关、调用历史与图表、设置卡片及其 HTTP 接口。
+> 搜索参数、调度策略、余额刷新、抓取接管与它自己的开关（默认关闭）、调用历史与图表、设置卡片及其 HTTP 接口。
 
 ## 安装
 
@@ -33,11 +32,12 @@
 dsh plugin add dsh-tavily-pool
 ```
 
-或直接从 GitHub 安装——不需要 registry 账号，且可以 pin 住某个 tag 或 commit：
+或直接从 GitHub 安装——不需要 registry 账号。想要可复现的版本就 pin 住某个已发布的 tag，
+可用的见 [tags 页](https://github.com/stormbuf/dsh-tavily-pool/tags)：
 
 ```sh
 dsh plugin add github:stormbuf/dsh-tavily-pool
-dsh plugin add github:stormbuf/dsh-tavily-pool#v0.1.0
+dsh plugin add github:stormbuf/dsh-tavily-pool#vX.Y.Z
 ```
 
 两条路装到的文件相同：`package.json` 里的 `files` 白名单对 git 安装同样生效，因此不会捎带上

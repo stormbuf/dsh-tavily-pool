@@ -25,10 +25,13 @@ function read(raw) {
 }
 
 describe('CFG-3：搜索参数可配置', () => {
-  test('默认值与 Tavily 自己的默认一致', () => {
+  test('默认值与 Tavily 自己的默认一致，但抓取开关默认关闭', () => {
     assert.deepEqual(read(undefined), {
       searchEnabled: true,
-      fetchEnabled: true,
+      // 抓取默认关闭（2026-09-20 决定）：搜索与抓取走两条不同的上游路径，抓取由
+      // `/extract` 承担、额度口径独立；用户装本插件通常是为了搜索，让抓取默认跟随接管
+      // 等于替他做了一个没要求的额度消耗决定。
+      fetchEnabled: false,
       fetchDepth: 'basic',
       fetchFormat: 'markdown',
       schedulingPolicy: 'balance',
@@ -37,6 +40,11 @@ describe('CFG-3：搜索参数可配置', () => {
       topic: 'general',
       includeAnswer: false,
     });
+  });
+
+  test('已显式配置过 fetchEnabled 的用户保留自己的选择，默认值只作用于从未设置过的配置', () => {
+    assert.equal(read({ fetchEnabled: true }).fetchEnabled, true, '显式打开的人不受默认值改动影响');
+    assert.equal(read({ fetchEnabled: false }).fetchEnabled, false);
   });
 
   test('用户取值被原样读出', () => {

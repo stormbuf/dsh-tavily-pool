@@ -59,6 +59,23 @@ function contextWithRealSettings() {
   return ctx;
 }
 
+/**
+ * 一个「settings 服务上挂着一份原始取值」的 ctx。
+ *
+ * 形状必须与真实宿主一致，是**两层**：`ctx.get('settings')` 取到服务，服务再按命名空间
+ * 取。写成一层（`get: () => ({...})`）会让 `readNamespace` 读到 `undefined`，于是每一项
+ * 都退回默认值——用例照样通过，但它证明的只是「桩件没接上」。
+ *
+ * @param raw - 命名空间下要暴露的原始取值。
+ * @returns ctx 桩件。
+ */
+function ctxWithRawSettings(raw) {
+  return {
+    // 外层按**服务名**取，内层按**命名空间**取——与 `readService` + `readNamespace` 的两跳一致。
+    get: (name) => (name === 'settings' ? { [SETTINGS_NAMESPACE]: raw } : undefined),
+  };
+}
+
 describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', () => {
   test('注册成功，且服务上的 get(ns) 读回 schema 默认值', async () => {
     const ctx = contextWithRealSettings();
@@ -70,7 +87,9 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
       ctx.settings.get(SETTINGS_NAMESPACE),
       {
         searchEnabled: true,
-        fetchEnabled: true,
+        // 抓取默认关闭（2026-09-20 决定）：抓取走另一条上游路径、额度口径独立，
+        // 默认跟随接管等于替用户做了一个他没要求的额度消耗决定。
+        fetchEnabled: false,
         searchDepth: 'basic',
         maxResults: 10,
         topic: 'general',
@@ -170,7 +189,7 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
       readPluginSettings(ctx),
       {
         searchEnabled: true,
-        fetchEnabled: true,
+        fetchEnabled: false,
         searchDepth: 'basic',
         maxResults: 10,
         topic: 'general',
@@ -200,25 +219,26 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
     // settings.yaml 是一份可以直接编辑的文件，因此解析结果里完全可能出现一个 schema
     // 永远不会写入的值。把它转发给 Tavily 会换回 400，而 400 按 REST-8 既不重试也不
     // 切换密钥——那等于每一次搜索都注定失败。
-    const ctx = contextWithRealSettings();
-    registerSettings(ctx);
-
-    const settings = readPluginSettings({
-      get: () => ({
-        searchEnabled: true,
-        searchDepth: 'deep',
-        maxResults: 99,
-        topic: 'sports',
-        includeAnswer: 'yes',
-        fetchEnabled: 'yes',
-        fetchDepth: 'deep',
-        fetchFormat: 'pdf',
-      }),
-    });
+    //
+    // ⚠️ 这里的 ctx 桩件必须是**两层**的：`ctx.get('settings')` 取到服务，服务再按命名
+    // 空间取。写成 `get: () => ({...})` 一层的话，`readNamespace` 读到的是 `undefined`，
+    // 于是每一项都退回默认值——断言照样通过，但它证明的是「桩件没接上」，不是「越界值被
+    // 退回」。先前这条用例就是这个形状，因此它是**空转**的。
+    const settings = readPluginSettings(ctxWithRawSettings({
+      searchEnabled: true,
+      searchDepth: 'deep',
+      maxResults: 99,
+      topic: 'sports',
+      includeAnswer: 'yes',
+      fetchEnabled: 'yes',
+      fetchDepth: 'deep',
+      fetchFormat: 'pdf',
+    }));
 
     assert.deepEqual(settings, {
       searchEnabled: true,
-      fetchEnabled: true,
+      // 越界的 `'yes'` 退回默认值，而抓取的默认值现在是 `false`（2026-09-20 决定）。
+      fetchEnabled: false,
       searchDepth: 'basic',
       maxResults: 10,
       topic: 'general',
@@ -226,6 +246,34 @@ describe('CFG-1：设置命名空间注册进宿主真实的 settings 服务', (
       fetchDepth: 'basic',
       fetchFormat: 'markdown',
       schedulingPolicy: 'balance',
+    });
+  });
+
+  test('合法取值原样读出——证明上一条不是在空转', () => {
+    // 上一条断言的全是「退回默认值」，而它只有在桩件真的接上时才有意义。这一条用一份
+    // 全部合法的取值走同一条路径：若桩件又写错了，这里会立刻炸。
+    const settings = readPluginSettings(ctxWithRawSettings({
+      searchEnabled: false,
+      searchDepth: 'advanced',
+      maxResults: 3,
+      topic: 'news',
+      includeAnswer: true,
+      fetchEnabled: true,
+      fetchDepth: 'advanced',
+      fetchFormat: 'text',
+      schedulingPolicy: 'manual',
+    }));
+
+    assert.deepEqual(settings, {
+      searchEnabled: false,
+      fetchEnabled: true,
+      searchDepth: 'advanced',
+      maxResults: 3,
+      topic: 'news',
+      includeAnswer: true,
+      fetchDepth: 'advanced',
+      fetchFormat: 'text',
+      schedulingPolicy: 'manual',
     });
   });
 

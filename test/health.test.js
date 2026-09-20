@@ -275,7 +275,7 @@ describe('SCHED-3 / SCHED-8：状态机的硬排除', () => {
     health.recordFailure(record.id, { failure: { status: 500 }, nowMs: now });
     assert.equal(health.snapshotOf(record.id, now).cooling, true);
 
-    health.recordSuccess(record.id, { credits: 1, nowMs: now + 1000 });
+    health.recordSuccess(record.id, { searchDepth: 'basic', nowMs: now + 1000 });
     assert.equal(health.snapshotOf(record.id, now + 1000).cooling, false, '上游刚接受了它');
   });
 
@@ -291,7 +291,7 @@ describe('SCHED-3 / SCHED-8：状态机的硬排除', () => {
     const later = now + 40 * 24 * 3600 * 1000;
     assert.equal(health.snapshotOf(record.id, later).quotaExhausted, true, '时间不是恢复依据');
 
-    health.recordSuccess(record.id, { credits: 2, nowMs: later });
+    health.recordSuccess(record.id, { searchDepth: 'advanced', nowMs: later });
     assert.equal(health.snapshotOf(record.id, later).quotaExhausted, true, '一次成功也不解除额度耗尽');
   });
 
@@ -324,11 +324,11 @@ describe('SCHED-3 / SCHED-8：状态机的硬排除', () => {
 });
 
 describe('USAGE-7：统计落在密钥池文件里', () => {
-  test('调用数、成功/失败、积分与最近错误都被记录', async () => {
+  test('调用数、成功/失败、最近错误与累计抓取 URL 数都被记录', async () => {
     const { pool, record, health } = await poolWithKey();
 
     await health.markSelected(record.id);
-    await health.recordSuccess(record.id, { credits: 1, durationMs: 42 });
+    await health.recordSuccess(record.id, { searchDepth: 'basic', durationMs: 42 });
     await health.recordFailure(record.id, {
       failure: { status: 500, detail: 'boom' },
       message: 'Tavily returned HTTP 500: boom',
@@ -339,20 +339,24 @@ describe('USAGE-7：统计落在密钥池文件里', () => {
     assert.equal(entry.stats.calls, 1);
     assert.equal(entry.stats.successes, 1);
     assert.equal(entry.stats.failures, 1);
-    assert.equal(entry.stats.credits, 1);
     assert.equal(entry.stats.lastDurationMs, 7);
     assert.equal(entry.stats.lastError.status, 500);
     assert.equal(entry.stats.lastError.message, 'Tavily returned HTTP 500: boom');
   });
 
-  test('缺失 credits 记「未知」而不是 0', async () => {
+  test('插件不统计自身消耗：stats 里既不写 credits 也不写 creditsUnknown', async () => {
+    // 积分规则由上游随时可能更改，任何自算的数字都可能在某次规则调整后变成误导，
+    // 因此插件不再统计自身消耗（2026-09-20 决定）。展示只用 `/usage` 的官方余额。
     const { pool, record, health } = await poolWithKey();
 
-    await health.recordSuccess(record.id, { durationMs: 10 });
+    await health.recordSuccess(record.id, { searchDepth: 'basic', durationMs: 10 });
+    await health.recordSuccess(record.id, { successfulUrls: 3, extractDepth: 'basic', durationMs: 11 });
 
     const { stats } = pool.maskedList()[0];
-    assert.equal(stats.creditsUnknown, 1, '不知道消耗了多少，与「没消耗」必须区分得开');
-    assert.equal(stats.credits, undefined, '不能记成 0');
+    assert.equal('credits' in stats, false, '不再有积分流水这一项');
+    assert.equal('creditsUnknown' in stats, false, '也不再有「消耗未知」这一项');
+    // 累计成功 URL 数保留：它只服务于估算，不是任何积分数字。
+    assert.equal(stats.extractUrls, 3, '抓取的累计成功 URL 数仍要记，跨档估算读的就是它');
   });
 
   test('状态经池文件往返：重新加载后冷却仍在', async () => {

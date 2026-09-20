@@ -166,13 +166,10 @@ describe('DOC-1：包清单完整，且发布出去的内容是完整的', () =>
     }
   });
 
-  test('四份面向用户的文档都写明了两条安装路径，且 pin 的 tag 与 version 一致', async () => {
+  test('四份面向用户的文档都写明了两条安装路径，且 pin 的是占位符而不是具体 tag', async () => {
     // 两条安装路径并存：registry 那条要有，GitHub 那条也要有。少了任何一条，读文档的人
     // 都会以为只有一种装法——而 GitHub 那条恰恰是包还没发布、或用户不想注册 registry
     // 账号时唯一能走的路。
-    const pkg = await manifest();
-    const tag = `v${pkg.version}`;
-
     for (const name of ['README.md', 'README.zh-CN.md', 'docs/usage.md', 'docs/usage.zh-CN.md']) {
       const text = await readFile(join(repoRoot, name), 'utf8');
 
@@ -186,12 +183,26 @@ describe('DOC-1：包清单完整，且发布出去的内容是完整的', () =>
         /dsh plugin add github:stormbuf\/dsh-tavily-pool/u,
         `${name} 缺少 GitHub 安装路径`,
       );
-      // 文档里 pin 的 tag 必须指向**当前**版本号。这条是防漂移的：version 一升，
-      // 文档里那句 `#v0.1.0` 就会静默指向一个更旧的提交，而它看起来仍然是对的。
-      assert.equal(
-        text.includes(`dsh-tavily-pool#${tag}`),
-        true,
-        `${name} 里 pin 的 tag 不是 ${tag}（version 升了就要同步改文档）`,
+      // pin 语法仍然要教：`#vX.Y.Z` 这个占位符说明「可以钉版本」，并把人引到 tags 页。
+      assert.match(
+        text,
+        /dsh plugin add github:stormbuf\/dsh-tavily-pool#vX\.Y\.Z/u,
+        `${name} 缺少 pin 语法的占位符示例`,
+      );
+      assert.match(
+        text,
+        /github\.com\/stormbuf\/dsh-tavily-pool\/tags/u,
+        `${name} 没有指向 tags 页——占位符必须配一个「去哪儿挑版本」的落点`,
+      );
+      // **不许出现具体 tag。** 这条取代了先前「文档 tag 必须等于当前 version」的守卫：
+      // 那种写法把「上一次发版时的版本号」写进了文档，而它看起来永远是对的，只是指向一个
+      // 更旧的提交；每次发版还要同步改四处。占位符没有这个漂移面。
+      //
+      // 匹配 `#v` 后跟数字：真正的 semver tag 一定长这样，而占位符 `#vX.Y.Z` 不会命中。
+      assert.doesNotMatch(
+        text,
+        /dsh-tavily-pool#v\d/u,
+        `${name} 里出现了具体的版本 tag——它会随发版静默过期，请用 #vX.Y.Z 占位符`,
       );
     }
   });

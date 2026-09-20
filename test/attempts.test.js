@@ -46,7 +46,8 @@ function stubInvoke(behaviour) {
     calls.push(id);
     const outcome = behaviour[id];
     if (outcome === undefined || outcome.ok === true) {
-      return { result: { sources: [], truncated: false }, credits: outcome?.credits };
+      // 内核的返回值里没有积分：估算由持有累计计数的 `lib/health.js` 负责。
+      return { result: { sources: [], truncated: false }, successfulUrls: outcome?.successfulUrls };
     }
     throw new TavilyError(outcome.message ?? `HTTP ${String(outcome.status)}`, {
       code: outcome.code ?? `TAVILY_HTTP_${String(outcome.status)}`,
@@ -256,7 +257,7 @@ describe('REST-10：透穿最后一个真实响应', () => {
   });
 });
 
-describe('取消与记账', () => {
+describe('取消、观察者与统计', () => {
   test('取消立刻向上传递，不记在密钥头上', async () => {
     const { health, scheduler, ids } = await harness([{ label: 'a' }, { label: 'b' }]);
     const invoke = async () => {
@@ -297,7 +298,7 @@ describe('取消与记账', () => {
     // `14` 用它记调用历史。它必须是**观察者**：抛错不该影响这次调用的结果，否则一段记历史的
     // 代码就能把搜索搞挂。
     const { scheduler, health, ids } = await harness([{ label: 'a' }]);
-    const { invoke } = stubInvoke({ [ids.a]: { ok: true, credits: 2 } });
+    const { invoke } = stubInvoke({ [ids.a]: { ok: true } });
     const seen = [];
 
     const outcome = await runWithFailover({
@@ -313,7 +314,7 @@ describe('取消与记账', () => {
     assert.equal(seen.length, 1, '观察者要在成功路径上被调用');
     assert.equal(seen[0].keyId, ids.a);
     assert.equal(seen[0].outcome, 'ok');
-    assert.equal(seen[0].credits, 2);
+    assert.equal('credits' in seen[0], false, '尝试记录里不再有积分——插件不再统计自身消耗');
     assert.equal(outcome.keyId, ids.a, '观察者抛错不该影响这次调用的结果');
 
     // 失败路径同理。
@@ -335,9 +336,9 @@ describe('取消与记账', () => {
     assert.equal(failed[0].status, 500);
   });
 
-  test('成功会把调度时记下的调用数与积分一并留下', async () => {
+  test('成功会把调度时记下的调用数与成功数一并留下', async () => {
     const { pool, health, scheduler, ids } = await harness([{ label: 'a' }]);
-    const { invoke } = stubInvoke({ [ids.a]: { ok: true, credits: 2 } });
+    const { invoke } = stubInvoke({ [ids.a]: { ok: true } });
 
     const outcome = await runWithFailover({ scheduler, health, invoke });
 
@@ -345,7 +346,7 @@ describe('取消与记账', () => {
     const { stats } = pool.maskedList().find((entry) => entry.id === ids.a);
     assert.equal(stats.calls, 1, '被选中即计一次调用');
     assert.equal(stats.successes, 1);
-    assert.equal(stats.credits, 2);
+    assert.equal('credits' in stats, false, '不再有积分流水这一项');
   });
 
   test('非 Tavily 错误原样向上，不被误记成密钥失败', async () => {
@@ -393,7 +394,7 @@ describe('SCHED-9：等待预算的折算', () => {
       now: () => now,
       invoke: async () => {
         invoked = true;
-        return { result: { sources: [], truncated: false }, credits: 1 };
+        return { result: { sources: [], truncated: false } };
       },
     });
 
