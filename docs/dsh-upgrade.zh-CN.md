@@ -242,6 +242,10 @@ Cordis `>=4.0.2 <5`。
 1. `npm test` —— 与宿主零耦合的内核必须**无需任何改动**即保持全绿。
 2. 带真实密钥运行 `node test/live/seam-check.mjs` —— 证明 seam 能解析到被 pin 的提供方，
    且一次真实搜索能正确映射回来。
-3. 重启 harness，通过界面跑一次真实的 `web_search`，然后逐条走
-   `.scratch/dsh-tavily/issues/16-real-machine-e2e-verification.md`。只存在于运行中 harness
-   里的行为无法用单测证明，而每次升级都会让上一次的验证结论作废。
+3. 带真实密钥运行 `node test/live/panel-and-toggles.mjs` —— 证明开关即时生效、回落路径可用，
+   且插件半坏时搜索仍能服务。
+4. 运行 `node test/live/panel-browser-check.mjs` —— 在真实 headless Chrome 里渲染设置卡片。
+   单测对着 React 替身执行组件、断言元素树，但**看不见渲染**；曾有一次 CSS 类名撞车通过了
+   全部单测而真机卡片不可用。
+5. 重启 harness，通过界面跑一次真实的 `web_search`。只存在于运行中 harness 里的行为无法用
+   单测证明，而每次升级都会让上一次的验证结论作废。

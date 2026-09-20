@@ -275,7 +275,12 @@ Two things to remember when widening:
 1. `npm test` — the host-free core must stay green with no changes.
 2. `node test/live/seam-check.mjs` with a real key — proves the seam resolves the pinned
    provider and a live search maps back correctly.
-3. Restart the harness and run one real `web_search` through the UI, then work through
-   `.scratch/dsh-tavily/issues/16-real-machine-e2e-verification.md`. Behaviour that only
+3. `node test/live/panel-and-toggles.mjs` with a real key — proves the toggles take effect
+   live, the fallback path works, and a half-broken plugin still serves searches.
+4. `node test/live/panel-browser-check.mjs` — renders the settings card in a real headless
+   Chrome. Unit tests execute the component against a React stand-in and assert the element
+   tree, but they cannot see rendering; a CSS collision once passed every unit test while the
+   real card was unusable.
+5. Restart the harness and run one real `web_search` through the UI. Behaviour that only
    exists inside a running harness cannot be proven by unit tests, and each upgrade
    invalidates the previous run.

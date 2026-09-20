@@ -405,7 +405,7 @@ describe('host-contract-1：与官方 resolveOptions 的键集对账', () => {
    *
    * 不是正则去数 `xxx:` 的字面量：官方的对象里有一个条件展开
    * （`...literalApiKey === void 0 ? {} : { apiKey }`），只有真的把它跑起来才知道
-   * 键集长什么样。手法与审计探针 `.scratch/audit-probes/hc1-record-request.mjs` 一致。
+   * 键集长什么样。
    *
    * @returns 排好序的键名。
    */
