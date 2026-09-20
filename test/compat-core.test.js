@@ -165,4 +165,34 @@ describe('DOC-1：包清单完整，且发布出去的内容是完整的', () =>
       for (const name of pair) assert.equal(published.has(name), true, `files 白名单缺少 ${name}`);
     }
   });
+
+  test('四份面向用户的文档都写明了两条安装路径，且 pin 的 tag 与 version 一致', async () => {
+    // 两条安装路径并存：registry 那条要有，GitHub 那条也要有。少了任何一条，读文档的人
+    // 都会以为只有一种装法——而 GitHub 那条恰恰是包还没发布、或用户不想注册 registry
+    // 账号时唯一能走的路。
+    const pkg = await manifest();
+    const tag = `v${pkg.version}`;
+
+    for (const name of ['README.md', 'README.zh-CN.md', 'docs/usage.md', 'docs/usage.zh-CN.md']) {
+      const text = await readFile(join(repoRoot, name), 'utf8');
+
+      assert.match(
+        text,
+        /dsh plugin add dsh-tavily-pool\b/u,
+        `${name} 缺少 registry 安装路径`,
+      );
+      assert.match(
+        text,
+        /dsh plugin add github:stormbuf\/dsh-tavily-pool/u,
+        `${name} 缺少 GitHub 安装路径`,
+      );
+      // 文档里 pin 的 tag 必须指向**当前**版本号。这条是防漂移的：version 一升，
+      // 文档里那句 `#v0.1.0` 就会静默指向一个更旧的提交，而它看起来仍然是对的。
+      assert.equal(
+        text.includes(`dsh-tavily-pool#${tag}`),
+        true,
+        `${name} 里 pin 的 tag 不是 ${tag}（version 升了就要同步改文档）`,
+      );
+    }
+  });
 });

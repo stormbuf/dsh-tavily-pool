@@ -27,9 +27,21 @@
 
 ## 安装
 
+从 npm registry 安装：
+
 ```sh
 dsh plugin add dsh-tavily-pool
 ```
+
+或直接从 GitHub 安装——不需要 registry 账号，且可以 pin 住某个 tag 或 commit：
+
+```sh
+dsh plugin add github:stormbuf/dsh-tavily-pool
+dsh plugin add github:stormbuf/dsh-tavily-pool#v0.1.0
+```
+
+两条路装到的文件相同：`package.json` 里的 `files` 白名单对 git 安装同样生效，因此不会捎带上
+`test/` 或 `scripts/` 目录。
 
 然后打开 **设置 → 插件 → dsh-tavily-pool**，粘贴你的 Tavily API key。密钥只能通过面板录入——本插件不读取环境变量，也不读取 DSH 的 credentials 服务。
 

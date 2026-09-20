@@ -6,9 +6,20 @@ Use [Tavily](https://tavily.com) in place of DeepSeek Harness's built-in web sea
 
 ## Install
 
+From the npm registry:
+
 ```sh
 dsh plugin add dsh-tavily-pool
 ```
+
+Or straight from GitHub, which needs no registry account and lets you pin a tag or a commit:
+
+```sh
+dsh plugin add github:stormbuf/dsh-tavily-pool
+dsh plugin add github:stormbuf/dsh-tavily-pool#v0.1.0
+```
+
+Both routes install the same files: the `files` whitelist in `package.json` applies to git installs too, so no `test/` or `scripts/` directory comes along.
 
 After installing, restart DSH and open **Settings → Plugins** to find this plugin's configuration card.
 

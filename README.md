@@ -29,9 +29,20 @@ Tavily-backed web search **and** page fetching for DeepSeek Harness: multi-key p
 
 ## Install
 
+From the npm registry:
+
 ```sh
 dsh plugin add dsh-tavily-pool
 ```
+
+Or straight from GitHub, which needs no registry account and lets you pin a tag or a commit:
+
+```sh
+dsh plugin add github:stormbuf/dsh-tavily-pool
+dsh plugin add github:stormbuf/dsh-tavily-pool#v0.1.0
+```
+
+Both routes install the same files: the `files` whitelist in `package.json` applies to git installs too, so no `test/` or `scripts/` directory comes along.
 
 Then open **Settings → Plugins → dsh-tavily-pool** and paste your Tavily API key(s). Keys are entered through the panel only — the plugin does not read environment variables or the DSH credentials service.
 
