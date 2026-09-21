@@ -19,12 +19,14 @@ import {
   QUOTA_PROBE_WINDOW_MS,
   TAVILY_USAGE_URL,
   USAGE_QUOTA_MAX_CALLS,
+  USAGE_REFRESH_AFTER_MS,
 } from '../lib/constants.js';
 import {
   UsageQuota,
   UsageRefresher,
   fetchUsage,
   hasPositiveBalance,
+  needsBalanceRefresh,
   needsQuotaProbe,
   shouldProbeAfterMonthStart,
   utcMonthStartAfter,
@@ -427,6 +429,60 @@ describe('SCHED-10：月起始探测窗口', () => {
       false,
     );
     assert.equal(needsQuotaProbe({ stats: {}, nowMs: monthStart }), false, '没标记过就无所谓探测');
+  });
+});
+
+describe('USAGE-8：读数超龄才刷新', () => {
+  const readAt = Date.parse('2026-09-21T00:00:00Z');
+
+  test('从未读到过余额时要刷新', () => {
+    // 它此刻在调度里按「未知」垫底（`SCHED-2`），而未知不是零——补一次读数能让它
+    // 立刻参与正常排序。
+    assert.equal(needsBalanceRefresh({ usage: undefined, nowMs: readAt }), true);
+    assert.equal(needsBalanceRefresh({ usage: null, nowMs: readAt }), true);
+  });
+
+  test('读数未超龄时不刷新', () => {
+    const usage = { fetchedAt: new Date(readAt).toISOString() };
+    assert.equal(
+      needsBalanceRefresh({ usage, nowMs: readAt + USAGE_REFRESH_AFTER_MS - 1000 }),
+      false,
+      '刚读过就不该再问一次——这是「闲置时零调用」的另一面：用一次只问一次',
+    );
+    assert.equal(needsBalanceRefresh({ usage, nowMs: readAt }), false);
+  });
+
+  test('读数超龄时刷新', () => {
+    const usage = { fetchedAt: new Date(readAt).toISOString() };
+    assert.equal(needsBalanceRefresh({ usage, nowMs: readAt + USAGE_REFRESH_AFTER_MS + 1000 }), true);
+  });
+
+  test('恰好等于阈值时不算超龄', () => {
+    // 判据是「严格大于」，边界归属刻意钉住：等号落在「还新鲜」那一侧，于是阈值的
+    // 含义就是它字面写的那个数，不必再解释「到底含不含端点」。
+    const usage = { fetchedAt: new Date(readAt).toISOString() };
+    assert.equal(needsBalanceRefresh({ usage, nowMs: readAt + USAGE_REFRESH_AFTER_MS }), false);
+  });
+
+  test('读数时刻读不出来时按需要刷新处理', () => {
+    // 一份无法定年的读数与没有读数，在「能不能信」上是同一件事。被手工改坏的
+    // `keys.json` 正是这条要兜的情形。
+    assert.equal(needsBalanceRefresh({ usage: {}, nowMs: readAt }), true);
+    assert.equal(needsBalanceRefresh({ usage: { fetchedAt: 'not a date' }, nowMs: readAt }), true);
+    assert.equal(needsBalanceRefresh({ usage: { fetchedAt: '' }, nowMs: readAt }), true);
+  });
+
+  test('阈值可注入，且默认值就是 USAGE_REFRESH_AFTER_MS', () => {
+    const usage = { fetchedAt: new Date(readAt).toISOString() };
+    assert.equal(USAGE_REFRESH_AFTER_MS, 3600 * 1000, '1 小时：单 key 最坏 1 次/小时，远低于官方限流');
+    assert.equal(needsBalanceRefresh({ usage, nowMs: readAt + 61 * 60 * 1000, maxAgeMs: 3600 * 1000 }), true);
+  });
+
+  test('系统时钟回拨时不刷新，而不是把未来时刻读成超龄', () => {
+    // 用户改过系统时间、或文件从别处复制来时，`fetchedAt` 可能落在「现在」之后。
+    // 那种情况下年龄是负数，判据必须得出「不刷新」——否则每次调用都会刷一次。
+    const future = new Date(readAt + 24 * 3600 * 1000).toISOString();
+    assert.equal(needsBalanceRefresh({ usage: { fetchedAt: future }, nowMs: readAt }), false);
   });
 });
 

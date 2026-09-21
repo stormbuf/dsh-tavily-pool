@@ -487,8 +487,22 @@ async function withStubbedFetch(handler, run) {
   }
 }
 
-/** 一个已加载插件、池中已有若干密钥的替身宿主。 */
 /**
+ * 桩件收到的**某一类**调用。
+ *
+ * `USAGE-8` 之后，一次搜索除了打 `/search` 还可能顺手打一次 `/usage`（某把密钥的
+ * 余额读数超龄、或从未读到过时）。因此「这次调用发出了什么」的断言必须按端点收窄：
+ * 数全部请求会把那次余额查询一起算进去，而它恰恰是**该发生**的。
+ *
+ * @param calls - 桩件记录下来的调用。
+ * @param endpoint - 路径片段，例如 `/search`、`/extract`、`/usage`。
+ * @returns 匹配的调用。
+ */
+function callsTo(calls, endpoint) {
+  return calls.filter((call) => String(call.url).includes(endpoint));
+}
+
+/** 一个已加载插件、池中已有若干密钥的替身宿主。 *//**
  * 抓取开关**默认关闭**（`CFG-2`，2026-09-20 决定），因此凡是断言「请求真的走了 Tavily
  * `/extract`」的用例，都必须先把设置显式打开——否则请求会按设计回落给官方本地抓取器。
  *
@@ -559,7 +573,7 @@ describe('调度与故障切换经入口真实生效', () => {
     );
 
     assert.equal(result.value.sources.length, 1);
-    assert.equal(result.calls.length, 1);
+    assert.equal(callsTo(result.calls, '/search').length, 1);
     assert.match(result.calls[0].url, /api\.tavily\.com\/search/u);
     assert.match(result.calls[0].authorization, /^Bearer tvly-dev-0-/u);
   });
@@ -1010,7 +1024,7 @@ describe('10：抓取接管经入口真实生效', () => {
     const host = await hostWithKeys([{ label: 'only' }], { settings: fetchOn() });
     const { result } = await fetchVia(host, 'https://example.com');
 
-    assert.equal(result.calls.length, 1);
+    assert.equal(callsTo(result.calls, '/extract').length, 1);
     assert.match(result.calls[0].url, /api\.tavily\.com\/extract/u);
     assert.match(result.calls[0].authorization, /^Bearer tvly-dev-0-/u);
     assert.deepEqual(result.calls[0].body.urls, ['https://example.com']);
@@ -1207,7 +1221,9 @@ describe('18：调度策略经入口真实生效（SCHED-7）', () => {
   async function keyUsedBy(host) {
     const { result } = await withStubbedFetch(
       () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
-      (calls) => host.registered[0].search({ query: 'q' }).then(() => calls[0].authorization),
+      // 只看 `/search`：`USAGE-8` 之后同一次调用还可能带上一次 `/usage`，而那次
+      // 余额查询用的是同一把密钥的 Authorization，混进来会让这条断言失去意义。
+      (calls) => host.registered[0].search({ query: 'q' }).then(() => callsTo(calls, '/search')[0].authorization),
     );
     return result;
   }
@@ -1242,7 +1258,7 @@ describe('18：调度策略经入口真实生效（SCHED-7）', () => {
       (call) => (call.authorization.includes('-0-')
         ? { status: 500, body: { detail: { error: 'boom' } } }
         : { status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
-      (calls) => host.registered[0].search({ query: 'q' }).then(() => calls.map((call) => call.authorization)),
+      (calls) => host.registered[0].search({ query: 'q' }).then(() => callsTo(calls, '/search').map((call) => call.authorization)),
     );
 
     assert.equal(result.length, 2, '第一把 500 之后必须换第二把，而不是原地重试');
@@ -1353,7 +1369,7 @@ describe('14：调用历史经入口真的落盘', () => {
     );
 
     assert.equal(result.value.sources.length, 1, '历史写不进去也不该让搜索失败');
-    assert.equal(result.calls.length, 1);
+    assert.equal(callsTo(result.calls, '/search').length, 1);
   });
 });
 
@@ -1411,7 +1427,7 @@ describe('host-contract-2：总预算读宿主真正绑定的值', () => {
     );
     const elapsed = Date.now() - startedAt;
 
-    assert.equal(outcome.result.calls.length, 1, '只该发出一次尝试');
+    assert.equal(callsTo(outcome.result.calls, '/search').length, 1, '只该发出一次尝试');
     assert.equal(outcome.result.aborted, true, '宿主给出的信号必须真的中止这次尝试');
     assert.ok(elapsed < 4_500, `必须按宿主绑定的 3000ms 排布，实际 ${String(elapsed)}ms`);
     assert.deepEqual(tools.scopes, [undefined], '必须按全局视图读，不去猜 agent scope');
@@ -1428,7 +1444,7 @@ describe('host-contract-2：总预算读宿主真正绑定的值', () => {
     );
 
     assert.equal(result.value.sources.length, 1, '读不到宿主预算时搜索必须照常');
-    assert.equal(result.calls.length, 1);
+    assert.equal(callsTo(result.calls, '/search').length, 1);
   });
 
   test('抓取路径同样按 web_fetch 的绑定值排布', async () => {
@@ -1453,9 +1469,143 @@ describe('host-contract-2：总预算读宿主真正绑定的值', () => {
     );
     const elapsed = Date.now() - startedAt;
 
-    assert.equal(outcome.result.calls.length, 1, '只该发出一次尝试');
+    assert.equal(callsTo(outcome.result.calls, '/extract').length, 1, '只该发出一次尝试');
     assert.equal(outcome.result.aborted, true);
     assert.ok(elapsed < 4_500, `抓取必须按 web_fetch 的 3000ms 排布，实际 ${String(elapsed)}ms`);
     assert.deepEqual(tools.scopes, [undefined], '同样按全局视图读');
+  });
+});
+
+describe('USAGE-8：读数超龄才顺手刷新，闲置时零调用', () => {
+  /** 往密钥池里写一份余额缓存；`ageMs` 是它「已经读了多久」。 */
+  async function seedReading(keyPoolPath, index, { ageMs, usage = 100, limit = 1000 } = {}) {
+    const document = JSON.parse(await readFile(keyPoolPath, 'utf8'));
+    document.usageCache[document.order[index]] = {
+      key: { limit, usage },
+      account: { plan_limit: limit },
+      fetchedAt: new Date(Date.now() - ageMs).toISOString(),
+      stale: false,
+    };
+    await writeFile(keyPoolPath, JSON.stringify(document), 'utf8');
+  }
+
+  /** 一次真实搜索，返回桩件记录下来的全部出站调用。 */
+  async function searchOnce(host) {
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      (calls) => host.registered[0].search({ query: 'q' }).then(() => calls),
+    );
+    return result;
+  }
+
+  test('读数未超龄时，一次搜索只打 /search，不多问一次 /usage', async () => {
+    // 这是「用一次只问一次」那一半：余额还新鲜时，任何多余的 /usage 都是在白耗
+    // 与恢复额度同一份的官方配额。
+    const host = await hostWithKeys([{ label: 'fresh' }]);
+    await seedReading(host.keyPoolPath, 0, { ageMs: 60_000 });
+
+    const calls = await searchOnce(host);
+
+    assert.equal(callsTo(calls, '/search').length, 1);
+    assert.equal(callsTo(calls, '/usage').length, 0, '读数才读过一分钟，不该再问');
+  });
+
+  test('读数超龄时，搜索之后会补问一次 /usage', async () => {
+    const host = await hostWithKeys([{ label: 'stale' }]);
+    await seedReading(host.keyPoolPath, 0, { ageMs: 2 * 3600 * 1000 });
+
+    const calls = await searchOnce(host);
+
+    assert.equal(callsTo(calls, '/search').length, 1, '搜索本身照常');
+    assert.equal(callsTo(calls, '/usage').length, 1, '超龄的读数要补一次');
+  });
+
+  test('从未读到过余额的密钥会被补一次读数', async () => {
+    // 它此刻在调度里按「未知」垫底（`SCHED-2`），而未知不是零。
+    const host = await hostWithKeys([{ label: 'never-read' }]);
+
+    const calls = await searchOnce(host);
+
+    assert.equal(callsTo(calls, '/usage').length, 1);
+  });
+
+  test('池内其余「从未读到过余额」的密钥也一并补齐，而读数偏旧的不补', async () => {
+    // 触发时检查**所有** key，对无余额信息的各调一次 `/usage`；已经有余额信息（哪怕偏旧）
+    // 的不调——后者只有**被选中**时才另有超龄规则。这个分界是刻意的：为一把余额已知、
+    // 只是读数偏旧的密钥反复发问，是拿官方配额换一点点排序精度。
+    const host = await hostWithKeys([{ label: 'fresh' }, { label: 'never' }, { label: 'stale' }]);
+    await seedReading(host.keyPoolPath, 0, { ageMs: 60_000 });
+    await seedReading(host.keyPoolPath, 2, { ageMs: 2 * 3600 * 1000 });
+
+    const calls = await searchOnce(host);
+
+    assert.equal(callsTo(calls, '/search').length, 1, '搜索照常');
+    assert.equal(callsTo(calls, '/usage').length, 1, '只补从未读到过的那把');
+  });
+
+  test('刷新不拖慢这次调用：搜索照常返回', async () => {
+    // 刷新是一次优化，不是这次调用的前提。让一次余额查询拖慢一次搜索是错误的量级，
+    // 因此它必须与搜索并发，而不是排在它前面。
+    const host = await hostWithKeys([{ label: 'stale' }]);
+    await seedReading(host.keyPoolPath, 0, { ageMs: 2 * 3600 * 1000 });
+
+    const calls = await searchOnce(host);
+
+    assert.equal(callsTo(calls, '/search').length, 1);
+    assert.equal(callsTo(calls, '/usage').length, 1, '刷新确实发生了');
+  });
+
+  test('同一把密钥的刷新在飞时不重复排（并发搜索只问一次）', async () => {
+    const host = await hostWithKeys([{ label: 'stale' }]);
+    await seedReading(host.keyPoolPath, 0, { ageMs: 2 * 3600 * 1000 });
+
+    // 两次搜索并发：第一次触发的刷新还没回来时，第二次不该再排一次——它们问的是
+    // 同一个问题，而每多问一次都在消耗与恢复额度同一份的官方配额。
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
+      async (calls) => {
+        await Promise.all([
+          host.registered[0].search({ query: 'q1' }),
+          host.registered[0].search({ query: 'q2' }),
+        ]);
+        return calls;
+      },
+    );
+
+    assert.equal(callsTo(result, '/search').length, 2, '两次搜索都发生了');
+    assert.equal(callsTo(result, '/usage').length, 1, '同一把密钥的读数只该补一次');
+  });
+
+  test('闲置时零调用：不搜索就一个 /usage 都不发', async () => {
+    // `USAGE-8` 明确不要后台定时任务：插件不被使用时不该产生任何 /usage 流量，
+    // 而它消耗的正是与额度恢复同一份的官方配额。
+    const host = await hostWithKeys([{ label: 'stale' }]);
+    await seedReading(host.keyPoolPath, 0, { ageMs: 10 * 3600 * 1000 });
+
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [] } }),
+      // 什么都不做，只是等一段足够让任何定时器现形的时间。
+      async (calls) => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 150);
+        });
+        return calls;
+      },
+    );
+
+    assert.deepEqual(result, [], '没有任何调用发生——超龄本身不会触发刷新');
+  });
+
+  test('抓取路径同样触发，且只问一次', async () => {
+    const host = await hostWithKeys([{ label: 'stale' }], { settings: fetchOn() });
+    await seedReading(host.keyPoolPath, 0, { ageMs: 2 * 3600 * 1000 });
+
+    const { result } = await withStubbedFetch(
+      () => ({ status: 200, body: { results: [{ url: 'https://example.com', raw_content: '# 正文' }] } }),
+      (calls) => host.registeredFetch[0].fetch({ url: 'https://example.com' }).then(() => calls),
+    );
+
+    assert.equal(callsTo(result, '/extract').length, 1);
+    assert.equal(callsTo(result, '/usage').length, 1);
   });
 });

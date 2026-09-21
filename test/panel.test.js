@@ -54,10 +54,12 @@ async function temporaryPool() {
  * @param options.settings - 当前设置。
  * @param options.writeSettings - 设置写入 thunk。
  * @param options.refresh - 余额刷新替身。
- * @returns `{ deps, pool, settings }`，`settings` 是一个会被写入改动的可变盒子。
+ * @returns `{ deps, pool, box, added }`，`box` 是一个会被写入改动的可变设置盒子，
+ *   `added` 收集 `onKeysAdded` 收到的记录（`USAGE-8` 在添加路径上的触发点）。
  */
 async function panelDeps({ pool, settings, writeSettings, refresh } = {}) {
   const store = pool ?? await temporaryPool();
+  const added = [];
   const box = {
     value: settings ?? {
       searchEnabled: true,
@@ -71,6 +73,7 @@ async function panelDeps({ pool, settings, writeSettings, refresh } = {}) {
   return {
     pool: store,
     box,
+    added,
     deps: {
       pool: store,
       readSettings: () => box.value,
@@ -79,6 +82,7 @@ async function panelDeps({ pool, settings, writeSettings, refresh } = {}) {
         box.value = { ...box.value, ...patch };
       }),
       refresh: refresh ?? (async () => ({ ok: true, recovered: false })),
+      onKeysAdded: (records) => added.push(...records),
     },
   };
 }
@@ -352,6 +356,35 @@ describe('POOL-8：批量添加', () => {
     const { body } = await runPanelCommand('keys', { action: 'addBatch', text: PASTED }, deps);
 
     assert.deepEqual(body.summary, { received: 3, added: 2, duplicates: 1 });
+  });
+
+  test('USAGE-8：新加入的密钥被交给 onKeysAdded，重复的不会被交出去', async () => {
+    // 新密钥没有余额读数，因此这一趟必然为它们各问一次官方。**只交真正新增的那些**：
+    // 被跳过的重复行对应的密钥池里早就有了，再问一次纯属浪费官方配额。
+    const { deps, added } = await panelDeps();
+    await runPanelCommand('keys', { action: 'addBatch', text: PASTED }, deps);
+
+    assert.deepEqual(
+      added.map((record) => record.key),
+      ['tvly-dev-batch-one-000000000000', 'tvly-dev-batch-two-000000000000'],
+      '只交出真正新增的两把，不含被跳过的那一行',
+    );
+  });
+
+  test('USAGE-8：单把添加也交给 onKeysAdded', async () => {
+    const { deps, added } = await panelDeps();
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+
+    assert.deepEqual(added.map((record) => record.key), [SECRET]);
+  });
+
+  test('USAGE-8：重复的单把添加不触发刷新', async () => {
+    const { deps, added } = await panelDeps();
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+    added.length = 0;
+    await runPanelCommand('keys', { action: 'add', key: SECRET }, deps);
+
+    assert.deepEqual(added, [], '没有新增就没有新读数要补');
   });
 
   test('池里已有的密钥也算重复：粘贴一整份清单不会得到两把一样的密钥', async () => {

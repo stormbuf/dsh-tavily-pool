@@ -2,7 +2,7 @@
 
 **English** | [简体中文](./usage.zh-CN.md)
 
-Use [Tavily](https://tavily.com) in place of DeepSeek Harness's built-in web search and page fetching: multiple API keys, balance-aware scheduling, automatic failover, and usage stats.
+Use [Tavily](https://tavily.com) in place of DeepSeek Harness's built-in web search and page fetching: multiple API keys, balance-aware scheduling, automatic failover, and per-key call stats.
 
 ## Install
 
@@ -178,6 +178,14 @@ Key failures fall into three kinds:
 
 The **Refresh balance** button in the panel calls Tavily's `/usage` endpoint to pull the official balance.
 
+You rarely need it. Three things refresh a reading automatically:
+
+- **A key that has never been read** is read the next time the plugin is used at all — a search or a fetch checks the whole pool and fills in the keys whose balance is still unknown. That matters because an unknown balance ranks last in scheduling.
+- **The key actually being used** is re-read once its reading is over an hour old.
+- **A key you just added** is read once, right after it is stored.
+
+Keys that already have a reading — even a somewhat old one — are left alone unless they are the one being used. **Nothing runs in the background**: if you never search or fetch, the plugin never calls `/usage` on its own.
+
 Tavily rate-limits that endpoint at **10 requests / 10 minutes**, so the plugin reserves quota per key and will not trip the limit. On failure it **keeps the old value and marks it stale** rather than overwriting with 0.
 
 The plugin **does not infer the billing cycle** — balances always come from the current-cycle values returned by the official `/usage`.
@@ -195,7 +203,7 @@ A single fetch therefore usually costs **0 credits**: the five-URL counter is **
 >
 > The reason is that these rules can change upstream at any time. If Tavily adjusts a tier or the way it charges, a locally computed number would not fail — it would quietly become wrong, and you would have no way to tell.
 >
-> The only credit figure the panel and settings page ever show comes from the official `/usage` reading (limit − used, both official numbers). No local estimate is involved in it.
+> The credit figure on the card always comes from the official `/usage` reading (limit − used). No locally computed number is ever shown as a figure of its own. One caveat worth knowing: the forward advance below moves the `used` value the card displays, so what you see is the last official reading **plus** the estimated cost of the calls since — and the card also tells you how old that last official reading is. Because a key's reading is refreshed automatically the next time it is used once that reading is over an hour old, that gap stays small.
 
 ### Why an estimate still exists
 
@@ -203,9 +211,10 @@ The scheduling policy is balance-first, and `/usage` cannot be refreshed on ever
 
 So after each successful call the plugin **estimates** a cost from the two rules above, purely to nudge the cached balance forward so ordering roughly reflects reality. That estimate:
 
-- is **never displayed** to you
+- is **never shown as a figure of its own**
 - only affects scheduling order, where the worst case is that two keys swap places
-- never affects the displayed balance, which always comes from the official reading
+- **does** move the displayed balance, which is why the card also shows how old the last official reading is
+- is bounded: the reading is refreshed automatically the next time the key is used after an hour, so the estimate can only ever accumulate over that window
 
 ## Call history
 
@@ -221,7 +230,7 @@ The panel shows a **chart of daily call counts** over the last 14 days (search a
 
 **One request can produce several entries.** Key failover means each attempt is a separate real upstream call, so a search that tried two keys leaves one failed entry and one successful one. That is deliberate: those attempts were each real calls, and a request-level summary would hide them.
 
-### Rotation
+### Retention
 
 Two limits apply **at once**, and the stricter one wins:
 
@@ -276,7 +285,7 @@ There are two other plugins on the same topic; this one is positioned differentl
 | Key model | Single key / keyless | Multi-key pool | **Multi-key pool** |
 | Balance-aware scheduling | No | Yes | **Yes** |
 | Failover and cooldown | No | Yes | **Yes** |
-| Usage stats | No | Yes | **Yes** |
+| Call stats and history | No | Yes | **Yes** |
 | Fetch takeover | No | No | **Yes** |
 | Takeover method | Static config | Rewrites internal fields at runtime | **Static config** |
 

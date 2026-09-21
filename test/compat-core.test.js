@@ -40,6 +40,7 @@ const HOST_FREE_MODULES = [
   'lib/panel.js',
   'lib/history.js',
   'lib/balance.js',
+  'lib/balance-refresh.js',
 ];
 
 /** 插件源码：入口加全部 lib/ 模块（含 lib/dsh/ 适配层）。 */
@@ -203,6 +204,73 @@ describe('DOC-1：包清单完整，且发布出去的内容是完整的', () =>
         text,
         /dsh-tavily-pool#v\d/u,
         `${name} 里出现了具体的版本 tag——它会随发版静默过期，请用 #vX.Y.Z 占位符`,
+      );
+    }
+  });
+});
+
+describe('DOC-5：四份用户文档里的两处事实不许再漂移', () => {
+  /** 四份面向用户的文档；中英成对，因此每条断言都要在四处成立。 */
+  const USER_DOCS = ['README.md', 'README.zh-CN.md', 'docs/usage.md', 'docs/usage.zh-CN.md'];
+
+  test('余额上限的两级回退都写出来了，且没有「limit 为 null 即无限」的旧说法', async () => {
+    // 这两条压的是同一类真实漂移：`key.limit === null` 曾被当成「无限额度」，而免费账号的
+    // `key.limit` 恰好也是 `null`（ticket 20 修掉的误读）。README 在中英两版里都留着旧写法，
+    // 而 docs/usage 早就写对了——单侧漂移没有任何守卫盯着，于是它一直留到 2026-09-21。
+    for (const name of USER_DOCS) {
+      const text = await readFile(join(repoRoot, name), 'utf8');
+      assert.match(text, /plan_limit/u, `${name} 必须写出账号级回退 account.plan_limit`);
+      // 判据要宽到认得出实际出现过的写法。真实漂移有两种排版：`` `limit` 为 `null` → 无限 ``
+      // 与 `` `limit === null` → unlimited first ``——反引号的位置不同，因此不能把
+      // 「反引号包住整个表达式」当成前提（第一版守卫正是这么写，于是对第二种写法失效）。
+      assert.doesNotMatch(
+        text,
+        /limit[`\s]*(?:为|===|==|is)[`\s]*null[`\s]*(?:→|->|即|means)[^\n]{0,24}(?:无限|unlimited)/iu,
+        `${name} 又把 key.limit === null 写成无限了——那是 ticket 20 修掉的误读`,
+      );
+    }
+  });
+
+  test('展示口径如实：说明余额含本地前推，而不是声称纯官方', async () => {
+    // ADR-0004 的「估算从不展示」与实现不符：前推改写的正是卡片显示的那份缓存。四份文档
+    // 先前都写着「两个数字都来自官方」，那会让用户以为屏幕上的数字没有本地成分。
+    //
+    // 判据是一张**已知错误写法**的清单，而不是「必须出现某句话」：后者会随文案改动产生
+    // 假警报（本仓库在 `test/client-card.test.js` 里已经踩过这个坑）。这些短语都是历史上
+    // 真的写进过文档的，因此它们回归时这条会红。
+    const PURE_OFFICIAL_CLAIMS = [
+      /两个数字都来自官方/u,
+      /both official numbers/u,
+      /不经过任何本地估算/u,
+      /不影响余额显示/u,
+      /never affects the displayed balance/u,
+      /No local estimate is involved/u,
+      /always comes from the official reading/u,
+      /数字始终来自官方/u,
+    ];
+
+    for (const name of USER_DOCS) {
+      const text = await readFile(join(repoRoot, name), 'utf8');
+      for (const claim of PURE_OFFICIAL_CLAIMS) {
+        assert.doesNotMatch(text, claim, `${name} 又声称展示的数字不含本地估算了（命中 ${String(claim)}）`);
+      }
+    }
+  });
+
+  test('条件式刷新的两条边界都写出来了（1 小时阈值 + 闲置零调用）', async () => {
+    // `USAGE-8` 的全部价值就在这两条边界上：阈值决定它多新鲜，而「闲置零调用」是用户
+    // 明确要求的约束。文档少写任何一条，读的人都会以为它是个后台定时任务。
+    for (const name of USER_DOCS) {
+      const text = await readFile(join(repoRoot, name), 'utf8');
+      assert.match(
+        text,
+        /(?:1 小时|an hour|one hour)/u,
+        `${name} 没写出读数超龄的 1 小时阈值`,
+      );
+      assert.match(
+        text,
+        /(?:闲置|后台任务|in the background|background task|No search or fetch|不搜索)/u,
+        `${name} 没写出「闲置时零调用」这条边界`,
       );
     }
   });

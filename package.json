@@ -1,6 +1,6 @@
 {
   "name": "dsh-tavily-pool",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Tavily-backed web search and page fetching for DeepSeek Harness: multi-key pool with balance-aware scheduling, automatic failover, cooldown, and official /usage balance reporting.",
   "type": "module",
   "main": "index.js",

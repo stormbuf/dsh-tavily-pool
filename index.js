@@ -19,6 +19,7 @@
 import z from '@deepseek-ai/schemastery';
 
 import { runWithFailover } from './lib/attempts.js';
+import { BalanceRefresher } from './lib/balance-refresh.js';
 import {
   FETCH_TOTAL_BUDGET_MS,
   HISTORY_FILE_NAME,
@@ -102,6 +103,8 @@ export const Config = z.object({});
  *   它描述的是**此刻仍然成立**的结论：一次成功的回落会清掉它（那是官方反过来接受了
  *   这把凭据的直接证据），`MISSING` 档同样不留痕。
  * @property {boolean|undefined} panelRegistered - 面板 HTTP 接口是否已注册。
+ * @property {BalanceRefresher|undefined} balanceRefresh - 条件式余额刷新（`USAGE-8`）：
+ *   某把密钥真的被用到、而它的读数已超龄时，在后台顺手问一次官方。
  * @property {{search?: {budgetMs: number, source: string, hostSource: string}, fetch?: {budgetMs: number, source: string, hostSource: string}}|undefined}
  *   hostBudget - 最近一次为每条路径定下的总预算与它的来源（`host-contract-2`）：`source`
  *   为 `'host'` 表示取自宿主绑定的 tool `timeoutMs`，`'constant'` 表示退回本插件的常量。
@@ -131,6 +134,7 @@ export function apply(ctx, _config) {
     reportedFetchFallbackReason: undefined,
     lastFallbackFailure: undefined,
     panelRegistered: undefined,
+    balanceRefresh: undefined,
     reportedCapabilities: undefined,
     hostBudget: undefined,
   };
@@ -201,6 +205,12 @@ export function apply(ctx, _config) {
     });
     // 调用历史（`14`）。它读盘失败、写盘失败都只上报：历史是记录，不是正确性前提。
     state.history = new CallHistory({ dir: resolveStateDir(state.host), fileName: HISTORY_FILE_NAME });
+    // 条件式余额刷新（`USAGE-8`）：只在密钥真的被用到（或刚被加入）时触发，闲置零调用。
+    // 刷新器与判据都是现成的，这一层只负责去重与「绝不拖慢调用方」。
+    state.balanceRefresh = new BalanceRefresher({
+      pool: state.pool,
+      refresh: (id, key, options) => state.usageRefresher.refresh(id, key, options),
+    });
   } catch (error) {
     state.initError = error;
     report(ctx, 'warn', `dsh-tavily-pool: initialization failed, continuing with search registered: ${String(error)}`);
@@ -387,16 +397,27 @@ async function search(state, request, signal) {
       // 值得问一次官方（`SCHED-10`）。
       probeQuota: () => probeQuotaForReset(state, signal),
       onAttempt: (attempt) => recordCall(state, 'search', attempt),
-      invoke: ({ key }) => searchTavily({
-        apiKey: key,
-        query: request.query,
-        // 用户配置与调用方请求取较小者：两者都是真实的上界，见 `effectiveMaxResults`。
-        maxResults: effectiveMaxResults(settings.maxResults, request.maxResults),
-        params: searchParamsOf(settings),
-        signal,
-        fetchImpl: globalThis.fetch,
-        timeoutMs: attemptTimeoutMs(deadlineMs),
-      }),
+      invoke: ({ id, key }) => {
+        // 顺手看一眼这把密钥的读数是否超龄（`USAGE-8`）。**在发请求之前**触发、但**不等
+        // 它**：本次仍用当前值排序，刷新结果供下一次调度使用。放在这里而不是 `select()`
+        // 里，是因为只有这一层知道「这把密钥真的要被用了」——而 `USAGE-8` 要的正是
+        // 「只在插件被使用时才问」。
+        state.balanceRefresh?.refreshIfStale({ id, key }, { reason: 'used' });
+        // 顺带把池里**从来没有过余额读数**的密钥补齐：它们在调度里按「未知」垫底
+        // （`SCHED-2`），补一次就能参与正常排序。只补这一种——读数只是偏旧的密钥不在此列，
+        // 那由上面那条针对**被选中**密钥的规则处理。
+        state.balanceRefresh?.sweepUnread(state.pool.keysInOrder(), { reason: 'used' });
+        return searchTavily({
+          apiKey: key,
+          query: request.query,
+          // 用户配置与调用方请求取较小者：两者都是真实的上界，见 `effectiveMaxResults`。
+          maxResults: effectiveMaxResults(settings.maxResults, request.maxResults),
+          params: searchParamsOf(settings),
+          signal,
+          fetchImpl: globalThis.fetch,
+          timeoutMs: attemptTimeoutMs(deadlineMs),
+        });
+      },
     }));
   } catch (error) {
     // 池内没有任何可能在本次请求内恢复的候选，且**没有**真实的上游失败可透穿：这正是
@@ -490,17 +511,25 @@ async function fetchUrl(state, request, signal) {
       // 算出这次该记多少积分（`USAGE-6` 的「每 5 个成功 URL」是跨请求累计的）。
       extractDepth: settings.fetchDepth,
       onAttempt: (attempt) => recordCall(state, 'extract', attempt),
-      invoke: ({ key }) => extractTavily({
-        apiKey: key,
-        url: request.url,
-        // `WebFetchRequest` 只有 `url`，因此这两个值只能来自设置——模型无法按次控制
-        // `extract_depth`，而它直接决定计费档位（`FETCH-1`、`USAGE-6`）。
-        depth: settings.fetchDepth,
-        format: settings.fetchFormat,
-        signal,
-        fetchImpl: globalThis.fetch,
-        timeoutMs: attemptTimeoutMs(deadlineMs),
-      }),
+      invoke: ({ id, key }) => {
+        // 与搜索路径逐字同一条规则（`USAGE-8`）：抓取也是一次真实使用，因此也顺手看一眼
+        // 这把密钥的读数是否超龄。两条路径各自触发而不是共用一个「每 N 分钟扫一遍池子」
+        // 的后台任务——后者会在插件闲置时凭空发请求，而 `USAGE-8` 明确不要那种行为。
+        state.balanceRefresh?.refreshIfStale({ id, key }, { reason: 'used' });
+        // 与搜索路径同一条规则：顺带补齐池里从未读到过余额的密钥（`USAGE-8`）。
+        state.balanceRefresh?.sweepUnread(state.pool.keysInOrder(), { reason: 'used' });
+        return extractTavily({
+          apiKey: key,
+          url: request.url,
+          // `WebFetchRequest` 只有 `url`，因此这两个值只能来自设置——模型无法按次控制
+          // `extract_depth`，而它直接决定计费档位（`FETCH-1`、`USAGE-6`）。
+          depth: settings.fetchDepth,
+          format: settings.fetchFormat,
+          signal,
+          fetchImpl: globalThis.fetch,
+          timeoutMs: attemptTimeoutMs(deadlineMs),
+        });
+      },
     });
   } catch (error) {
     if (error?.blocked === 'all-unusable' || error?.blocked === 'no-keys') {
