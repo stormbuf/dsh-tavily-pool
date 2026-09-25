@@ -12,7 +12,8 @@ import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
 import { apply, inject, name } from '../index.js';
-import { KEYS_FILE_NAME, PROVIDER_ID, SETTINGS_NAMESPACE, STATE_DIR_NAME } from '../lib/constants.js';
+import { KEYS_FILE_NAME, PLUGIN_ID, PROVIDER_ID, STATE_DIR_NAME } from '../lib/constants.js';
+import { strictSettings, writeSetting } from './settings-stub.mjs';
 import { MissingHostCapabilityError } from '../lib/dsh/register.js';
 import { officialFetchProvider, setOfficialFetchProvider } from '../lib/dsh/fallback.js';
 import { maskKey } from '../lib/pool.js';
@@ -45,7 +46,9 @@ function fakeHost({ harnessHome, omitRegistration = false, omitFetchRegistration
   const registered = [];
   const registeredFetch = [];
   const warnings = [];
-  const values = { ...settings };
+  // 设置就是本插件那条 loader 行的配置（0.1.7 起没有「命名空间」这回事），因此用例给的
+  // 直接是一份配置对象，由桩件按 schema 补齐默认值并交回 volatile 访问器形状。
+  const settingsStub = strictSettings(settings);
   let registerCalls = 0;
 
   const services = {
@@ -62,18 +65,9 @@ function fakeHost({ harnessHome, omitRegistration = false, omitFetchRegistration
         return () => undefined;
       },
     },
-    // 形状照抄真实的 settings 服务：`get(ns)` 读一个已注册命名空间的解析值，
-    // `register(ns, schema)` 返回该命名空间所有者用的句柄。少了服务上的 `get`，
-    // 插件会静默退回默认值——那正是这些测试要防的失败，不能让它出现在测试替身里。
-    settings: {
-      get: (namespace) => values[namespace],
-      register: () => ({
-        get: () => values[SETTINGS_NAMESPACE],
-        set: (next) => {
-          values[SETTINGS_NAMESPACE] = next;
-        },
-      }),
-    },
+    // 形状照抄 DSH 0.1.7 的 settings 服务（`describe()` / `update()`），并由共享桩件提供：
+    // 它拿**同一份** `settingsSchema()` 校验，且把 volatile 访问器那条活链路也复刻了。
+    settings: settingsStub.service,
     // 宿主的工具注册表（`host-contract-2`）。默认**不提供**：真实宿主里它由
     // `dsh-tools` 提供，而本替身此前完全没有它——那正是「总预算从不读宿主绑定值」
     // 这条缺陷在单测里没有判据的原因之一。要检验读取，就显式传一个进来。
@@ -135,10 +129,12 @@ function fakeHost({ harnessHome, omitRegistration = false, omitFetchRegistration
     settleInjections: () => new Promise((resolve) => {
       setTimeout(resolve, 0);
     }),
-    /** 改一个设置值，供「改动即时生效」的检验使用。 */
+    /** 改一个设置值，供「改动即时生效」的检验使用——写的是宿主那份访问器。 */
     setSettings: (next) => {
-      values[SETTINGS_NAMESPACE] = { ...values[SETTINGS_NAMESPACE], ...next };
+      for (const [key, value] of Object.entries(next)) writeSetting(settingsStub.config, key, value);
     },
+    /** 这份宿主替身交给 `apply()` 的条目配置。 */
+    config: settingsStub.config,
   };
 }
 
@@ -168,7 +164,7 @@ describe('插件形状', () => {
 describe('PIN-5 / 硬约束 5：注册发生在最前', () => {
   test('提供方以 profile patch pin 住的 id 注册', () => {
     const host = fakeHost();
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     assert.equal(host.registered.length, 1);
     assert.equal(host.registered[0].id, PROVIDER_ID);
@@ -187,7 +183,7 @@ describe('PIN-5 / 硬约束 5：注册发生在最前', () => {
     process.env.HOME = '';
 
     try {
-      apply(host.ctx, {});
+      apply(host.ctx, host.config);
     } finally {
       process.env.HOME = previousHome;
     }
@@ -216,7 +212,7 @@ describe('PIN-5 / 硬约束 5：注册发生在最前', () => {
     };
 
     assert.doesNotThrow(() => {
-      apply(host.ctx, {});
+      apply(host.ctx, host.config);
     });
     assert.equal(host.registered.length, 1);
 
@@ -236,7 +232,7 @@ describe('PIN-5 / 硬约束 5：注册发生在最前', () => {
     const host = fakeHost();
     // 移除一项可选能力：探测仍须成功，而该发现必须进入日志，而不是被静默吞掉。
     delete host.ctx.services.dshHomePath;
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     assert.equal(host.registered.length, 1, '退化的宿主不得阻止注册');
     // 探测刻意推迟一轮宏任务：`settings` / `connection` / `credentials` 三项只能经
@@ -256,7 +252,7 @@ describe('COMPAT-2：seam 变形会在加载期响亮地失败', () => {
     const host = fakeHost({ omitRegistration: true });
     const error = (() => {
       try {
-        apply(host.ctx, {});
+        apply(host.ctx, host.config);
         return undefined;
       } catch (thrown) {
         return thrown;
@@ -272,14 +268,14 @@ describe('COMPAT-2：seam 变形会在加载期响亮地失败', () => {
 describe('PIN-2 / 硬约束 1：available() 恒为 true', () => {
   test('一把密钥都没有的提供方仍然自称可用', () => {
     const host = fakeHost({ harnessHome: '/nonexistent-home' });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
     assert.equal(host.registered[0].available(), true);
   });
 
   test('密钥池文件损坏的提供方仍然自称可用', async () => {
     const home = await temporaryHarnessHome('not json at all');
     const host = fakeHost({ harnessHome: home });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     await host.registered[0].search({ query: 'anything' }).catch(() => undefined);
     assert.equal(
@@ -293,7 +289,7 @@ describe('PIN-2 / 硬约束 1：available() 恒为 true', () => {
 describe('PIN-3 / SCHED-5：没有可用候选时回落到官方提供方', () => {
   test('空池回落，且错误同时说清起点与回落目标', async () => {
     const host = fakeHost({ harnessHome: await temporaryHarnessHome() });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     const error = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
 
@@ -307,7 +303,7 @@ describe('PIN-3 / SCHED-5：没有可用候选时回落到官方提供方', () =
 
   test('损坏的密钥池文件回落，但仍按路径把文件问题说出来', async () => {
     const host = fakeHost({ harnessHome: await temporaryHarnessHome('not json at all') });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     const error = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
 
@@ -327,7 +323,7 @@ describe('PIN-3 / SCHED-5：没有可用候选时回落到官方提供方', () =
     // 用上官方搜索——面板上两个开关都开着、搜索也正常工作，没有任何迹象说明 Tavily 根本
     // 没被用上。
     const host = fakeHost({ harnessHome: await temporaryHarnessHome() });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     const original = globalThis.fetch;
     // 一份官方提供方会当作成功的最小 Messages 响应：它要求响应里有
@@ -339,10 +335,11 @@ describe('PIN-3 / SCHED-5：没有可用候选时回落到官方提供方', () =
       }],
     }), { status: 200 });
     try {
-      // 给官方提供方一份字面凭据，让它走到「成功」而不是「凭据缺失」。
-      host.ctx.services.settings.get = (namespace) => (namespace === 'web-search-deepseek'
-        ? { apiKey: 'sk-literal' }
-        : { searchEnabled: true });
+      // 给官方提供方一份字面凭据，让它走到「成功」而不是「凭据缺失」。0.1.7 起读别人的
+      // 条目配置走 `describe()`，因此这里替换的是它，而不是已经不存在了的 `get(ns)`。
+      host.ctx.services.settings.describe = () => [
+        { ns: 'web-search-deepseek', value: { apiKey: 'sk-literal' } },
+      ];
       const before = host.warnings.length;
       let served = 0;
       for (let index = 0; index < 3; index += 1) {
@@ -361,7 +358,7 @@ describe('PIN-3 / SCHED-5：没有可用候选时回落到官方提供方', () =
 
   test('坏文件是个持续状态：连搜三次只报告一次，不刷屏', async () => {
     const host = fakeHost({ harnessHome: await temporaryHarnessHome('not json at all') });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
     const before = host.warnings.length;
 
     for (let index = 0; index < 3; index += 1) {
@@ -387,7 +384,7 @@ describe('PIN-3 / SCHED-5：没有可用候选时回落到官方提供方', () =
     // 的那条路径。
     const home = await temporaryHarnessHome('not json at all');
     const host = fakeHost({ harnessHome: home });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     await host.registered[0].search({ query: 'q' }).catch(() => undefined);
     assert.equal(host.warnings.filter((message) => /key pool at/u.test(message)).length, 1);
@@ -408,7 +405,7 @@ describe('PIN-3 / SCHED-5：没有可用候选时回落到官方提供方', () =
     // 才能恢复——用户没有任何线索知道要这么做。
     const home = await temporaryHarnessHome('not json at all');
     const host = fakeHost({ harnessHome: home });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     const first = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
     assert.equal(first.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING', '先是回落');
@@ -510,7 +507,7 @@ function callsTo(calls, endpoint) {
  * @returns 可以直接交给 `hostWithKeys` 的 `settings` 值。
  */
 function fetchOn(extra = {}) {
-  return { [SETTINGS_NAMESPACE]: { fetchEnabled: true, ...extra } };
+  return { fetchEnabled: true, ...extra };
 }
 
 /**
@@ -523,7 +520,7 @@ function fetchOn(extra = {}) {
 async function hostWithKeys(keys, options = {}) {
   const home = await temporaryHarnessHome('{"version":1,"keys":[],"order":[],"stats":{},"usageCache":{}}');
   const host = fakeHost({ harnessHome: home, settings: options.settings, tools: options.tools });
-  apply(host.ctx, {});
+  apply(host.ctx, host.config);
 
   // 先经真实的加载路径读入空池，再经存储自身的编辑接口添加密钥——与面板将来做的
   // 是同一件事，因此这里检验的是真实的往返，而不是一份手工写出的文件。
@@ -546,7 +543,7 @@ describe('POOL-1：密钥池落在用户级 harness 目录，而不是 profile �
       order: ['a'], stats: {}, usageCache: {},
     }));
     const host = fakeHost({ harnessHome: home });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     await withStubbedFetch(
       () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
@@ -612,7 +609,7 @@ describe('调度与故障切换经入口真实生效', () => {
       usageCache: {},
     }));
     const host = fakeHost({ harnessHome: home });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     const startedAt = Date.now();
     const error = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
@@ -633,7 +630,7 @@ describe('调度与故障切换经入口真实生效', () => {
       usageCache: {},
     }));
     const host = fakeHost({ harnessHome: home });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     const startedAt = Date.now();
     const error = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
@@ -652,7 +649,7 @@ describe('调度与故障切换经入口真实生效', () => {
       usageCache: {},
     }));
     const host = fakeHost({ harnessHome: home });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     const error = await host.registered[0].search({ query: 'q' }).catch((thrown) => thrown);
     assert.equal(error.code, 'TAVILY_FALLBACK_CREDENTIAL_MISSING');
@@ -660,7 +657,7 @@ describe('调度与故障切换经入口真实生效', () => {
   });
 
   test('关闭搜索开关时不再向 Tavily 发请求', async () => {
-    const host = await hostWithKeys([{ label: 'only' }], { settings: { [SETTINGS_NAMESPACE]: {} } });
+    const host = await hostWithKeys([{ label: 'only' }], { settings: {} });
     host.setSettings({ searchEnabled: false });
 
     let requests = 0;
@@ -679,7 +676,7 @@ describe('调度与故障切换经入口真实生效', () => {
   });
 
   test('开关改动即时生效，无需重新注册提供方', async () => {
-    const host = await hostWithKeys([{ label: 'only' }], { settings: { [SETTINGS_NAMESPACE]: {} } });
+    const host = await hostWithKeys([{ label: 'only' }], { settings: {} });
     const provider = host.registered[0];
 
     host.setSettings({ searchEnabled: false });
@@ -711,7 +708,7 @@ describe('调度与故障切换经入口真实生效', () => {
 
     try {
       const host = fakeHost({ harnessHome: home });
-      apply(host.ctx, {});
+      apply(host.ctx, host.config);
       const before = host.warnings.length;
 
       const { result } = await withStubbedFetch(
@@ -742,7 +739,7 @@ describe('调度与故障切换经入口真实生效', () => {
 
 describe('CFG-3：搜索参数经设置生效，且改动无需重启', () => {
   test('默认参数被送进请求体', async () => {
-    const host = await hostWithKeys([{ label: 'only' }], { settings: { [SETTINGS_NAMESPACE]: {} } });
+    const host = await hostWithKeys([{ label: 'only' }], { settings: {} });
 
     const { result } = await withStubbedFetch(
       () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } }),
@@ -757,7 +754,7 @@ describe('CFG-3：搜索参数经设置生效，且改动无需重启', () => {
   });
 
   test('改 searchDepth 之后下一次搜索立即生效', async () => {
-    const host = await hostWithKeys([{ label: 'only' }], { settings: { [SETTINGS_NAMESPACE]: {} } });
+    const host = await hostWithKeys([{ label: 'only' }], { settings: {} });
     const provider = host.registered[0];
     const respond = () => ({ status: 200, body: { results: [{ url: 'https://ok.example' }] } });
 
@@ -776,7 +773,7 @@ describe('CFG-3：搜索参数经设置生效，且改动无需重启', () => {
 
   test('调用方的 maxResults 更小时听调用方的', async () => {
     const host = await hostWithKeys([{ label: 'only' }], {
-      settings: { [SETTINGS_NAMESPACE]: { maxResults: 20 } },
+      settings: { maxResults: 20 },
     });
 
     const { result } = await withStubbedFetch(
@@ -789,7 +786,7 @@ describe('CFG-3：搜索参数经设置生效，且改动无需重启', () => {
 
   test('include_answer 为真时响应里的 answer 成为结果的 content', async () => {
     const host = await hostWithKeys([{ label: 'only' }], {
-      settings: { [SETTINGS_NAMESPACE]: { includeAnswer: true } },
+      settings: { includeAnswer: true },
     });
 
     const { result } = await withStubbedFetch(
@@ -831,7 +828,7 @@ describe('SCHED-10：跨月起始后自动探测并恢复', () => {
     Date.now = () => Date.parse(nowIso);
     try {
       const host = fakeHost({ harnessHome: home });
-      apply(host.ctx, {});
+      apply(host.ctx, host.config);
       return await run(host);
     } finally {
       Date.now = realNow;
@@ -892,7 +889,7 @@ describe('SCHED-10：跨月起始后自动探测并恢复', () => {
     try {
       Date.now = () => Date.parse('2026-04-01T00:00:30Z');
       const host = fakeHost({ harnessHome: home });
-      apply(host.ctx, {});
+      apply(host.ctx, host.config);
       await withStubbedFetch(respond, () => host.registered[0].search({ query: 'q' }).catch(() => undefined));
 
       // 同一个探测窗口内再搜三次：一次都不该再问官方。
@@ -958,7 +955,7 @@ describe('USAGE-5：搜索成功后按**估算**前推余额', () => {
 
   test('advanced 搜索前推 2：深度取自设置，且改动即时生效', async () => {
     const host = await hostWithKeys([{ label: 'only' }], {
-      settings: { [SETTINGS_NAMESPACE]: { searchDepth: 'advanced' } },
+      settings: { searchDepth: 'advanced' },
     });
 
     const { PoolStore } = await import('../lib/pool.js');
@@ -1092,7 +1089,7 @@ describe('10：抓取接管经入口真实生效', () => {
 
   test('CFG-2：抓取开关独立于搜索开关——关掉抓取不影响搜索', async () => {
     const host = await hostWithKeys([{ label: 'only' }], {
-      settings: { [SETTINGS_NAMESPACE]: { fetchEnabled: false } },
+      settings: { fetchEnabled: false },
     });
 
     // 回落目标换成记录调用的桩件：这里要观察的是「请求交给了**谁**」，而真实官方实例
@@ -1161,7 +1158,7 @@ describe('10：抓取接管经入口真实生效', () => {
 
   test('宿主没有 registerFetchProvider 时只丢抓取，搜索照常注册', () => {
     const host = fakeHost({ omitFetchRegistration: true });
-    apply(host.ctx, {});
+    apply(host.ctx, host.config);
 
     assert.equal(host.registeredFetch.length, 0);
     assert.equal(host.registered.length, 1, 'PIN-5：抓取的注册失败不得把搜索一起拖下水');

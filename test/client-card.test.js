@@ -32,7 +32,8 @@ import {
   EXTRACT_DEPTH_VALUES,
   EXTRACT_FORMAT_VALUES,
   EXTRACT_URLS_PER_CREDIT_TIER,
-  SETTINGS_NAMESPACE,
+  PACKAGE_NAME,
+  PLUGIN_ID,
   USAGE_QUOTA_MAX_CALLS,
   USAGE_QUOTA_WINDOW_MS,
 } from '../lib/constants.js';
@@ -259,7 +260,7 @@ function mountCard(exports) {
     },
     slots: {
       inject: (name, register) => {
-        assert.equal(name, 'settings.plugin.item');
+        assert.equal(name, 'plugins.row.config');
         register();
         return () => undefined;
       },
@@ -524,27 +525,31 @@ function cssSelectors(source) {
     .filter((selector) => selector.length > 0);
 }
 
-describe('PANEL-1：卡片注册进 settings.plugin.item', () => {
-  test('slot 名、key、locale 三者配对，key 与 settings 命名空间逐字相同', async () => {
+describe('PANEL-1：卡片注册进 plugins.row.config', () => {
+  test('slot 名、key、locale 三者配对', async () => {
     const { inject, options } = await mountedCard();
 
     // 展开成调用方这一侧的数组再比：工厂是在 `vm` 里创建的，它返回的数组带的是那个
     // realm 的原型，`deepStrictEqual` 会因此判不等——那是 realm 的差异，不是内容的差异。
     assert.deepEqual([...inject], ['slots', 'locale']);
-    assert.equal(options.name, 'settings.plugin.item');
+    assert.equal(
+      options.name,
+      'plugins.row.config',
+      '0.1.7 起插件配置页挂在 Plugins 页的行详情上；注册到不存在的 slot 不会报错，卡片只是永不渲染',
+    );
     assert.equal(
       options.key,
-      SETTINGS_NAMESPACE,
-      'key 与命名空间不一致时卡片根本不会被派发，而且没有任何报错',
+      `${PACKAGE_NAME}#${PLUGIN_ID}`,
+      'key 是 <包名>#<行 id>；不一致时卡片不会被派发，而且没有任何报错',
     );
-    assert.equal(options.locale, SETTINGS_NAMESPACE, '文案命名空间与设置命名空间同源');
+    assert.equal(options.locale, PACKAGE_NAME, 'locale 仍是本插件的词表命名空间');
   });
 
   test('注册的是中英两套词表（PANEL-5）', async () => {
     const { dictionaries } = await mountedCard();
 
     assert.equal(dictionaries.length, 1);
-    assert.equal(dictionaries[0].ns, SETTINGS_NAMESPACE);
+    assert.equal(dictionaries[0].ns, PACKAGE_NAME);
     assert.deepEqual(Object.keys(dictionaries[0].dictionary).sort(), ['en', 'zh']);
   });
 

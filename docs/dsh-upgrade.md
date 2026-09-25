@@ -6,10 +6,10 @@ DeepSeek Harness is in preview, so its plugin interfaces change between releases
 plugin is built around one idea: **all host-specific knowledge lives in `lib/dsh/`**, so a
 breaking change costs one directory, not the whole codebase.
 
-| Tested against | `@deepseek-ai/dsh-*` `0.1.5-rc.2`, `@deepseek-ai/cordis` `4.0.2` |
+| Tested against | `@deepseek-ai/dsh-*` `0.1.7-rc.2`, `@deepseek-ai/cordis` `4.0.4` |
 |---|---|
 | Depends on | the packages listed in `package.json` → `peerDependencies` |
-| Declared range | deliberately **narrow** — see [Version range](#version-range) |
+| Declared range | **lower bound only** for the host packages — see [Version range](#version-range) |
 
 If an upgrade breaks something, read the failure first: the plugin **probes the host at
 load time** and reports *which* capability is missing, by name, instead of failing on the
@@ -117,10 +117,11 @@ the direct form again.
 | `ctx.inject([all three], cb)` | object | object | object | object | object | function |
 
 Three services this plugin needs — `settings`, `connection`, `credentials` — are **not** in
-a plain fiber's scope, so `ctx.get` silently returned `undefined` for them: the settings
-namespace was never registered and no panel route was ever mounted. They must be obtained
-through `ctx.inject([name], callback)`, which hands the callback a child fiber where the
-service is visible (`lib/dsh/host-services.js`).
+a plain fiber's scope, so `ctx.get` silently returned `undefined` for them: under the old
+model that meant the settings namespace was never registered and no panel route was ever
+mounted; under 0.1.7 the same blindness means every panel write reports "the host has no
+settings service". They must be obtained through `ctx.inject([name], callback)`, which hands
+the callback a child fiber where the service is visible (`lib/dsh/host-services.js`).
 
 Do **not** add them to the plugin's own `inject` list instead: that list is all-or-nothing
 (Cordis loads the plugin only while every declared service is available), so a host missing
@@ -216,20 +217,35 @@ agent at request time, and guessing one would read another agent's budget. The r
 reported as `host` / `unbound` / `unavailable`, so "we fell back to the constant" is observable
 rather than silent.
 
-### 7. Settings registration
+### 7. Settings model
 
-**Where:** `dsh-settings` — `register(ns, schema, options)` on the service, and `get(ns)` on
-the service for reading a registered namespace back.
-**Then edit:** `lib/dsh/settings.js`
+**Where:** `dsh-settings` (the `settings` service), `dsh-app-boot` (`evaluatePluginCompatibility`),
+and the entry-config resolution in `@deepseek-ai/cordis`.
+**Then edit:** `index.js` (the `Config` export), `lib/dsh/settings.js`, `lib/settings.js`
 
-Confirm both halves of the shape: `register` returns an owner scope, and the **service**
-carries `get(ns)`. Reading through the scope returned by `register` looks equivalent but is
-not — a service without `get` is one more host shape to notice, and the plugin reads through
-the service so that a re-registration failure does not also break reading.
+DSH 0.1.7 replaced the whole model. Settings are **the plugin's own loader row config**, not a
+namespace the plugin registers:
 
-Confirm too that duplicate namespace registration still throws. The plugin must **not**
-re-register `web-search-deepseek`: that namespace belongs to the official plugin, which
-must stay enabled, and re-registering it throws.
+- the entry module exports `Config` (a schemastery schema) and `apply(ctx, config)` receives the
+  resolved config. There is no `ctx.settings.register(ns, schema)` and no `get(ns)` any more;
+- **only `.volatile()` fields get a form.** `volatileForm()` in `dsh-settings` recurses the root
+  schema's `dict` and keeps volatile children; an entry where none is volatile does not appear in
+  `describe()` at all — no settings page, no error;
+- a volatile field resolves to a **live accessor** (`{ get(), [volatile.write]() }`), not a plain
+  value. Read it with `config.x.get()` (the official packages do exactly this). The accessor is
+  what makes `applies: 'live'` work: a panel write lands on the same accessor, so the next read
+  sees it **without reloading the plugin**. `lib/dsh/settings.js` flattens these into a plain
+  object for the host-free `lib/settings.js`;
+- entry identity is the **profile entry id** (`entry.options.id`), i.e. the `name` export and the
+  `id` in `cordis.patch.yml`. `ctx.settings.update(entryId, patch, expectedRevision?)` writes to
+  the profile patch; `ctx.settings.update` is the only member the panel needs;
+- reading **another** entry's config (the fallback path reads the official
+  `web-search-deepseek`) goes through `ctx.settings.describe()`, which returns each configurable
+  entry's resolved value under `ns`. It is unredacted unless `redactSecrets` is requested, and it
+  walks every entry — call it on the fallback path, not per search.
+
+`test/settings-stub.mjs` reproduces both the schema validation (same `settingsSchema()`) and the
+volatile-accessor liveness, so the unit tests exercise the real shape rather than a plain object.
 
 ### 8. Manifest fields
 
@@ -249,26 +265,48 @@ The seed module table lists exactly which specifiers a zero-build bundle may `re
 an entry the panel uses was removed, the card fails to load. This card uses three: `react`,
 `react-dom` (the batch-add dialog mounts through its `createPortal`) and
 `@deepseek-ai/dsh-client-ui-primitives` (`Switch` / `Tag` / `IconChevronDownOutline14`).
-The slot contract is
-`dsh-client-ui-settings-plugins/lib/types/client/slot-contract.d.ts`; the card must register
-with the **`key`** field (the settings namespace), never `id` or `order`.
+
+The **mount point** is the other half. 0.1.7 moved plugin configuration to the sidebar Plugins
+page: the card registers into `plugins.row.config`, keyed by **`<package name>#<row id>`**
+(`dsh-tavily-pool#tavily-pool`) — the old `settings.plugin.item` keyed by settings namespace is
+gone from the host. The owning contract is
+`dsh-client-ui-plugin-manager/lib/types/client/slot-contract.d.ts`. Registering into a slot the
+host does not declare **does not error**; the card simply never renders, which is why the slot
+name and key are asserted in `test/client-card.test.js`.
+
+The entry receives `PluginConfigViewProps` (`view: 'summary' | 'page'`, plus an optional
+`form` carrying the host-owned config snapshot and `mutate`). This card renders itself for
+`page` and a one-liner for `summary`, and keeps writing settings through its own panel route
+(`ctx.settings.update`) rather than through `form.mutate`.
 
 ## Version range
 
-`package.json` → `peerDependencies` uses an intentionally narrow range:
-`>=0.1.5-rc.2 <0.1.6` for the host packages, `>=4.0.2 <5` for Cordis.
+`package.json` declares the host packages with a **lower bound only**
+(`>=0.1.5-rc.2`), while Cordis keeps a major upper bound (`>=4.0.2 <5`).
 
-The preview period argues for **failing loudly on an untested version rather than
-declaring compatibility that was never checked.** When you verify a new release, widen the
-range to include it and update the README's tested-version line — that line and this table
-are the same promise, so change both together.
+The upper bound was dropped in `0.3.1`. DSH 0.1.7 introduced a hard gate —
+`evaluatePluginCompatibility()` in `@deepseek-ai/dsh-app-boot` — that checks every
+`@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` peer against the running version and, on a
+mismatch, **skips the whole bundle** before any of its code loads. Under the old `<0.1.6`
+bound every DSH release past `0.1.6` silently dropped the plugin: no providers registered,
+no provider pin, no settings card. A stale upper bound is therefore worse than no upper
+bound — it turns "may need re-adaptation" into "quietly gone".
 
-Two things to remember when widening:
+The discipline it replaces still holds one layer lower: the plugin keeps probing host
+capabilities at load time and names the missing one, so an incompatible release fails
+loudly at the first thing that actually breaks instead of refusing to mount at all.
+`engines.dsh` carries the same lower bound declaratively; no DSH reader enforces it today.
+
+Two things to remember:
 
 - A prerelease is only matched by a range that names it. `^0.1.5` does **not** match
-  `0.1.5-rc.2`; write `>=0.1.5-rc.2 <0.1.6` or name the prerelease explicitly.
+  `0.1.5-rc.2`; write `>=0.1.5-rc.2`.
 - `pnpm` (which `dsh plugin add` forwards to) does not auto-install peers. Peer ranges here
   are documentation and a warning source, not an install mechanism.
+
+Verifying a new release no longer requires touching the range at all: update the README's
+tested-version line and the table above — those two are the same promise and must change
+together. Raise the lower bound only when you deliberately stop supporting older releases.
 
 ## After upgrading
 

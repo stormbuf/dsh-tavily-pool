@@ -19,9 +19,14 @@ import {
   searchParamsOf,
 } from '../lib/settings.js';
 
-/** 从一个裸值读出设置。 */
+/**
+ * 从一个裸值读出设置。
+ *
+ * DSH 0.1.7 起设置就是 loader 解析后的条目配置，因此这里直接递那个对象——旧模型里
+ * 「服务 + 命名空间」的两段式已经不存在。
+ */
 function read(raw) {
-  return readSettings({ get: () => raw });
+  return readSettings(raw);
 }
 
 describe('CFG-3：搜索参数可配置', () => {

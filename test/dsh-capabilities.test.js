@@ -48,7 +48,7 @@ function completeHost() {
   return {
     ctx: fakeContext({
       web: { registerSearchProvider() {}, registerFetchProvider() {} },
-      settings: { register() {} },
+      settings: { update() {} },
       clientModules: {},
       dshHomePath: (...segments) => join('/home/.dsh', ...segments),
       connection: { fetch: { register() {} } },
@@ -71,8 +71,17 @@ describe('COMPAT-2：探测会点名缺了什么', () => {
     const host = completeHost();
     delete host.ctx.services.settings;
     const report = probeCapabilities(host);
-    assert.equal(report.ok, false);
-    assert.deepEqual(report.missingRequired, ['settings.register']);
+    // 0.1.7 起 settings 是**可选**能力：设置就是本插件那条 loader 行的配置，读它不需要任何
+    // 服务，只有面板的写入要用 `update`。因此它缺席不该让探测失败，但仍必须被点名。
+    assert.equal(report.ok, true, 'settings 缺席只该让面板的写入退化');
+    assert.deepEqual(report.missingOptional, ['settings.update']);
+
+    // 必需能力缺席仍然是硬的：一项都不能少。
+    const brokenHost = completeHost();
+    delete brokenHost.ctx.services.clientModules;
+    const broken = probeCapabilities(brokenHost);
+    assert.equal(broken.ok, false);
+    assert.deepEqual(broken.missingRequired, ['clientModules']);
   });
 
   test('seam 变形后会被按名字报告为缺失', () => {
@@ -91,7 +100,6 @@ describe('COMPAT-2：探测会点名缺了什么', () => {
       const host = completeHost();
       if (id === 'ctx.reflectiveRead') delete host.ctx.get;
       if (id === 'web.registerSearchProvider') delete host.ctx.services.web.registerSearchProvider;
-      if (id === 'settings.register') delete host.ctx.services.settings;
       if (id === 'clientModules') delete host.ctx.services.clientModules;
       const report = probeCapabilities(host);
       assert.equal(report.ok, false, `移除 ${id} 应当使探测失败`);

@@ -18,15 +18,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
-import { Context } from '@deepseek-ai/cordis';
-import { SettingsProvider } from '@deepseek-ai/dsh-settings';
-import schemaBuilder from '@deepseek-ai/schemastery';
 
 import { apply } from '../index.js';
-import { KEYS_FILE_NAME, SETTINGS_NAMESPACE, STATE_DIR_NAME } from '../lib/constants.js';
+import { KEYS_FILE_NAME, STATE_DIR_NAME } from '../lib/constants.js';
 import { bindHostServices, hostView, INJECTED_SERVICES } from '../lib/dsh/host-services.js';
-import { readPluginSettings } from '../lib/dsh/settings.js';
-import { settingsSchema } from '../lib/settings.js';
+import { strictSettings } from './settings-stub.mjs';
 
 /**
  * 需要经 `inject` 才能看见的服务——实测结论，与 `INJECTED_SERVICES` 同源。
@@ -35,29 +31,6 @@ import { settingsSchema } from '../lib/settings.js';
  * inject」的用例会跟着一起失去判据。
  */
 const ISOLATED_SERVICES = Object.freeze(['settings', 'connection', 'credentials']);
-
-/**
- * 一个内存后端的真实 settings provider（与 `dsh-settings.test.js` 同一手法）。
- *
- * **刻意不预注册命名空间**：本文件的每一条用例都走 `apply()`，而命名空间正是要靠插件自己
- * 注册上去的那个东西。预注册会让「插件到底有没有注册」这件事无从判断——重名注册会抛错，
- * 而抛错又被插件收成一条告警，于是测试看起来仍然全绿。
- */
-function realSettingsProvider() {
-  let document = {};
-  class MemorySettingsProvider extends SettingsProvider {
-    writable = true;
-
-    async load() {
-      return document;
-    }
-
-    async persist(ns, section) {
-      document = { ...document, [ns]: section };
-    }
-  }
-  return new (MemorySettingsProvider)(new Context());
-}
 
 /**
  * 一个照抄真实宿主可见性规则的 context。
@@ -181,12 +154,13 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
   /**
    * 在严格宿主上加载插件。
    *
-   * @returns `{ ctx, routes, settings, warnings }`。
+   * @param options - `config` 是 loader 会解析并交给 `apply()` 的条目配置。
+   * @returns `{ ctx, routes, settings, warnings, home }`。
    */
-  async function loadPlugin() {
+  async function loadPlugin({ config = {} } = {}) {
     const routes = new Map();
     const warnings = [];
-    const settings = realSettingsProvider();
+    const settings = strictSettings(config);
     const connection = {
       fetch: {
         register(route) {
@@ -201,7 +175,7 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
     const home = await mkdtemp(join(tmpdir(), 'dsh-tavily-host-services-'));
     const services = {
       web: { registerSearchProvider: () => () => undefined, registerFetchProvider: () => () => undefined },
-      settings,
+      settings: settings.service,
       connection,
       credentials: { resolve: async () => ({ value: 'sk-from-credentials' }) },
       clientModules: {},
@@ -211,19 +185,28 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
     // `web` 由插件自己的 `inject: ['web']` 注入，因此替身也照此预先标记。
     const ctx = strictHost(services, { declaredInject: ['web'] });
     ctx.logger = { warn: (message) => warnings.push(String(message)) };
-    apply(ctx, {});
+    // 交给 `apply()` 的是**替身那份 volatile 配置**，与真实 loader 的做法一致：于是
+    // `update()` 写回访问器时，插件下一次读取就能看到新值。
+    apply(ctx, settings.config);
     // 注入回调不在同步栈上（见 `strictHost` 的注释），因此加载完不等于接好了。
     await settleInjections();
     return { ctx, services, routes, settings, warnings, home };
   }
 
-  test('settings 命名空间真的注册上了（CFG-1）', async () => {
-    // 缺陷版本里 `registerSettings` 拿到 undefined 服务就静默返回，于是命名空间从未注册，
-    // 宿主也就永远不会派发这张卡片。
-    const { settings } = await loadPlugin();
+  test('设置来自 apply 的 config，而不是某个服务（CFG-1）', async () => {
+    // 0.1.7 起没有「注册命名空间」这回事：条目配置就是设置，由 loader 按入口模块的
+    // `Config` 解析后交给 `apply()`。旧模型里这条用例断言的是「命名空间注册上了」，而
+    // 那个动作已经不存在——现在要证明的是另一件事：**配置真的被读到了**。
+    const { routes } = await loadPlugin({ config: { searchEnabled: false, searchDepth: 'advanced' } });
 
-    assert.notEqual(settings.get(SETTINGS_NAMESPACE), undefined, '命名空间必须已注册');
-    assert.equal(settings.get(SETTINGS_NAMESPACE).searchEnabled, true, '默认值由宿主按 schema 解析');
+    const state = await (await routes.get('/api/tavily-pool.state').fetch(
+      new Request('http://x/api/tavily-pool.state'),
+    )).json();
+
+    assert.equal(state.settings.searchEnabled, false, 'config 里的开关必须被读到');
+    assert.equal(state.settings.searchDepth, 'advanced', 'config 里的参数必须被读到');
+    // 没配的那些仍然逐项退回默认值——这正是「schema 的 default 由 loader 解析」那一半。
+    assert.equal(state.settings.maxResults, 10);
   });
 
   test('面板路由真的挂上了（PANEL-4）', async () => {
@@ -238,8 +221,8 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
     ].sort());
   });
 
-  test('经路由写设置落到真实命名空间上（CFG-3）', async () => {
-    const { routes, ctx } = await loadPlugin();
+  test('经路由写设置按条目 id 交给宿主（CFG-3）', async () => {
+    const { routes, settings } = await loadPlugin();
 
     const response = await routes.get('/api/tavily-pool.settings').fetch(new Request('http://x/api/tavily-pool.settings', {
       method: 'POST',
@@ -247,13 +230,15 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
     }));
 
     assert.equal(response.status, 200);
-    // 从**插件本体**的 context 读：它看不见 settings 服务，因此只能走 hostView —— 而这里
-    // 要证明的正是「面板写进去的值能被搜索路径读到」。
-    assert.equal(readPluginSettings(ctx).searchDepth, 'advanced');
+    // 写进去的值必须真的落到宿主那份配置上（替身的 `update` 已经断言过条目 id）。
+    assert.equal(settings.read().searchDepth, 'advanced');
+    // 而面板回给客户端的是写完之后的那一份。
+    const body = await response.json();
+    assert.equal(body.settings.searchDepth, 'advanced');
   });
 
-  test('越界取值仍被宿主 schema 拒绝（CFG-4）', async () => {
-    const { routes } = await loadPlugin();
+  test('越界取值仍被 schema 拒绝，面板编成 400（CFG-4）', async () => {
+    const { routes, settings } = await loadPlugin();
 
     const response = await routes.get('/api/tavily-pool.settings').fetch(new Request('http://x/api/tavily-pool.settings', {
       method: 'POST',
@@ -261,6 +246,7 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
     }));
 
     assert.equal(response.status, 400);
+    assert.equal(settings.read().maxResults, 10, '被拒绝的值不能留在配置里');
   });
 
   test('能力探测如实报告：三项服务不再是 missing（COMPAT-2）', async () => {
@@ -290,12 +276,23 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
     assert.equal(state.fallback.credentialSource, 'probe');
   });
 
-  test('搜索开关经真实 settings 服务生效（CFG-2）', async () => {
-    const { settings, ctx } = await loadPlugin();
+  test('搜索路径读到的值随配置改动而变，无需重载插件（CFG-2）', async () => {
+    const { routes, settings } = await loadPlugin({ config: { searchEnabled: true } });
 
-    await settings.update(SETTINGS_NAMESPACE, { searchEnabled: false });
+    // 经面板那条真实路径关掉开关：POST /settings → 宿主 update(entryId, patch) → 写回同一个
+    // volatile 访问器。插件没有重载，它下一次读就该看到 false——这正是 `applies: 'live'`。
+    const response = await routes.get('/api/tavily-pool.settings').fetch(new Request('http://x/api/tavily-pool.settings', {
+      method: 'POST',
+      body: JSON.stringify({ patch: { searchEnabled: false } }),
+    }));
 
-    assert.equal(readPluginSettings(ctx).searchEnabled, false, '关掉开关之后搜索路径必须读到 false');
+    assert.equal(response.status, 200);
+    assert.equal(settings.read().searchEnabled, false, '写入必须落到宿主那份配置上');
+
+    const state = await (await routes.get('/api/tavily-pool.state').fetch(
+      new Request('http://x/api/tavily-pool.state'),
+    )).json();
+    assert.equal(state.settings.searchEnabled, false, '关掉开关之后搜索路径必须读到 false');
   });
 
   test('宿主缺少 connection 时面板缺席，但设置与搜索照常（PIN-5）', async () => {
@@ -304,7 +301,7 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
     // （例如忽略 `registerPanelRoutes` 的 `false` 返回值、或在缺 connection 时半注册），
     // 这条用例照样全绿。因此这里把承诺的两件事都真的断言出来：面板**缺席**，且搜索
     // **照常**（跑一次真的 `search`，而不是只看 `apply()` 不抛）。
-    const settings = realSettingsProvider();
+    const settings = strictSettings();
     const home = await mkdtemp(join(tmpdir(), 'dsh-tavily-host-services-'));
     const registered = [];
     const warnings = [];
@@ -316,18 +313,21 @@ describe('插件在真实可见性规则下仍然接得上（本组用例就是�
         },
         registerFetchProvider: () => () => undefined,
       },
-      settings,
+      settings: settings.service,
       clientModules: {},
       launchEnvironment: { get: () => undefined },
       dshHomePath: (...segments) => join(home, ...segments),
     };
     const ctx = strictHost(services, { declaredInject: ['web'] });
     ctx.logger = { warn: (message) => warnings.push(String(message)) };
-    assert.doesNotThrow(() => apply(ctx, {}), '缺一项可选能力不该让插件加载失败');
+    assert.doesNotThrow(() => apply(ctx, settings.config), '缺一项可选能力不该让插件加载失败');
     await settleInjections();
 
-    assert.notEqual(settings.get(SETTINGS_NAMESPACE), undefined, '设置照常接上');
-    assert.equal(warnings.some((message) => message.includes('settings namespace')), false);
+    assert.equal(
+      warnings.some((message) => message.includes('ctx.settings.update')),
+      false,
+      'settings 服务在场时不该报它缺失',
+    );
     // 面板**缺席**：缺的正是它唯一依赖的那个服务，因此必须留下那条点名的告警，且不能有
     // 任何路由挂上（这里没有 connection 可挂，判据是「没有把它当成注册成功」）。
     assert.equal(

@@ -53,7 +53,7 @@ dsh plugin add github:stormbuf/dsh-tavily-pool#vX.Y.Z
 
 DeepSeek Harness 处于预览期，其架构与插件接口可能随版本变动。本插件把**绝大多数**宿主相关知识隔离在一层薄适配器（`lib/dsh/`）中，零构建客户端半边（`lib/client.js`）与 `cordis.patch.yml` 里的提供方 pin 另计；并在加载时探测宿主能力，使破坏性变更后的重适配成本保持低廉。
 
-**已测试版本：DSH `0.1.5-rc.2`。** 在更新的版本上可能需要重新适配；届时插件会报出**明确指出缺失能力**的错误，而不是静默失败。逐条重适配清单见 [`docs/dsh-upgrade.zh-CN.md`](./docs/dsh-upgrade.zh-CN.md)。
+**已测试版本：DSH `0.1.7-rc.2`。** 在更新的版本上可能需要重新适配；插件会在加载时探测宿主能力，报出**明确指出缺失能力**的错误，而不是静默失败。宿主 peer 区间**只设下限**，因此未经测试的 DSH 版本不会让插件拒绝加载——DSH 0.1.7 起新增了一道硬闸门，peer 区间不覆盖运行版本就整包跳过，一个过期的上限会变成「插件静默消失」。逐条重适配清单见 [`docs/dsh-upgrade.zh-CN.md`](./docs/dsh-upgrade.zh-CN.md)。
 
 经 `dsh plugin add` 安装后，本包会成为目标 profile 的一个 **bundle 层**（进入该 profile 的
 `dsh.profile.bundles`，排在 DSH 各 bundle 之后），它的 `cordis.patch.yml` 因此能 pin 住提供方。

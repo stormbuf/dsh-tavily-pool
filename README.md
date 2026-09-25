@@ -55,7 +55,7 @@ See [`docs/usage.md`](./docs/usage.md) for configuration, scheduling behaviour, 
 
 DeepSeek Harness is in preview, so its architecture and plugin interfaces may change between releases. This plugin isolates nearly all host-specific knowledge in one thin adapter layer (`lib/dsh/`), plus the zero-build client half (`lib/client.js`) and the provider pin in `cordis.patch.yml`, and probes host capabilities at load time, so that adapting to a breaking change stays cheap.
 
-**Tested against DSH `0.1.5-rc.2`.** On a newer release, the plugin may need re-adaptation; it will report a clear error naming the missing capability rather than failing silently. The step-by-step checklist lives in [`docs/dsh-upgrade.md`](./docs/dsh-upgrade.md).
+**Tested against DSH `0.1.7-rc.2`.** A newer release may still need re-adaptation; the plugin probes host capabilities at load time and reports a clear error naming the missing one rather than failing silently. Its host peer ranges carry **only a lower bound**, so an untested DSH release never refuses to load the plugin — DSH 0.1.7 added a hard gate that skips a whole bundle whose peer range excludes the running version, which turns a stale upper bound into a silently missing plugin. The step-by-step checklist lives in [`docs/dsh-upgrade.md`](./docs/dsh-upgrade.md).
 
 Installing through `dsh plugin add` makes this package a **bundle layer** of the target profile (it lands in that profile's `dsh.profile.bundles`, after the DSH bundles), which is what lets its `cordis.patch.yml` pin the providers. Your own profile patch is applied after every bundle layer, so it can always override or disable what this plugin does — see [Manual rollback](./docs/usage.md#manual-rollback).
 

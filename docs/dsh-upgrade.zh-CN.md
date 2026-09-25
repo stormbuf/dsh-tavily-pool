@@ -5,10 +5,10 @@
 DeepSeek Harness 处于预览期，其插件接口会随版本变动。本插件围绕一个思路构建：
 **所有宿主相关知识都活在 `lib/dsh/` 里**，因此一次破坏性变更的代价是一个目录，而不是整个代码库。
 
-| 已测试版本 | `@deepseek-ai/dsh-*` `0.1.5-rc.2`，`@deepseek-ai/cordis` `4.0.2` |
+| 已测试版本 | `@deepseek-ai/dsh-*` `0.1.7-rc.2`，`@deepseek-ai/cordis` `4.0.4` |
 |---|---|
 | 依赖 | `package.json` → `peerDependencies` 列出的包 |
-| 声明区间 | 刻意取**窄** —— 见[版本区间](#版本区间) |
+| 声明区间 | 宿主包**只设下限** —— 见[版本区间](#版本区间) |
 
 升级若弄坏了什么，先读失败信息：插件在**加载时探测宿主**，按名字报出**哪一项**能力缺失，
 而不是等到第一次搜索才失败。那条消息通常已足够定位下面该走哪一行。
@@ -106,7 +106,8 @@ context proxy 有两种语义不同的读取方式：
 | `ctx.inject([三项], cb)` | object | object | object | object | object | function |
 
 本插件需要的三项——`settings`、`connection`、`credentials`——**不在**普通 fiber 的作用域里，
-于是 `ctx.get` 对它们安静地返回 `undefined`：设置命名空间从未注册、面板路由一条也没挂上。
+于是 `ctx.get` 对它们安静地返回 `undefined`：旧模型下这意味着设置命名空间从未注册、面板路由一条
+也没挂上；0.1.7 下同一种失明表现成「每一次面板写入都报『宿主没有 settings 服务』」。
 它们必须经 `ctx.inject([name], callback)` 取得，那个回调拿到的子 fiber 里该服务可见
 （`lib/dsh/host-services.js`）。
 
@@ -187,18 +188,31 @@ policy 仍以 `?.timeoutMs` 读它、缺失时不武装；检查工具名仍是 
 猜一个只会读到另一个 agent 的预算。读取结果如实报成 `host` / `unbound` / `unavailable`，
 因此「退回了常量」这件事是可观察的，而不是静默的。
 
-### 7. 设置注册
+### 7. 设置模型
 
-**看哪里：** `dsh-settings` —— 服务上的 `register(ns, schema, options)`，以及读回某个已注册
-命名空间的 `get(ns)`。
-**改哪个模块：** `lib/dsh/settings.js`
+**看哪里：** `dsh-settings`（`settings` 服务）、`dsh-app-boot`（`evaluatePluginCompatibility`），
+以及 `@deepseek-ai/cordis` 里条目配置的解析。
+**改哪个模块：** `index.js`（`Config` 导出）、`lib/dsh/settings.js`、`lib/settings.js`
 
-确认这个形状的两半都在：`register` 返回所有者句柄，**服务自身**带有 `get(ns)`。经 `register`
-返回的句柄读取看起来等价，其实不是——服务少了 `get` 就是一处需要察觉的宿主形状变化，而本插件
-经服务读取，正是为了不让一次重复注册的失败同时弄坏读取。
+DSH 0.1.7 把整个模型换掉了。设置是**本插件自己那条 loader 行的配置**，不再是插件注册的命名空间：
 
-同时确认重复注册命名空间仍然抛错。本插件**不得**重新注册 `web-search-deepseek`：那个命名空间
-属于官方插件，而官方插件必须保持启用，重新注册会抛错。
+- 入口模块导出 `Config`（schemastery schema），`apply(ctx, config)` 收到解析后的配置。旧模型里
+  的 `ctx.settings.register(ns, schema)` 与 `get(ns)` 都已不存在；
+- **只有带 `.volatile()` 的字段会进表单。** `dsh-settings` 的 `volatileForm()` 递归根 schema 的
+  `dict`、只保留 volatile 子项；一个都没有的条目**根本不进 `describe()`**——没有设置页，也不报错；
+- volatile 字段解析出来是**活动访问器**（`{ get(), [volatile.write]() }`）而不是纯值，要用
+  `config.x.get()` 读（官方包就是这么写的）。访问器正是 `applies: 'live'` 的实现方式：面板写入落
+  在同一个访问器上，于是下一次读取就看到新值，**无需重载插件**。`lib/dsh/settings.js` 负责把它
+  摊平成纯对象交给与宿主无关的 `lib/settings.js`；
+- 条目身份是 **profile 条目 id**（`entry.options.id`），也就是 `name` 导出与 `cordis.patch.yml`
+  里那一行的 `id`。`ctx.settings.update(entryId, patch, expectedRevision?)` 写入 profile patch；
+  面板需要的成员只有这一个；
+- 读**别人**的条目配置（回落路径要读官方 `web-search-deepseek`）走 `ctx.settings.describe()`：它
+  返回每个可配置条目的已解析值，键是 `ns`。不传 `redactSecrets` 时不脱敏；它会遍历全部条目，
+  因此只在回落路径上调用，不要每次搜索都调。
+
+`test/settings-stub.mjs` 同时复刻了 schema 校验（用**同一份** `settingsSchema()`）与 volatile
+访问器那条活链路，单测因此压的是真实形状，而不是一个纯对象。
 
 ### 8. 清单字段
 
@@ -217,25 +231,43 @@ policy 仍以 `?.timeoutMs` 读它、缺失时不武装；检查工具名仍是 
 种子模块表精确列出了零构建 bundle 可以 `require` 哪些说明符。若面板用到的一项被移除，
 卡片就会加载失败。本卡片目前用三个：`react`、`react-dom`（批量添加的弹层经它的
 `createPortal` 挂到 `document.body`）与 `@deepseek-ai/dsh-client-ui-primitives`
-（`Switch` / `Tag` / `IconChevronDownOutline14`）。slot 契约在
-`dsh-client-ui-settings-plugins/lib/types/client/slot-contract.d.ts`；卡片必须用 **`key`**
-字段（即设置命名空间）注册，绝不能用 `id` 或 `order`。
+（`Switch` / `Tag` / `IconChevronDownOutline14`）。
+
+**挂载点是另一半。** 0.1.7 把插件配置页移到了侧栏 Plugins 页：卡片注册进
+`plugins.row.config`，key 是 **`<包名>#<行 id>`**（`dsh-tavily-pool#tavily-pool`）——旧的
+`settings.plugin.item`（key 为设置命名空间）在宿主里已经不存在。契约在
+`dsh-client-ui-plugin-manager/lib/types/client/slot-contract.d.ts`。注册到宿主没有声明的 slot
+**不会报错**，卡片只是永远不渲染——这正是 slot 名与 key 在 `test/client-card.test.js` 里被断言的原因。
+
+条目收到的是 `PluginConfigViewProps`（`view: 'summary' | 'page'`，外加可选的 `form`：宿主那份
+配置快照与 `mutate`）。本卡片对 `page` 渲染整张卡片、对 `summary` 只回一行，并且仍经自己的面板
+路由（`ctx.settings.update`）写设置，而不是走 `form.mutate`。
 
 ## 版本区间
 
-`package.json` → `peerDependencies` 刻意取窄区间：宿主包 `>=0.1.5-rc.2 <0.1.6`，
-Cordis `>=4.0.2 <5`。
+`package.json` 对宿主包**只设下限**（`>=0.1.5-rc.2`），Cordis 保留主版本上限
+（`>=4.0.2 <5`）。
 
-预览期支持**对未经测试的版本响亮失败，而不是声明一份从未验证过的兼容性。** 当你验证过某个
-新版本后，把区间放宽到包含它，并同步更新 README 的已测试版本行——那一行与这张表是同一个
-承诺，必须一起改。
+上限是 `0.3.1` 放开的。DSH 0.1.7 起在 profile 组合阶段多了一道硬闸门
+（`@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility()`）：它拿运行版本逐个校验
+`@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` 这些 peer，一旦不匹配就在**任何代码加载之前整包
+跳过**。区间停在 `<0.1.6` 时，每一个晚于 `0.1.6` 的 DSH 版本都会让插件静默消失——提供方没
+注册、pin 没生效、设置卡片不存在。**一个过期的上限比没有上限更糟**：它把「可能需要重适配」
+变成了「悄无声息地没了」。
 
-放宽时记住两件事：
+被它替换掉的那条纪律仍然成立，只是下沉了一层：插件继续在加载时探测宿主能力并指名缺了哪一
+项，因此不兼容的版本会在**真正坏掉的第一件事**上响亮失败，而不是干脆不挂载。`engines.dsh`
+用同样的下限做声明性表达；目前没有任何 DSH 读取方强制它。
+
+两件事要记住：
 
 - 预发布版本只会被点名它的区间匹配。`^0.1.5` **不**匹配 `0.1.5-rc.2`；要写
-  `>=0.1.5-rc.2 <0.1.6`，或显式点名该预发布版本。
+  `>=0.1.5-rc.2`。
 - `pnpm`（`dsh plugin add` 转发到的就是它）不会自动安装 peer。这里的 peer 区间是文档与
   警告来源，不是安装机制。
+
+验证一个新版本之后**不再需要动区间**：更新 README 的已测试版本行与上面那张表即可——两者是
+同一个承诺，必须一起改。只有当你决定不再支持更旧的版本时，才抬高下限。
 
 ## 升级之后
 

@@ -3,8 +3,10 @@
  * 外加抓取接管（`10`）与调度策略（`18`）。
  *
  * 单测打的是桩件，而这里打的是**真实宿主服务**：真实的 `WebRuntime`（pin 到本插件）、
- * 真实的 `SettingsProvider`（宿主的基类，不是替身）、真实的 Tavily API 与真实网络。它能
- * 证明而单测证明不了的五件事：
+ * 真实的 Tavily API 与真实网络。**settings 是唯一一处例外**——DSH 0.1.7 的 `SettingsForms`
+ * 需要 `configEditor` 与 `profileContext` 才构造得起来，独立脚本里立不起那两项，因此设置
+ * 走共享桩件（`test/settings-stub.mjs`），它拿同一份 schema 校验。设置 UI 本身的验证属于
+ * `panel-browser-check.mjs`。它能证明而单测证明不了的五件事：
  *
  * 1. **开关即时生效**（第 7 项）：改设置之后**不重新加载插件**，下一次搜索立刻换路径；
  * 2. **回落路径**（第 8 项）：关掉开关后请求转交官方提供方，并记下官方凭据在本机的**真实**
@@ -33,15 +35,12 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { Context } from '@deepseek-ai/cordis';
-import { SettingsProvider } from '@deepseek-ai/dsh-settings';
 import { WebRuntime } from '@deepseek-ai/dsh-web';
-import schemaBuilder from '@deepseek-ai/schemastery';
 
 import { apply } from '../../index.js';
-import { KEYS_FILE_NAME, PROVIDER_ID, SETTINGS_NAMESPACE, STATE_DIR_NAME } from '../../lib/constants.js';
+import { KEYS_FILE_NAME, PLUGIN_ID, PROVIDER_ID, STATE_DIR_NAME } from '../../lib/constants.js';
 import { PANEL_ROUTE_PATHS } from '../../lib/dsh/panel-routes.js';
-import { settingsSchema } from '../../lib/settings.js';
+import { strictSettings, writeSetting } from '../settings-stub.mjs';
 
 /** 解析 `--flag value` 形式的参数，不引入参数解析库。 */
 function flag(name, fallback) {
@@ -60,25 +59,22 @@ function note(label, detail) {
 }
 
 /**
- * 一个内存后端的**真实** settings provider。
+ * 一份 settings 替身，与单测共用同一个桩件。
  *
- * 与 `test/dsh-settings.test.js` 同一手法：注册、解析、校验、写入串行、变更广播全部由宿主
- * 基类执行。于是「开关即时生效」检验的是真实的设置链路，而不是我们对它的复述。
+ * 旧版本这里借的是宿主**真实的** `SettingsProvider` 基类。0.1.7 换成 `SettingsForms`，而它
+ * 要 `configEditor` 与 `profileContext` 两项服务才构造得起来——在一个独立脚本里立起那两项
+ * 等于把整个 profile 组合搬过来，得到的仍是「我们对自己的复述」。桩件因此改用共享的
+ * `test/settings-stub.mjs`：它拿**同一份** `settingsSchema()` 校验，并复刻 volatile 访问器
+ * 那条活链路。
+ *
+ * **本脚本真正的价值不在这里**，而在它用的是真实 Tavily API、真实网络、真实面板路由，
+ * 以及插件自己的那套接线。设置 UI 本身属于浏览器验证（`panel-browser-check.mjs`）。
+ *
+ * @param initial - 条目的初始配置。
+ * @returns 与 `strictSettings()` 相同的形状。
  */
-function memorySettings(ctx) {
-  let document = {};
-  class MemorySettingsProvider extends SettingsProvider {
-    writable = true;
-
-    async load() {
-      return document;
-    }
-
-    async persist(ns, section) {
-      document = { ...document, [ns]: section };
-    }
-  }
-  return new (MemorySettingsProvider)(ctx);
+function memorySettings(initial = {}) {
+  return strictSettings(initial);
 }
 
 /**
@@ -133,8 +129,8 @@ function bootHost(harnessHome, { connection } = {}) {
   // `config` 是整包替换而不是合并，少写一个的后果正是 ticket `16` 第 2 项要防的那件事。
   new WebRuntime(ctx, { searchProvider: PROVIDER_ID, fetchProvider: PROVIDER_ID });
   if (connection !== undefined) ctx.provide('connection', connection);
-  const settings = memorySettings(ctx);
-  apply(ctx, {});
+  const settings = memorySettings();
+  apply(ctx, settings.config);
   return { ctx, settings };
 }
 
@@ -167,7 +163,7 @@ async function waitForRoutes(routes) {
  */
 async function waitForSettings(settings) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (settings.get(SETTINGS_NAMESPACE) !== undefined) return;
+    if (settings.read().searchEnabled !== undefined) return;
     await new Promise((resolve) => {
       setTimeout(resolve, 50);
     });
@@ -196,7 +192,7 @@ async function tryFetch(ctx, url) {
 const harnessHome = await prepareHarnessHome();
 const { ctx, settings } = bootHost(harnessHome);
 await waitForSettings(settings);
-check('插件已加载且设置命名空间已注册', `ns=${SETTINGS_NAMESPACE}`);
+check('插件已加载，设置经条目配置接上', 'apply(ctx, config)');
 
 // ── ticket 22 F2：总预算读的是宿主绑定的 tool timeoutMs ─────────────────────────
 //
@@ -221,8 +217,8 @@ check('第 1 项：pin 解析到本插件，请求真的抵达 api.tavily.com', 
 check('首条来源', first.result.sources[0].url);
 
 // ── 第 8 项：关掉开关 → 回落官方，并记录官方凭据在本机的真实结论 ──────────────
-await settings.update(SETTINGS_NAMESPACE, { searchEnabled: false });
-assert.equal(settings.get(SETTINGS_NAMESPACE).searchEnabled, false, '写入必须落到真实 settings 上');
+await settings.service.update(PLUGIN_ID, { searchEnabled: false });
+assert.equal(settings.read().searchEnabled, false, '写入必须落到真实 settings 上');
 
 const second = await trySearch(ctx, 'DeepSeek Harness release notes');
 if (second.ok) {
@@ -246,7 +242,7 @@ if (second.ok) {
 }
 
 // ── 第 7 项：改回开 → 不重新加载插件，下一次搜索立刻回到 Tavily ────────────────
-await settings.update(SETTINGS_NAMESPACE, { searchEnabled: true });
+await settings.service.update(PLUGIN_ID, { searchEnabled: true });
 const third = await trySearch(ctx, 'Tavily API pricing');
 assert.equal(third.ok, true, `开关改回开之后必须立刻走 Tavily：${third.ok ? '' : String(third.error)}`);
 assert.ok(third.result.sources.length > 0);
@@ -291,8 +287,8 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
   // 按设计回落给官方抓取器，而下面那条「必须打到 /extract」的断言会以一条看起来像接线
   // 坏掉的错误失败。开关是否真的默认为关由 `test/settings.test.js` 与
   // `test/dsh-settings.test.js` 直接断言 schema 默认值。
-  await settings.update(SETTINGS_NAMESPACE, { fetchEnabled: true });
-  assert.equal(settings.get(SETTINGS_NAMESPACE).fetchEnabled, true, '先把抓取开关打开再测接管');
+  await settings.service.update(PLUGIN_ID, { fetchEnabled: true });
+  assert.equal(settings.read().fetchEnabled, true, '先把抓取开关打开再测接管');
   //
   // 出站请求在这里被**换掉**而不是真的发出去：本脚本要证明的是「接管的接线对不对」——
   // 请求有没有抵达 Tavily 的抽取端点、参数对不对、返回值是不是被标成 `text`——而
@@ -345,8 +341,8 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
   });
 
   try {
-    await settings.update(SETTINGS_NAMESPACE, { fetchEnabled: false });
-    assert.equal(settings.get(SETTINGS_NAMESPACE).fetchEnabled, false, '写入必须落到真实 settings 上');
+    await settings.service.update(PLUGIN_ID, { fetchEnabled: false });
+    assert.equal(settings.read().fetchEnabled, false, '写入必须落到真实 settings 上');
 
     const afterOff = await tryFetch(ctx, 'https://example.com');
     assert.equal(afterOff.ok, true, `关掉抓取开关后必须回落而不是抛错：${afterOff.ok ? '' : String(afterOff.error)}`);
@@ -358,8 +354,8 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
     assert.equal(stillTavily.ok, true, '关掉抓取不得影响搜索');
     check('第 10 项：关掉抓取开关后抓取转交官方抓取器，搜索仍然走 Tavily');
 
-    await settings.update(SETTINGS_NAMESPACE, { fetchEnabled: true });
-    assert.equal(settings.get(SETTINGS_NAMESPACE).fetchEnabled, true);
+    await settings.service.update(PLUGIN_ID, { fetchEnabled: true });
+    assert.equal(settings.read().fetchEnabled, true);
   } finally {
     setOfficialFetchProvider(previousTarget);
   }
@@ -612,8 +608,8 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
       'balance：余额已知的真密钥先被选中（假密钥余额未知，垫底）',
     );
 
-    await settings.update(SETTINGS_NAMESPACE, { schedulingPolicy: 'manual' });
-    assert.equal(settings.get(SETTINGS_NAMESPACE).schedulingPolicy, 'manual', '写入必须落到真实 settings 上');
+    await settings.service.update(PLUGIN_ID, { schedulingPolicy: 'manual' });
+    assert.equal(settings.read().schedulingPolicy, 'manual', '写入必须落到真实 settings 上');
 
     assert.equal(
       String(await keyUsed()).includes('manual-first'),
@@ -624,7 +620,7 @@ check('第 7 项：开关改动即时生效，无需重启、无需重新注册�
 
     // 收尾：把假密钥删掉、策略改回默认，免得影响后面的检查。
     await call(PANEL_ROUTE_PATHS.keys, { action: 'remove', id: fakeId });
-    await settings.update(SETTINGS_NAMESPACE, { schedulingPolicy: 'balance' });
+    await settings.service.update(PLUGIN_ID, { schedulingPolicy: 'balance' });
   } finally {
     globalThis.fetch = realFetch;
   }

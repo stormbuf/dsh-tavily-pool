@@ -26,15 +26,15 @@ import {
   HOST_BUDGET_MARGIN_MS,
   KEYS_FILE_NAME,
   MIN_ATTEMPT_TIMEOUT_MS,
+  PLUGIN_ID,
   SEARCH_TOTAL_BUDGET_MS,
-  SETTINGS_NAMESPACE,
   TAVILY_TIMEOUT_MS,
 } from './lib/constants.js';
 import { KeyHealth } from './lib/health.js';
 import { CallHistory } from './lib/history.js';
 import { PoolStore, maskKey } from './lib/pool.js';
 import { Scheduler } from './lib/scheduler.js';
-import { searchParamsOf, effectiveMaxResults } from './lib/settings.js';
+import { searchParamsOf, effectiveMaxResults, settingsSchema } from './lib/settings.js';
 import { TavilyError, extractTavily, searchTavily } from './lib/tavily.js';
 import { UsageQuota, UsageRefresher } from './lib/usage.js';
 import { probeCapabilities, describeMissingCapabilities } from './lib/dsh/capabilities.js';
@@ -47,7 +47,7 @@ import { registerPanelRoutes } from './lib/dsh/panel-routes.js';
 import { ensurePoolLoaded } from './lib/dsh/pool-load.js';
 import { registerFetchProvider, registerSearchProvider } from './lib/dsh/register.js';
 import { TavilySearchProvider } from './lib/dsh/search-provider.js';
-import { readPluginSettings, registerSettings } from './lib/dsh/settings.js';
+import { readPluginSettings } from './lib/dsh/settings.js';
 
 /** Cordis 插件名，供 loader 诊断使用。 */
 export const name = 'tavily-pool';
@@ -62,20 +62,24 @@ export const name = 'tavily-pool';
 export const inject = ['web'];
 
 /**
- * 本插件所在行（row）的组合配置。
+ * 本插件那条 loader 行的配置 schema——**它就是本插件的设置**。
  *
- * 为空，是因为所有面向用户的设置都放在 `dsh-tavily-pool` 设置命名空间里，那里改动
- * 即时生效且会出现在面板上。它仍然被声明、且不可为空：行的 `config` 会先经这份
- * schema 校验，再交给 `apply()`，因此一个形状错误的值（字符串而非对象）会在加载期
- * 以 loader 自己的诊断失败，而不是未经检查地递进来。
+ * DSH 0.1.7 起设置的身份是 profile 条目，而不是插件自选的命名空间：loader 按这份 schema
+ * 校验并补齐默认值，把解析结果交给 `apply()`，宿主再从同一个 schema 生成设置表单。表单
+ * 只收带 `.volatile()` 的字段（`volatileForm()` 递归 `dict`），一个都没有的条目不会出现在
+ * `settings.describe()` 里——那正是旧的空 schema 必须配一张自绘卡片的原因。
+ *
+ * 形状与默认值全部来自 `lib/settings.js`（宿主无关），本文件只负责把它挂到 loader 上。
  */
-export const Config = z.object({});
+export const Config = settingsSchema(z);
 
 /**
  * 插件运行期的可变状态。
  *
  * @typedef {object} PluginState
  * @property {object} ctx - 插件 context。
+ * @property {object} config - loader 按 `Config` 解析后的条目配置（DSH 0.1.7 起设置就是
+ *   它）；经 `readPluginSettings` 读出的才是复校验过的九项设置。
  * @property {object} host - {@link hostView} 给出的 context 视图；`lib/dsh/` 的其余模块
  *   一律经它读取宿主服务，因为 `settings` / `connection` / `credentials` 三项在插件本体的
  *   context 上根本看不见（实测见 `lib/dsh/host-services.js`）。
@@ -115,12 +119,14 @@ export const Config = z.object({});
  * 向宿主注册 Tavily 搜索提供方。
  *
  * @param ctx - 插件 context。
- * @param _config - 校验后的组合配置；目前未使用。
+ * @param config - loader 按 {@link Config} 解析后的条目配置；它是本插件设置的唯一来源，
+ *   由 {@link readPluginSettings} 复校验后交给各个消费方。
  */
-export function apply(ctx, _config) {
+export function apply(ctx, config) {
   /** @type {PluginState} */
   const state = {
     ctx,
+    config,
     host: undefined,
     pool: undefined,
     health: undefined,
@@ -170,13 +176,9 @@ export function apply(ctx, _config) {
   state.host = hostView(ctx, services);
   bindHostServices(ctx, services, {
     settings: () => {
-      // 命名空间不可重复注册。重复注册会抛错，而它说明的是「我们注册了两次」——一个真实
-      // 的缺陷，不该被吞掉；但也不该把搜索一起关掉，所以只上报，不设 `initError`。
-      try {
-        registerSettings(state.host);
-      } catch (error) {
-        report(ctx, 'warn', `dsh-tavily-pool: could not register the settings namespace: ${String(error)}`);
-      }
+      // 设置不再需要注册：loader 按入口模块的 `Config` 校验并解析，`apply()` 收到的
+      // `config` 就是当前值。这个回调只用于把「settings 服务已就绪」反映到能力探测里
+      // ——面板的写入经 `ctx.settings.update(entryId, …)`，没有服务时那一步会失败。
       refreshCapabilities(state);
     },
     connection: () => {
@@ -193,7 +195,7 @@ export function apply(ctx, _config) {
     state.scheduler = new Scheduler({
       pool: state.pool,
       health: state.health,
-      policy: () => readPluginSettings(state.host).schedulingPolicy,
+      policy: () => readPluginSettings(state).schedulingPolicy,
     });
     state.usageRefresher = new UsageRefresher({
       pool: state.pool,
@@ -347,11 +349,11 @@ async function search(state, request, signal) {
     });
   }
 
-  const settings = readPluginSettings(state.host);
+  const settings = readPluginSettings(state);
   // 开关先判：它与密钥池能不能读、有没有密钥都无关（`PIN-3`）。这也是唯一一条**不**
   // 需要先把池读进来的回落路径，因此它排在最前。
   if (settings.searchEnabled !== true) {
-    return fallbackToOfficial(state, request, signal, `the Tavily search toggle is off (${SETTINGS_NAMESPACE})`);
+    return fallbackToOfficial(state, request, signal, `the Tavily search toggle is off (${PLUGIN_ID})`);
   }
 
   await ensurePoolLoaded(state);
@@ -471,9 +473,9 @@ async function fetchUrl(state, request, signal) {
     });
   }
 
-  const settings = readPluginSettings(state.host);
+  const settings = readPluginSettings(state);
   if (settings.fetchEnabled !== true) {
-    return fallbackToOfficialFetch(state, request, signal, `the Tavily fetch toggle is off (${SETTINGS_NAMESPACE})`);
+    return fallbackToOfficialFetch(state, request, signal, `the Tavily fetch toggle is off (${PLUGIN_ID})`);
   }
 
   await ensurePoolLoaded(state);

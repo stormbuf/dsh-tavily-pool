@@ -4,8 +4,10 @@
  * 三件事只有在这里才检验得到，而它们恰恰是最容易做错的三件：
  *
  * 1. **路由真的挂上了**——路径、方法、以及「同一路径不能注册两次」这条宿主约束；
- * 2. **设置的校验是宿主做的**——因此这里用宿主**真实的** `SettingsProvider`，不是替身。
- *    用替身的话，`CFG-4` 的越界取值会被替身一起放过，测试全绿而面板上照样能存下 21；
+ * 2. **设置的校验按条目的 schema 做**——0.1.7 起宿主拿本插件入口模块的 `Config` 校验用户
+ *    写下的值，而共享桩件（`test/settings-stub.mjs`）用的就是**同一份** `settingsSchema()`，
+ *    因此 `CFG-4` 的越界取值不会被放过：替身若自己写一套宽松校验，测试全绿而面板上照样能
+ *    存下 21。桩件同时把 volatile 访问器那条活链路也复刻了，面板写完下一次读取就能看到；
  * 3. **凭据两态是从真实凭据平面解析出来的**——`CFG-5` 的「未配置」与「已失效」必须
  *    经 `credentials` / 启动环境走一遍才作数。
  *
@@ -20,75 +22,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
-import { Context } from '@deepseek-ai/cordis';
-import { SettingsProvider } from '@deepseek-ai/dsh-settings';
-import schemaBuilder from '@deepseek-ai/schemastery';
-
 import { apply } from '../index.js';
-import { KEYS_FILE_NAME, SETTINGS_NAMESPACE, STATE_DIR_NAME } from '../lib/constants.js';
+import { KEYS_FILE_NAME, STATE_DIR_NAME } from '../lib/constants.js';
 import { PANEL_ROUTE_PATHS, registerPanelRoutes } from '../lib/dsh/panel-routes.js';
-import { readPluginSettings } from '../lib/dsh/settings.js';
 import { PoolStore } from '../lib/pool.js';
-import { settingsSchema } from '../lib/settings.js';
+import { strictSettings } from './settings-stub.mjs';
 
 /** 用例里用到的那把明文密钥。任何响应里出现它，都是 `POOL-3` 的失败。 */
 const SECRET = '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';
 
 /** 第二把，用于「磁盘上本来就有多把」的用例。 */
 const OTHER_SECRET = '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';
-
-/**
- * 一个内存后端的**真实** settings provider。
- *
- * 与 `dsh-settings.test.js` 同一手法：注册、解析、校验、写入串行全部由宿主基类执行，
- * 我们只提供存储。于是「面板提交的越界取值被拒绝」是在检验真正的接缝。
- *
- * @param options - 覆盖项。
- * @param options.preRegistered - 是否在返回前就注册好命名空间。走 `apply()` 的用例必须
- *   传 `false`：命名空间不可重复注册，预注册会让 `apply()` 里的注册抛错，于是插件被判成
- *   「初始化失败」，而失败的其实是测试桩件。
- * @returns 真实的 settings provider。
- */
-function realSettingsProvider({ preRegistered = true } = {}) {
-  let document = {};
-  class MemorySettingsProvider extends SettingsProvider {
-    writable = true;
-
-    async load() {
-      return document;
-    }
-
-    async persist(ns, section) {
-      document = { ...document, [ns]: section };
-    }
-  }
-  const ctx = new Context();
-  const provider = new (MemorySettingsProvider)(ctx);
-  if (preRegistered) provider.register(SETTINGS_NAMESPACE, settingsSchema(schemaBuilder));
-  return provider;
-}
-
-/**
- * 一个**注册动作也排在宏任务里**的 settings 服务。
- *
- * 真实 `SettingsProvider.register` 是同步的，于是「注入回调不在同步栈上」这条时序在走
- * `apply()` 的用例里会被它自己抹掉：只要回调跑了，命名空间与路由就同时到位，`apply()`
- * 返回时的那一瞬间看不出区别。这个桩件让 `settings` 服务在注入回调里直接就位、而面板路由
- * 要等注册完才挂上，于是那条时序判据不再被替身自己抹掉——真机上 `inject:settings` 正是排在
- * 整个 profile 组合完成之后（`@+3385ms`）。
- *
- * 它只做 `register`，不做 `get` / `update`：那条用例碰不到后两者，而假装实现它们只会
- * 多出一份会在别处漂移的替身。
- *
- * @returns 一个只有 `register` 的 settings 服务桩件。
- */
-function deferredSettingsService() {
-  return {
-    register() {
-      return { get: () => undefined, update: async () => undefined };
-    },
-  };
-}
 
 /**
  * 一个照抄宿主行为的 connection 服务。
@@ -178,8 +122,18 @@ async function callJson(connection, path, options) {
   return { response, body: await response.json() };
 }
 
-/** 一个落在临时目录上的状态对象，形状与 `index.js` 里的 `state` 一致。 */
-async function panelState({ pool, usageRefresher, lastFallbackFailure, hostBudget } = {}) {
+/**
+ * 一个落在临时目录上的状态对象，形状与 `index.js` 里的 `state` 一致。
+ *
+ * `ctx` 是这份状态对应的宿主替身。`state.host` 在生产里由 `hostView()` 建立——`lib/dsh/`
+ * 的模块一律经它读服务，因为 `settings` 与 `connection` 在插件本体的 ctx 上根本看不见
+ * （实测表见 `lib/dsh/host-services.js`）。替身这里照同一个形状转发，而不是直接读 ctx：
+ * 少了这一层，「面板读错了 ctx」这类缺陷就会在单测里消失。
+ *
+ * @param options - 状态字段与它的 `ctx`。
+ * @returns 状态对象。
+ */
+async function panelState({ pool, usageRefresher, lastFallbackFailure, hostBudget, ctx } = {}) {
   return {
     pool,
     usageRefresher,
@@ -187,6 +141,8 @@ async function panelState({ pool, usageRefresher, lastFallbackFailure, hostBudge
     reportedFallbackReason: undefined,
     lastFallbackFailure,
     hostBudget,
+    host: { get: (name) => ctx?.get(name), logger: ctx?.logger },
+    config: ctx?.config,
   };
 }
 
@@ -199,7 +155,7 @@ async function temporaryPool() {
 describe('PANEL-4：面板接口挂在 /api 之下', () => {
   test('五条精确路由，方法与用途各自对应', () => {
     const connection = fakeConnection();
-    const ctx = fakeContext({ connection: connection.service, settings: realSettingsProvider() });
+    const ctx = fakeContext({ connection: connection.service, settings: strictSettings().service });
 
     assert.equal(registerPanelRoutes(ctx, {}), true);
 
@@ -272,7 +228,7 @@ describe('PANEL-4：面板接口挂在 /api 之下', () => {
 describe('响应约定', () => {
   test('响应带 no-store：缓存它会让用户点完「刷新余额」仍看到旧值', async () => {
     const connection = fakeConnection();
-    registerPanelRoutes(fakeContext({ connection: connection.service, settings: realSettingsProvider() }), {});
+    registerPanelRoutes(fakeContext({ connection: connection.service, settings: strictSettings().service }), {});
 
     const { response } = await callJson(connection, PANEL_ROUTE_PATHS.state);
 
@@ -293,9 +249,11 @@ describe('响应约定', () => {
 
   test('空请求体是合法的：refresh 不带 id 就是「刷新全部」', async () => {
     const connection = fakeConnection();
-    registerPanelRoutes(fakeContext({ connection: connection.service }), await panelState({
+    const ctx = fakeContext({ connection: connection.service });
+    registerPanelRoutes(ctx, await panelState({
       pool: await temporaryPool(),
       usageRefresher: { refresh: async () => ({ ok: true }) },
+      ctx,
     }));
 
     const { response, body } = await callJson(connection, PANEL_ROUTE_PATHS.refresh, { method: 'POST' });
@@ -306,9 +264,11 @@ describe('响应约定', () => {
 
   test('未知动作是 404，并带上机器码', async () => {
     const connection = fakeConnection();
-    registerPanelRoutes(fakeContext({ connection: connection.service }), await panelState({
+    const ctx = fakeContext({ connection: connection.service });
+    registerPanelRoutes(ctx, await panelState({
       pool: await temporaryPool(),
       usageRefresher: { refresh: async () => ({ ok: true }) },
+      ctx,
     }));
 
     const { response, body } = await callJson(connection, PANEL_ROUTE_PATHS.keys, {
@@ -324,11 +284,12 @@ describe('响应约定', () => {
 describe('CFG-5：面板上的回落目标状态', () => {
   test('没有任何官方凭据时报「未配置」', async () => {
     const connection = fakeConnection();
-    registerPanelRoutes(fakeContext({
+    const ctx = fakeContext({
       connection: connection.service,
-      settings: realSettingsProvider(),
+      settings: strictSettings().service,
       launchEnvironment: { get: () => undefined },
-    }), await panelState({}));
+    });
+    registerPanelRoutes(ctx, await panelState({ ctx }));
 
     const { body } = await callJson(connection, PANEL_ROUTE_PATHS.state);
 
@@ -342,12 +303,14 @@ describe('CFG-5：面板上的回落目标状态', () => {
     // 探测只能说「有值」，而「有值」并不反驳「上次被官方拒了」。因此这一档只能由一次
     // 真实发生过的失败提供——这正是 CFG-5 要求区分的两态。
     const connection = fakeConnection();
-    registerPanelRoutes(fakeContext({
+    const ctx = fakeContext({
       connection: connection.service,
-      settings: realSettingsProvider(),
+      settings: strictSettings().service,
       credentials: { resolve: async () => ({ value: 'sk-present' }) },
-    }), await panelState({
+    });
+    registerPanelRoutes(ctx, await panelState({
       lastFallbackFailure: { code: 'TAVILY_FALLBACK_CREDENTIAL_INVALID', at: '2026-09-19T08:00:00.000Z' },
+      ctx,
     }));
 
     const { body } = await callJson(connection, PANEL_ROUTE_PATHS.state);
@@ -359,11 +322,12 @@ describe('CFG-5：面板上的回落目标状态', () => {
 
   test('凭据配好且没失败过时报「已配置」', async () => {
     const connection = fakeConnection();
-    registerPanelRoutes(fakeContext({
+    const ctx = fakeContext({
       connection: connection.service,
-      settings: realSettingsProvider(),
+      settings: strictSettings().service,
       launchEnvironment: { get: (name) => (name === 'DEEPSEEK_API_KEY' ? { value: 'sk-from-env' } : undefined) },
-    }), await panelState({}));
+    });
+    registerPanelRoutes(ctx, await panelState({ ctx }));
 
     const { body } = await callJson(connection, PANEL_ROUTE_PATHS.state);
 
@@ -377,10 +341,10 @@ describe('COMPAT-3、POOL-7：诊断信息出现在面板状态里', () => {
     // 这条断言的是一个真实缺陷的修法：三项注入服务要到 profile 组合完成之后才可见，加载期
     // 缓存下来的那份报告会在插件刚起来的那几秒里谎报缺失。因此面板每次读状态都重新探一遍。
     const connection = fakeConnection();
-    const ctx = fakeContext({ connection: connection.service, settings: realSettingsProvider() });
+    const ctx = fakeContext({ connection: connection.service, settings: strictSettings().service });
     // 有意让宿主缺一项必需能力：seam 上没有注册函数。
     ctx.get = ((original) => (name) => (name === 'web' ? {} : original(name)))(ctx.get);
-    registerPanelRoutes(ctx, await panelState({}));
+    registerPanelRoutes(ctx, await panelState({ ctx }));
 
     const { body } = await callJson(connection, PANEL_ROUTE_PATHS.state);
 
@@ -398,7 +362,8 @@ describe('COMPAT-3、POOL-7：诊断信息出现在面板状态里', () => {
     const pool = await new PoolStore({ dir, fileName: KEYS_FILE_NAME }).load();
 
     const connection = fakeConnection();
-    registerPanelRoutes(fakeContext({ connection: connection.service, settings: realSettingsProvider() }), await panelState({ pool }));
+    const ctx = fakeContext({ connection: connection.service, settings: strictSettings().service });
+    registerPanelRoutes(ctx, await panelState({ pool, ctx }));
 
     const { body } = await callJson(connection, PANEL_ROUTE_PATHS.state);
 
@@ -416,7 +381,8 @@ describe('密钥池与设置经路由工作', () => {
     const pool = await new PoolStore({ dir: home, fileName: KEYS_FILE_NAME }).load();
     const refreshes = [];
     const connection = fakeConnection();
-    const settings = realSettingsProvider();
+    const settings = strictSettings();
+    const ctx = fakeContext({ connection: connection.service, settings: settings.service });
     const state = await panelState({
       pool,
       usageRefresher: {
@@ -425,8 +391,10 @@ describe('密钥池与设置经路由工作', () => {
           return { ok: true, recovered: false };
         },
       },
+      ctx,
     });
-    registerPanelRoutes(fakeContext({ connection: connection.service, settings }), state);
+    state.config = settings.config;
+    registerPanelRoutes(ctx, state);
     return { connection, pool, refreshes, settings, home };
   }
 
@@ -484,9 +452,11 @@ describe('密钥池与设置经路由工作', () => {
     const pool = await new PoolStore({ dir: home, fileName: KEYS_FILE_NAME }).load();
     await pool.addKey({ key: SECRET });
     const connection = fakeConnection();
-    registerPanelRoutes(fakeContext({ connection: connection.service, settings: realSettingsProvider() }), await panelState({
+    const ctx = fakeContext({ connection: connection.service, settings: strictSettings().service });
+    registerPanelRoutes(ctx, await panelState({
       pool,
       usageRefresher: { refresh: async () => ({ ok: false, skipped: 'quota' }) },
+      ctx,
     }));
 
     const { body } = await callJson(connection, PANEL_ROUTE_PATHS.refresh, { method: 'POST', body: {} });
@@ -522,14 +492,15 @@ describe('密钥池与设置经路由工作', () => {
     assert.equal(body.settings.searchDepth, 'advanced');
     assert.equal(body.settings.maxResults, 5);
     assert.equal(
-      settings.get(SETTINGS_NAMESPACE).searchDepth,
+      settings.read().searchDepth,
       'advanced',
       '写入必须落到宿主 settings 服务上，下一次搜索才会立刻看到',
     );
   });
 
   test('越界取值被宿主的 schema 拒绝，错误文案原样透出（CFG-4）', async () => {
-    // 这条是本文件用**真实** SettingsProvider 的理由：替身会把 21 一起放过。
+    // 这条是本文件用共享桩件的理由：桩件拿 `settingsSchema()` 校验，与自己写一套宽松校验的
+    // 替身不同——后者会把 21 一起放过，测试全绿而面板上照样能存下它。
     const { connection, settings } = await wired();
 
     const { response, body } = await callJson(connection, PANEL_ROUTE_PATHS.settings, {
@@ -541,7 +512,7 @@ describe('密钥池与设置经路由工作', () => {
     assert.equal(body.error.code, 'PANEL_INVALID_SETTINGS');
     assert.match(body.error.message, /maxResults/u, '文案要指名是哪个字段');
     assert.match(body.error.message, /21/u, '也要带上被拒的值，用户才改得动');
-    assert.equal(settings.get(SETTINGS_NAMESPACE).maxResults, 10, '被拒的写入不得留下任何痕迹');
+    assert.equal(settings.read().maxResults, 10, '被拒的写入不得留下任何痕迹');
   });
 
   test('maxResults 的下界同样是 1（CFG-4）', async () => {
@@ -564,7 +535,7 @@ describe('index.js 真的把接口接上了', () => {
    * **真的临时目录**，因为密钥池的写入是真实的 `mkdir` + `rename`，指向一个不存在的根路径
    * 只会让每次编辑都以 EACCES 失败。
    */
-  async function hostWithRoutes({ settings = realSettingsProvider({ preRegistered: false }) } = {}) {
+  async function hostWithRoutes({ settings = strictSettings().service } = {}) {
     const connection = fakeConnection();
     // 不预注册：命名空间由 `apply()` 自己注册，否则这里会以「重复注册」失败，而那失败
     // 属于桩件而不是被测代码。
@@ -610,11 +581,10 @@ describe('index.js 真的把接口接上了', () => {
     // 上同一时刻是 0（实测 `apply:end @+817ms`、`inject:settings @+3385ms`）。没有这一条，
     // 「在注入回调里才成立的前置条件」这类缺陷在单测里就没有判据。
     //
-    // ⚠️ 判据只有在**没有任何一步同步注册**时才成立：`settings.register` 本身是同步的，
-    // 而 `realSettingsProvider` 一调它就注册好了——那 5 条路由因此会在 `apply()` 返回之前
-    // 出现，与真实宿主无关，纯粹是替身自己的时序。因此这里把 settings 服务换成一个
-    // **注册动作也排在宏任务里**的桩件，让整条链路的时序与真机一致。
-    const host = await hostWithRoutes({ settings: deferredSettingsService() });
+    // 旧的 `SettingsProvider.register` 是同步的，于是那份替身会在 `apply()` 返回之前就把
+    // 路由注册好——那是替身自己的时序，与真机无关。0.1.7 起没有同步注册这回事了（设置就是
+    // 条目配置，`apply()` 只读不注册），因此这条判据现在落在真实代码路径上，不再需要特殊桩件。
+    const host = await hostWithRoutes({ settings: strictSettings().service });
 
     apply(host.ctx, {});
 
@@ -737,14 +707,17 @@ describe('index.js 真的把接口接上了', () => {
     assert.equal(body.error.code, 'PANEL_BAD_REQUEST');
   });
 
-  test('apply() 注册的面板设置写入落到宿主的命名空间上（CFG-1）', async () => {
-    const host = await hostWithRoutes();
-    apply(host.ctx, {});
+  test('apply() 注册的面板设置写入落到宿主那份配置上（CFG-1）', async () => {
+    const settings = strictSettings();
+    const host = await hostWithRoutes({ settings: settings.service });
+    apply(host.ctx, settings.config);
     await host.injections();
 
     await callJson(host.connection, PANEL_ROUTE_PATHS.settings, { method: 'POST', body: { patch: { searchEnabled: false } } });
 
-    assert.equal(readPluginSettings(host.ctx).searchEnabled, false);
+    // 判据落在**宿主那份配置**上，而不是插件内部的某个副本：写进去之后下一次读取就该看到，
+    // 这正是 `applies: 'live'` 的含义，也是面板上那个开关的意义。
+    assert.equal(settings.read().searchEnabled, false);
   });
 
   test('apply() 二次执行只记一条告警，不把插件判死', async () => {
@@ -837,10 +810,8 @@ describe('panel-http-6：写失败的响应体按白名单构造', () => {
     const pool = await new PoolStore({ dir: home, fileName: KEYS_FILE_NAME }).load();
 
     const connection = fakeConnection();
-    registerPanelRoutes(
-      fakeContext({ connection: connection.service, settings: realSettingsProvider() }),
-      await panelState({ pool }),
-    );
+    const ctx = fakeContext({ connection: connection.service, settings: strictSettings().service });
+    registerPanelRoutes(ctx, await panelState({ pool, ctx }));
 
     const { response, body } = await callJson(connection, PANEL_ROUTE_PATHS.keys, {
       method: 'POST',
@@ -867,10 +838,8 @@ describe('panel-http-4：批量删除经 keys 命令出去', () => {
     const home = await mkdtemp(join(tmpdir(), 'dsh-tavily-pool-panel-'));
     const pool = await new PoolStore({ dir: home, fileName: KEYS_FILE_NAME }).load();
     const connection = fakeConnection();
-    registerPanelRoutes(
-      fakeContext({ connection: connection.service, settings: realSettingsProvider() }),
-      await panelState({ pool }),
-    );
+    const ctx = fakeContext({ connection: connection.service, settings: strictSettings().service });
+    registerPanelRoutes(ctx, await panelState({ pool, ctx }));
     const third = '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';
     await callJson(connection, PANEL_ROUTE_PATHS.keys, {
       method: 'POST',
@@ -903,7 +872,7 @@ describe('host-contract-2：预算来源经 /state 如实投影', () => {
       fetch: { budgetMs: 23_000, source: 'host', hostSource: 'host' },
     };
     registerPanelRoutes(
-      fakeContext({ connection: connection.service, settings: realSettingsProvider() }),
+      fakeContext({ connection: connection.service, settings: strictSettings().service }),
       await panelState({ pool: await temporaryPool(), hostBudget: budget }),
     );
 
@@ -912,7 +881,7 @@ describe('host-contract-2：预算来源经 /state 如实投影', () => {
 
     const fresh = fakeConnection();
     registerPanelRoutes(
-      fakeContext({ connection: fresh.service, settings: realSettingsProvider() }),
+      fakeContext({ connection: fresh.service, settings: strictSettings().service }),
       await panelState({ pool: await temporaryPool() }),
     );
     const withoutReading = await callJson(fresh, PANEL_ROUTE_PATHS.state);

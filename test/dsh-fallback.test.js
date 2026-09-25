@@ -16,6 +16,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment';
+import {
+  Config as OfficialConfig,
+  DEEPSEEK_DEFAULT_BASE_URL,
+  WEB_SEARCH_DEEPSEEK_SETTINGS_NAMESPACE,
+} from '@deepseek-ai/dsh-web-search-deepseek';
 
 import { apply } from '../index.js';
 import {
@@ -39,7 +44,14 @@ import { PANEL_ROUTE_PATHS } from '../lib/dsh/panel-routes.js';
  */
 function fakeContext({ settings, credentials, environment, agents } = {}) {
   const services = {
-    ...settings === undefined ? {} : { settings: { get: () => settings } },
+    // DSH 0.1.7 起，读别的条目配置的唯一公开途径是 `settings.describe()`：它返回每个有
+    // 可编辑字段的条目的已解析配置，`ns` 就是条目 id（不再有 `get(namespace)`）。替身照着
+    // 这个形状来，而不是照着我们**以为**的形状来——那正是旧替身盖住 `get` 消失的方式。
+    ...settings === undefined ? {} : {
+      settings: {
+        describe: () => [{ ns: WEB_SEARCH_DEEPSEEK_SETTINGS_NAMESPACE, value: settings }],
+      },
+    },
     ...credentials === undefined ? {} : { credentials },
     ...agents === undefined ? {} : { agents },
     launchEnvironment: { get: (name) => environment?.(name) },
@@ -420,14 +432,12 @@ describe('host-contract-1：与官方 resolveOptions 的键集对账', () => {
     const build = new Function(
       'credentialRef',
       'launchEnvironmentOf',
-      'DEFAULT_API_KEY_ENV',
       'SEARCH_BASE_URL_ENV',
       `${extractFunction(source, 'function resolveOptions(ctx, config) {')}\nreturn resolveOptions;`,
     );
     const resolve = build(
       credentialRef,
       launchEnvironmentOf,
-      literal('DEFAULT_API_KEY_ENV'),
       literal('SEARCH_BASE_URL_ENV'),
     );
     return Object.keys(resolve(fakeContext(), {})).sort();
@@ -437,6 +447,23 @@ describe('host-contract-1：与官方 resolveOptions 的键集对账', () => {
     // 这是一条**对账**而不是一份手抄副本：上游给 `resolveOptions` 加字段时这里会变红，
     // 而不是继续静默漏一次官方的副作用（`recordRequest` 就是这么漏掉的）。
     assert.deepEqual(Object.keys(resolveOfficialOptions(fakeContext())).sort(), officialOptionKeys());
+  });
+
+  test('照抄的官方默认值与官方 schema 逐项一致', () => {
+    // 官方把 `DEFAULT_API_KEY_ENV` 这类常量收进了 schema 的 `.default()`：0.1.7 的源码里
+    // 已经**没有那个标识符**，`resolveOptions` 直接读 `config.apiKeyEnv`。因此「本插件抄的
+    // 那份默认值有没有漂移」不能再从源码抽常量来比，而要直接问官方的 schema——这也更接近
+    // 事实：loader 解析条目配置时用的就是它。
+    const ours = resolveOfficialOptions(fakeContext());
+
+    for (const field of ['apiKeyEnv', 'model', 'apiVersion', 'maxTokens', 'maxUses']) {
+      assert.equal(
+        ours[field],
+        OfficialConfig.dict[field].meta.default,
+        `${field} 的默认值与官方 schema 不一致`,
+      );
+    }
+    assert.equal(ours.baseURL, DEEPSEEK_DEFAULT_BASE_URL, 'baseURL 的默认值与官方导出的常量不一致');
   });
 });
 
@@ -472,11 +499,14 @@ describe('failure-paths-7：官方凭据状态必须可撤销', () => {
         },
       },
       settings: {
-        get: (namespace) => values[namespace],
-        register: (namespace) => ({
-          get: () => values[namespace],
-          set: (next) => { values[namespace] = next; },
-        }),
+        // 0.1.7 的读取途径：`describe()` 返回每个**有可编辑字段的**条目的已解析配置，
+        // `ns` 就是条目 id。替身按这个形状来，而不是按我们以为的形状来。
+        describe: () => Object.entries(values).map(([ns, value]) => ({ ns, value })),
+        // 写入途径：面板的「保存设置」落在这里；条目 id 同样是入参。
+        update: (ns, patch) => {
+          values[ns] = { ...values[ns], ...patch };
+          return Promise.resolve();
+        },
       },
       connection: {
         fetch: {
@@ -502,7 +532,7 @@ describe('failure-paths-7：官方凭据状态必须可撤销', () => {
       registered,
       routes,
       warnings,
-      /** 改一个设置命名空间的值，用来模拟用户在 Models 页改配置。 */
+      /** 改一个条目的配置值，用来模拟用户在设置页改配置。 */
       setNamespaceValue: (namespace, next) => { values[namespace] = next; },
     };
   }

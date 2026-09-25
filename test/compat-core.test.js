@@ -11,9 +11,12 @@
 
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import test, { describe } from 'node:test';
+
+import { resolveHostRoot } from './host-install.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -90,7 +93,7 @@ describe('COMPAT-1：每个 lib/ 模块都要被归类', () => {
   });
 });
 
-describe('COMPAT-4：每个被 import 的宿主包都在 package.json 里声明', () => {
+describe('COMPAT-4：宿主包在 package.json 里声明，且区间只留下限', () => {
   test('未声明的宿主依赖会让插件在严格的包布局下整个加载失败', async () => {
     // 这条压的是一个真实的漏网：`lib/dsh/fallback.js` 新增了 `dsh-credentials` 与
     // `dsh-launch-environment` 两个顶层 import，却只靠 `dsh-web-search-deepseek` 的
@@ -115,6 +118,57 @@ describe('COMPAT-4：每个被 import 的宿主包都在 package.json 里声明'
 
     const undeclared = [...used].filter((name) => !declared.has(name)).sort();
     assert.deepEqual(undeclared, [], '这些宿主包被 import 却没在 package.json 里声明');
+  });
+
+  test('宿主 peer 区间只带下限——带上限会让新版本把插件整包跳过', async () => {
+    // DSH 0.1.7 起在 profile 组合阶段多了一道硬闸门 `evaluatePluginCompatibility()`
+    // （`@deepseek-ai/dsh-app-boot`）：它拿运行版本逐个校验 `@deepseek-ai/dsh` /
+    // `@deepseek-ai/dsh-*` 这些 peer，不匹配就在**任何代码加载之前**把整个 bundle 跳过——
+    // 提供方不注册、pin 不生效、设置卡片不存在，而用户只看到插件「显示异常」。区间停在
+    // `<0.1.6` 时，每一个晚于 `0.1.6` 的 DSH 版本都会如此静默消失，所以上限的代价远大于它
+    // 买到的那点提示。下限仍要保留：它说明本插件从哪个版本起被验证过；`engines.dsh` 用同一份
+    // 下限做声明性表达（COMPAT-5）。
+    const manifest = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8'));
+    const hostPeers = Object.entries(manifest.peerDependencies ?? {})
+      .filter(([name]) => name === '@deepseek-ai/dsh' || name.startsWith('@deepseek-ai/dsh-'));
+
+    assert.ok(hostPeers.length > 0, '宿主 peer 一个都没有——闸门判据的前提就不成立了');
+
+    for (const [name, range] of hostPeers) {
+      assert.equal(range.includes('<'), false, `${name} 的区间 ${range} 带了版本上限`);
+      assert.match(range, />=/u, `${name} 的区间 ${range} 没有下限，无法表达最低支持的版本`);
+    }
+
+    const engines = manifest.engines?.dsh;
+    assert.equal(typeof engines, 'string', 'engines.dsh 应声明最低支持的 DSH 版本');
+    assert.equal(engines.includes('<'), false, `engines.dsh（${engines}）带了版本上限`);
+  });
+
+  test('宿主自己的版本闸门接受这份包清单', async () => {
+    // 上一条查的是区间的字符串形状，只是近似；这一条用的是**宿主自己的判据**。DSH 0.1.7 起
+    // `evaluatePluginCompatibility()` 在 profile 组合阶段拿运行版本逐个校验 `@deepseek-ai/dsh`
+    // 与 `@deepseek-ai/dsh-*` 的 peer，一旦不匹配，就在**任何代码加载之前**把整个 bundle 跳过：
+    // 提供方不注册、pin 不生效、设置卡片不存在，而用户看到的现象只是「插件显示异常」。
+    // 2026-09-25 的事故正是它——区间停在 `<0.1.6`，于是 0.1.7 上插件静默消失。
+    //
+    // 判据取自宿主产物而不是我们的复述（`host-contract-4`）；解析不到就抛错，不跳过。
+    const root = resolveHostRoot({
+      markers: [join('@deepseek-ai', 'dsh-app-boot', 'package.json')],
+      what: 'the host compatibility gate',
+    });
+    const hostRequire = createRequire(join(root, 'index.js'));
+    const { evaluatePluginCompatibility } = hostRequire('@deepseek-ai/dsh-app-boot');
+    const manifest = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8'));
+
+    const issue = evaluatePluginCompatibility(manifest);
+
+    assert.equal(
+      issue,
+      undefined,
+      issue === undefined
+        ? ''
+        : `宿主 ${issue.runtimeVersion} 会整包跳过本插件，不匹配的 peer 是 ${JSON.stringify(issue.peers)}`,
+    );
   });
 });
 
