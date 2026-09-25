@@ -18,10 +18,11 @@
  * 5. 批量删除弹框（ticket `22` D2）同样成立：它的复选框真的画得出来、勾选之后确认按钮可用
  *    （勾了**不提交**——那会删掉验证用的密钥）。
  *
- * ⚠️ **本脚本尚未重适配到 DSH 0.1.7，导航步骤是旧的。** 卡片过去挂在「设置 → 插件」下，
- * 而 0.1.7 把它移到了**侧栏 Plugins 页 → 本 bundle → 那一行的配置页**（slot 从
- * `settings.plugin.item` 换成 `plugins.row.config`）。选择器与点击路径必须对着一个真跑着的
- * 实例重新推一遍——**在推完之前，本脚本的结论不作数**，别把它的失败当成卡片坏了。
+ * 导航已按 0.1.7 的挂载点重推（2026-09-25 在一台隔离实例上实测）：卡片不再挂在「设置 →
+ * 插件」下，而在**侧栏 Plugins 页 → 本 bundle → 那一行的配置入口**（slot 从
+ * `settings.plugin.item` 换成 `plugins.row.config`，key 为 `<包名>#<行 id>`）。行上的配置
+ * 入口只在那个 key 真的注册上时才渲染，因此「找不到入口」本身就是一条判据，而不是环境问题。
+ * 侧栏是纯图标按钮，只能按 `aria-label` 点。
  *
  * 它需要一台跑着的 `dsh web` 与一个本机 Chrome，因此不属于 `npm test`：
  *
@@ -188,6 +189,14 @@ const clickText = (text) => `(() => {
   return true;
 })()`;
 
+/** 侧栏入口是纯图标按钮，没有可见文字，只能按 `aria-label` 点。 */
+const clickAria = (label) => `(() => {
+  const node = [...document.querySelectorAll('[aria-label]')].find((element) => element.getAttribute('aria-label') === ${JSON.stringify(label)});
+  if (node === undefined) return false;
+  node.click();
+  return true;
+})()`;
+
 const token = await resolveToken();
 const chrome = launchChrome();
 let failure;
@@ -198,10 +207,28 @@ try {
   await client.send('Page.navigate', { url: `${base}/?token=${token}` });
   await sleep(2500);
 
-  if (!await client.evaluate(clickText('设置'))) throw new Error('找不到「设置」入口');
+  // 全新 profile 上会先弹内测声明；已经看过的 profile 上它不出现，因此不当作失败。
+  await client.evaluate(clickText('继续'));
   await sleep(900);
-  if (!await client.evaluate(clickText('插件'))) throw new Error('找不到「插件」导航项');
-  await sleep(900);
+
+  // 0.1.7 起插件配置页在**侧栏 Plugins 页**：本 bundle → 那一行的配置入口 → 卡片本体。
+  // 侧栏是纯图标按钮，因此靠 `aria-label` 定位而不是可见文字。
+  if (!await client.evaluate(clickAria('插件'))) throw new Error('侧栏找不到「插件」入口');
+  await sleep(1500);
+  if (!await client.evaluate(clickText('dsh-tavily-pool'))) throw new Error('Plugins 页找不到本 bundle 的卡片');
+  await sleep(1200);
+  // 行上的配置入口只在 `plugins.row.config` 真的有本插件的 key 时才渲染——它**就是**
+  // 「卡片注册成功了没有」的判据，所以这里找不到就直接失败。
+  if (!await client.evaluate(`(() => {
+    const button = [...document.querySelectorAll('button')].find((node) => (node.getAttribute('aria-label') ?? '').startsWith('配置'));
+    if (button === undefined) return false;
+    button.click();
+    return true;
+  })()`)) throw new Error('那一行没有配置入口——plugins.row.config 上没有本插件的 key，卡片不会渲染');
+  await sleep(1500);
+  check('卡片已挂载', await client.evaluate("document.querySelector('.dtp-header') !== null ? '行配置页上有卡片' : '卡片缺席'"));
+
+  // 卡片默认折叠（`expanded: false`），主体要点头部才渲染出来。
   await client.evaluate("(() => { document.querySelector('.dtp-header')?.click(); return true; })()");
   await sleep(900);
   check('卡片已展开', await client.evaluate("document.querySelector('.dtp-add') !== null ? '密钥池表单在' : '密钥池表单缺席'"));
@@ -261,6 +288,15 @@ try {
   //    「当前打开的对话框是哪一个」这个判据有两个答案。
   if (!await client.evaluate(clickText('取消'))) throw new Error('找不到批量添加弹框的「取消」按钮');
   await sleep(600);
+  // 池是空的时候「批量删除」是**故意禁用**的（`disabled: busy || keys.length === 0`），
+  // 这不是缺陷而是契约。与掩码那条同策：空池就跳过，不把环境当成失败。
+  const removeDisabled = await client.evaluate(`(() => {
+    const button = [...document.querySelectorAll('button')].find((node) => (node.textContent ?? '').trim() === '批量删除');
+    return button === undefined ? null : button.disabled;
+  })()`);
+  if (removeDisabled !== false) {
+    check('池里没有密钥，批量删除检查跳过（该按钮此时按契约禁用）');
+  } else {
   if (!await client.evaluate(clickText('批量删除'))) throw new Error('找不到「批量删除」按钮');
   await sleep(800);
   const removal = await client.evaluate(SNAPSHOT);
@@ -294,6 +330,7 @@ try {
     throw new Error('勾了一把之后「删除所选」仍是灰的');
   }
   check('勾选之后确认按钮可用（未提交）');
+  }
 
   if (!await client.evaluate(clickText('取消'))) throw new Error('删除弹框里找不到「取消」按钮');
   await sleep(600);
